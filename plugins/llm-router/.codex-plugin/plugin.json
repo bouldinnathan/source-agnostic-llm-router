@@ -1,0 +1,36 @@
+{
+  "name": "llm-router",
+  "version": "0.3.0",
+  "description": "Automatically discover, provision, prioritize, and route local and hosted LLMs through one resilient endpoint.",
+  "author": {
+    "name": "LLM Router contributors"
+  },
+  "license": "MIT",
+  "keywords": [
+    "llm",
+    "routing",
+    "discovery",
+    "failover",
+    "mcp",
+    "home-assistant"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "LLM Router",
+    "shortDescription": "Choose and call the best available LLM.",
+    "longDescription": "Automatic local and cloud enrollment, resource-aware Ollama provisioning, operator priority, capability routing, health scoring, and cross-source failover through one MCP server.",
+    "developerName": "LLM Router contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Network"
+    ],
+    "defaultPrompt": [
+      "Route this request to the most capable available model.",
+      "Compare the best models for this task without sending it.",
+      "Answer this with a cost-aware model and automatic failover.",
+      "Prefer my local models and install a suitable one if Ollama is empty."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "llm-router": {
+      "command": "llm-router-mcp",
+      "args": [
+        "--stdio"
+      ]
+    }
+  }
+}

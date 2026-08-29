@@ -1,0 +1,103 @@
+"""In-process health, latency, load, and circuit-breaker state."""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import Any
+
+from .schema import ModelConfig, PolicyConfig
+
+
+@dataclass(slots=True)
+class DeploymentState:
+    successes: int = 0
+    failures: int = 0
+    consecutive_failures: int = 0
+    active_requests: int = 0
+    latency_ewma_ms: float | None = None
+    circuit_open_until: float = 0.0
+    last_error: str | None = None
+
+
+class RuntimeRegistry:
+    """Tracks ephemeral deployment health for one router process."""
+
+    def __init__(self, policy: PolicyConfig) -> None:
+        self.policy = policy
+        self._states: dict[str, DeploymentState] = {}
+
+    def state(self, deployment: str) -> DeploymentState:
+        return self._states.setdefault(deployment, DeploymentState())
+
+    def is_available(self, deployment: str) -> bool:
+        return self.state(deployment).circuit_open_until <= time.monotonic()
+
+    def begin(self, deployment: str) -> None:
+        self.state(deployment).active_requests += 1
+
+    def record_success(self, deployment: str, latency_ms: float) -> None:
+        state = self.state(deployment)
+        state.active_requests = max(0, state.active_requests - 1)
+        state.successes += 1
+        state.consecutive_failures = 0
+        state.circuit_open_until = 0.0
+        state.last_error = None
+        if state.latency_ewma_ms is None:
+            state.latency_ewma_ms = latency_ms
+        else:
+            alpha = self.policy.latency_ewma_alpha
+            state.latency_ewma_ms = alpha * latency_ms + (1 - alpha) * state.latency_ewma_ms
+
+    def record_failure(self, deployment: str, reason: str) -> None:
+        state = self.state(deployment)
+        state.active_requests = max(0, state.active_requests - 1)
+        state.failures += 1
+        state.consecutive_failures += 1
+        state.last_error = reason
+        if state.consecutive_failures >= self.policy.circuit_breaker_failures:
+            state.circuit_open_until = (
+                time.monotonic() + self.policy.circuit_breaker_cooldown_seconds
+            )
+
+    def end_without_result(self, deployment: str) -> None:
+        state = self.state(deployment)
+        state.active_requests = max(0, state.active_requests - 1)
+
+    def observed_latency(self, model: ModelConfig) -> float:
+        return self.state(model.id).latency_ewma_ms or model.estimated_latency_ms
+
+    def health_score(self, model: ModelConfig) -> float:
+        state = self.state(model.id)
+        # Start with the configured reliability as a ten-observation prior.
+        prior_strength = 10.0
+        return (
+            model.reliability * prior_strength + state.successes
+        ) / (prior_strength + state.successes + state.failures)
+
+    def snapshot(self, models: tuple[ModelConfig, ...]) -> dict[str, Any]:
+        now = time.monotonic()
+        deployments: list[dict[str, Any]] = []
+        for model in models:
+            state = self.state(model.id)
+            deployments.append(
+                {
+                    "deployment": model.id,
+                    "endpoint": model.endpoint,
+                    "enabled": model.enabled,
+                    "circuit_open": state.circuit_open_until > now,
+                    "circuit_open_for_seconds": round(max(0.0, state.circuit_open_until - now), 3),
+                    "active_requests": state.active_requests,
+                    "successes": state.successes,
+                    "failures": state.failures,
+                    "consecutive_failures": state.consecutive_failures,
+                    "latency_ewma_ms": (
+                        round(state.latency_ewma_ms, 2)
+                        if state.latency_ewma_ms is not None
+                        else None
+                    ),
+                    "health_score": round(self.health_score(model), 6),
+                    "last_error": state.last_error,
+                }
+            )
+        return {"deployments": deployments}

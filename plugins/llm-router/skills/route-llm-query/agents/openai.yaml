@@ -1,0 +1,9 @@
+interface:
+  display_name: "Route LLM Query"
+  short_description: "Provision, prioritize, and route the best LLM"
+  default_prompt: "Use $route-llm-query to discover, prioritize, and safely route this request, provisioning a local model only if authorized."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "llm-router"
+      description: "Automatic model enrollment, bounded local provisioning, priority routing, and failover"

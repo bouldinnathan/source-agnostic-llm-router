@@ -1,0 +1,8 @@
+include install.sh
+include config/router.example.toml
+include config/router.env.example
+include plugins/llm-router/.mcp.json
+include plugins/llm-router/.codex-plugin/plugin.json
+include plugins/llm-router/skills/route-llm-query/SKILL.md
+include plugins/llm-router/skills/route-llm-query/agents/openai.yaml
+include plugins/llm-router/skills/route-llm-query/references/configuration.md
