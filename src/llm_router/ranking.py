@@ -90,6 +90,12 @@ class Ranker:
         candidates.sort(key=lambda item: (-item.score, -item.model.quality, item.model.id))
         if self.config.policy.diversify_fallbacks:
             candidates = _diversify_endpoints(candidates)
+        if request.preferred_endpoints:
+            # A named machine is the first choice after hard constraints, even
+            # when another replica has a better score. Preserve scoring within
+            # each tier and independent-endpoint fallback order.
+            preferred = set(request.preferred_endpoints)
+            candidates.sort(key=lambda item: item.model.endpoint not in preferred)
         return RoutingDecision(
             strategy=strategy,
             inferred_capabilities=inferred,
@@ -107,12 +113,16 @@ class Ranker:
         reasons: list[str] = []
         if not model.enabled:
             reasons.append("disabled")
+        if request.allowed_deployments is not None and model.id not in request.allowed_deployments:
+            reasons.append("outside selected model alias")
         if model.id in request.exclude_deployments:
             reasons.append("explicitly excluded deployment")
         if model.endpoint in request.exclude_endpoints:
             reasons.append("explicitly excluded endpoint")
         if not self.runtime.is_available(model.id):
             reasons.append("circuit breaker open")
+        if not self.runtime.endpoint_available(model.endpoint):
+            reasons.append("endpoint health check failed")
         required_context = max(
             request.estimated_input_tokens + request.max_tokens,
             request.min_context_window or 0,

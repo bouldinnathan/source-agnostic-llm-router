@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -21,8 +22,10 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response, Strea
 from starlette.routing import Route
 
 from .bootstrap import BootstrapResult, bootstrap_router
-from .discovery import DiscoveryReport, DiscoverySettings
+from .aliases import ModelAlias, alias_conflicts, build_aliases
+from .discovery import DiscoveryReport, DiscoverySettings, ProbeResult
 from .errors import AllModelsFailed, NoEligibleModel, RequestError, RouterError
+from .health import probe_endpoints
 from .provisioning import OllamaProvisioner, ProvisioningReport, ProvisioningSettings
 from .router import LLMRouter
 from .schema import QueryRequest, RoutedCompletion, RouterConfig
@@ -71,6 +74,8 @@ class RouterGateway:
         self._discovery: DiscoveryReport | None = None
         self._refresh_lock = asyncio.Lock()
         self._refresh_task: asyncio.Task[None] | None = None
+        self._health_task: asyncio.Task[None] | None = None
+        self._health_lock = asyncio.Lock()
         self._provision_task: asyncio.Task[None] | None = None
         self._provisioning: ProvisioningReport | None = None
         self._last_error: str | None = None
@@ -78,6 +83,10 @@ class RouterGateway:
 
     async def start(self) -> None:
         await self.refresh()
+        await self.check_health()
+        self._health_task = asyncio.create_task(
+            self._health_loop(), name="llm-router-endpoint-health"
+        )
         self._ensure_provisioning()
         if self.discovery_enabled and self.settings.enabled:
             self._refresh_task = asyncio.create_task(
@@ -85,7 +94,7 @@ class RouterGateway:
             )
 
     async def stop(self) -> None:
-        for task in (self._refresh_task, self._provision_task):
+        for task in (self._refresh_task, self._provision_task, self._health_task):
             if task is None:
                 continue
             task.cancel()
@@ -95,6 +104,7 @@ class RouterGateway:
                 pass
         self._refresh_task = None
         self._provision_task = None
+        self._health_task = None
 
     async def refresh(self) -> bool:
         async with self._refresh_lock:
@@ -107,6 +117,13 @@ class RouterGateway:
                     previous=previous,
                 )
                 result = self._retain_failed_sources(result, previous)
+                for probe in result.discovery.probes:
+                    name = _probe_endpoint_name(probe, result.router.config.endpoints)
+                    if (
+                        name in result.router.config.endpoints
+                        and result.router.config.endpoints[name].health_path is None
+                    ):
+                        result.router.runtime.record_endpoint_probe(name, probe.reachable, probe.error)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -145,20 +162,24 @@ class RouterGateway:
 
     def status(self) -> dict[str, Any]:
         availability_error: str | None = None
+        ready = self._router is not None and any(
+            model.enabled
+            and self._router.runtime.is_available(model.id)
+            and self._router.runtime.endpoint_available(model.endpoint)
+            for model in self._router.config.models
+        )
         if self._router is None:
             state = "unavailable"
         elif self._last_error:
             state = "degraded"
-        elif not any(
-            model.enabled and self._router.runtime.is_available(model.id)
-            for model in self._router.config.models
-        ):
+        elif not ready:
             state = "degraded"
             availability_error = "No enabled deployment is currently available"
         else:
             state = "ready"
         payload: dict[str, Any] = {
             "status": state,
+            "ready": ready,
             "version": VERSION,
             "last_refresh": (
                 datetime.fromtimestamp(self._last_refresh, timezone.utc).isoformat()
@@ -169,6 +190,7 @@ class RouterGateway:
         }
         if self._router is not None:
             payload["router"] = self._router.status()
+            payload["alias_conflicts"] = list(alias_conflicts(self._router.config))
         if self._discovery is not None:
             payload["discovery"] = self._discovery.to_dict(include_failures=True)
         if self._provisioning is not None:
@@ -180,6 +202,38 @@ class RouterGateway:
             await asyncio.sleep(self.settings.refresh_seconds)
             await self.refresh()
             self._ensure_provisioning()
+
+    async def check_health(self) -> None:
+        recovered = False
+        async with self._health_lock, self._refresh_lock:
+            router = self._router
+            if router is not None:
+                previously_offline = {
+                    name for name in router.config.endpoints
+                    if not router.runtime.endpoint_available(name)
+                }
+                results = await probe_endpoints(router.config, router.runtime)
+                recovered = any(results.get(name) is True for name in previously_offline)
+                # An endpoint-only config can start while every server is asleep.
+                # Enroll models promptly once one of those servers becomes usable.
+                recovered = recovered or (
+                    not router.config.models and any(value is True for value in results.values())
+                )
+        if recovered and self.discovery_enabled:
+            await self.refresh()
+
+    async def _health_loop(self) -> None:
+        while True:
+            router = self._router
+            interval = router.config.policy.health_check_interval_seconds if router else 15.0
+            await asyncio.sleep(interval)
+            try:
+                await self.check_health()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # One health cycle must not terminate future checks or discovery.
+                continue
 
     def _ensure_provisioning(self) -> None:
         if (
@@ -210,22 +264,33 @@ class RouterGateway:
     ) -> BootstrapResult:
         if previous is None:
             return result
-        failed_urls = {
-            probe.base_url.rstrip("/")
-            for probe in result.discovery.probes
-            if not probe.reachable
-        }
-        if not failed_urls:
+        failed_probes = [probe for probe in result.discovery.probes if not probe.reachable]
+        if not failed_probes:
             return result
         endpoints = dict(result.router.config.endpoints)
         models = {model.id: model for model in result.router.config.models}
         retained_endpoints: set[str] = set()
-        for name, endpoint in previous.config.endpoints.items():
-            if endpoint.base_url.rstrip("/") in failed_urls and name not in endpoints:
+        known_endpoints = {**previous.config.endpoints, **endpoints}
+        for probe in failed_probes:
+            name = _probe_endpoint_name(probe, known_endpoints)
+            if name not in previous.config.endpoints:
+                continue
+            if name not in endpoints:
+                endpoint = previous.config.endpoints[name]
+                if endpoint.base_url.rstrip("/") != probe.base_url.rstrip("/"):
+                    continue
                 endpoints[name] = endpoint
-                retained_endpoints.add(name)
+            # Preserve the current address for a stable identity after an IP
+            # change. Discovery failure must not erase that machine's aliases.
+            retained_endpoints.add(name)
+        current_pairs = {(model.endpoint, model.upstream_model) for model in models.values()}
         for model in previous.config.models:
-            if model.endpoint in retained_endpoints and model.id not in models:
+            if (
+                model.endpoint in retained_endpoints
+                and "discovered" in model.tags
+                and model.id not in models
+                and (model.endpoint, model.upstream_model) not in current_pairs
+            ):
                 models[model.id] = model
         if not retained_endpoints:
             return result
@@ -235,8 +300,16 @@ class RouterGateway:
             policy=result.router.config.policy,
             source_path=result.router.config.source_path,
         )
-        router = LLMRouter(merged, runtime=previous.runtime)
+        router = LLMRouter(merged, runtime=result.router.runtime)
         return replace(result, router=router)
+
+
+def _probe_endpoint_name(probe: ProbeResult, endpoints: Mapping[str, Any]) -> str:
+    if getattr(probe, "endpoint", None):
+        return probe.endpoint
+    if probe.source in endpoints:
+        return probe.source
+    return re.sub(r"[^a-z0-9]+", "-", "auto-" + probe.source.lower()).strip("-")
 
 
 def create_app(
@@ -271,7 +344,8 @@ def create_app(
         status = service.status()
         public_status = {"status": status["status"], "version": status["version"]}
         return JSONResponse(
-            public_status, status_code=200 if status["status"] != "unavailable" else 503
+            public_status,
+            status_code=200 if status.get("ready", status["status"] == "ready") else 503,
         )
 
     async def router_status(request: Request) -> Response:
@@ -336,8 +410,8 @@ def create_app(
         try:
             body = await _json_body(request)
             model = str(body.get("model", body.get("name", "auto")))
-            await service.router()
-            _strategy(model)
+            router = await service.router()
+            _, alias = _resolve_model(router, model)
         except (ValueError, GatewayUnavailable) as exc:
             return _ollama_error(str(exc), 503 if isinstance(exc, GatewayUnavailable) else 404)
         return JSONResponse(
@@ -347,7 +421,7 @@ def create_app(
                 "parameters": "",
                 "template": "",
                 "details": {"family": "llm-router", "families": ["llm-router"]},
-                "capabilities": ["completion", "tools", "vision"],
+                "capabilities": _model_capabilities(router, alias),
                 "model_info": {"general.architecture": "llm-router"},
             }
         )
@@ -359,11 +433,15 @@ def create_app(
         try:
             body = await _json_body(request)
             model = str(body.get("model", body.get("name", "")))
-            _strategy(model)
-        except ValueError as exc:
-            return _ollama_error(str(exc), 404)
+            if model in VIRTUAL_MODELS:
+                alias = None
+            else:
+                router = await service.router()
+                _, alias = _resolve_model(router, model)
+        except (ValueError, GatewayUnavailable) as exc:
+            return _ollama_error(str(exc), 503 if isinstance(exc, GatewayUnavailable) else 404)
         report: ProvisioningReport | None = None
-        if hasattr(service, "provision"):
+        if alias is None and hasattr(service, "provision"):
             try:
                 report = await service.provision()
             except Exception as exc:
@@ -388,17 +466,19 @@ def create_app(
         try:
             body = await _json_body(request)
             model = str(body.get("model", "auto"))
-            strategy = _strategy(model)
+            router = await service.router()
+            strategy, alias = _resolve_model(router, model)
             preferred_tags = VIRTUAL_PREFERRED_TAGS.get(model, ())
             messages = body.get("messages")
             if not isinstance(messages, list):
                 raise ValueError("messages must be an array")
             if not messages:
                 return JSONResponse(_ollama_empty(model, "load"))
-            router = await service.router()
             query = _query_request(
                 body, messages, strategy, ollama=True, preferred_tags=preferred_tags
             )
+            if alias is not None:
+                query = alias.apply(query)
             completion = await router.complete(query)
             first, final = _ollama_completion(model, completion)
             if body.get("stream", True):
@@ -422,7 +502,7 @@ def create_app(
         if denied:
             return denied
         try:
-            await service.router()
+            router = await service.router()
         except GatewayUnavailable as exc:
             return _openai_error(str(exc), 503, "router_unavailable")
         now = int(time.time())
@@ -436,7 +516,7 @@ def create_app(
                         "created": now,
                         "owned_by": "llm-router",
                     }
-                    for model in VIRTUAL_MODELS
+                    for model in (*VIRTUAL_MODELS, *build_aliases(router.config))
                 ],
             }
         )
@@ -448,15 +528,17 @@ def create_app(
         try:
             body = await _json_body(request)
             model = str(body.get("model", "auto"))
-            strategy = _strategy(model)
+            router = await service.router()
+            strategy, alias = _resolve_model(router, model)
             preferred_tags = VIRTUAL_PREFERRED_TAGS.get(model, ())
             messages = body.get("messages")
             if not isinstance(messages, list) or not messages:
                 raise ValueError("messages must be a non-empty array")
-            router = await service.router()
             query = _query_request(
                 body, messages, strategy, ollama=False, preferred_tags=preferred_tags
             )
+            if alias is not None:
+                query = alias.apply(query)
             completion = await router.complete(query)
             payload = _openai_completion(model, completion)
             if body.get("stream", False):
@@ -576,9 +658,10 @@ def _messages_have_images(messages: list[Any]) -> bool:
 
 def _ollama_models(router: LLMRouter) -> list[dict[str, Any]]:
     now = _timestamp()
-    largest_context = max(
-        (model.context_window for model in router.config.models if model.enabled), default=8192
-    )
+    aliases = build_aliases(router.config)
+    def largest_context(name: str) -> int:
+        members = aliases[name].models if name in aliases else router.config.models
+        return max((model.context_window for model in members if model.enabled), default=8192)
     return [
         {
             "name": name,
@@ -592,11 +675,33 @@ def _ollama_models(router: LLMRouter) -> list[dict[str, Any]]:
                 "families": ["llm-router"],
                 "parameter_size": "dynamic",
                 "quantization_level": "dynamic",
-                "context_length": largest_context,
+                "context_length": largest_context(name),
             },
         }
-        for name in VIRTUAL_MODELS
+        for name in (*VIRTUAL_MODELS, *aliases)
     ]
+
+
+def _resolve_model(router: LLMRouter, name: str) -> tuple[str, ModelAlias | None]:
+    if name in VIRTUAL_MODELS:
+        return VIRTUAL_MODELS[name], None
+    alias = build_aliases(router.config).get(name)
+    if alias is None:
+        raise ValueError(f"unknown virtual model '{name}'; query the model list for available aliases")
+    return alias.strategy, alias
+
+
+def _model_capabilities(router: LLMRouter, alias: ModelAlias | None) -> list[str]:
+    members = alias.models if alias else router.config.models
+    capabilities = ["completion"]
+    for public, internal in (("tools", "tool_use"), ("vision", "vision")):
+        if any(
+            model.enabled
+            and model.capabilities.get(internal, 0) >= router.config.policy.capability_threshold
+            for model in members
+        ):
+            capabilities.append(public)
+    return capabilities
 
 
 def _ollama_completion(

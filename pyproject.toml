@@ -46,6 +46,7 @@ where = ["src"]
 [tool.setuptools.data-files]
 "share/source-agnostic-llm-router/config" = [
   "config/router.example.toml",
+  "config/router.ha.example.toml",
   "config/router.env.example",
 ]
 "share/source-agnostic-llm-router/plugins/llm-router" = ["plugins/llm-router/.mcp.json"]

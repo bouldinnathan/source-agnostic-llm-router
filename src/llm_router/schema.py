@@ -76,6 +76,9 @@ class EndpointConfig:
     options: Mapping[str, Any] = field(default_factory=dict)
     timeout_seconds: float = 90.0
     verify_tls: bool = True
+    machine_id: str | None = None
+    discover: bool = False
+    health_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +98,7 @@ class ModelConfig:
     priority: int = 0
     routing_weight: float = 1.0
     tags: tuple[str, ...] = ()
+    replica_group: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +113,8 @@ class PolicyConfig:
     circuit_breaker_cooldown_seconds: float = 30.0
     latency_ewma_alpha: float = 0.25
     diversify_fallbacks: bool = True
+    health_check_interval_seconds: float = 15.0
+    health_check_timeout_seconds: float = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +143,8 @@ class QueryRequest:
     exclude_deployments: tuple[str, ...] = ()
     exclude_endpoints: tuple[str, ...] = ()
     preferred_tags: tuple[str, ...] = ()
+    allowed_deployments: tuple[str, ...] | None = None
+    preferred_endpoints: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.messages:

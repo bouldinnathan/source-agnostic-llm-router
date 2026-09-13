@@ -1,0 +1,50 @@
+# Replace these example DNS names and exact upstream model IDs with your fleet.
+# The router host must be able to resolve the names through LAN/VPN DNS.
+# `machine_id` stays the same even if you later change base_url.
+
+[router]
+default_strategy = "quality"
+max_attempts = 4
+health_check_interval_seconds = 15
+health_check_timeout_seconds = 2
+circuit_breaker_failures = 3
+circuit_breaker_cooldown_seconds = 30
+
+[endpoints.golemframe-ollama]
+adapter = "ollama-chat"
+base_url = "http://golemframe.home.arpa:11434"
+machine_id = "golemframe"
+discover = true
+
+[endpoints.pantheon-studio]
+adapter = "openai-compatible"
+base_url = "http://pantheon.example-vpn:1234/v1"
+machine_id = "pantheon"
+discover = true
+auth = { scheme = "none" }
+# For authentication, replace auth above with:
+# auth = { scheme = "bearer", key_env = "PANTHEON_API_KEY" }
+
+# Omit model entries entirely for automatic groups based on exact upstream names.
+# These two entries explicitly declare equivalent replicas advertised under
+# different runtime names. Verify model weights, version, size and quantization
+# before assigning the same replica_group. Adjust context/capabilities as needed.
+# Produces qwen-ha, qwen-golemframe, qwen-pantheon and each -nofailover alias.
+
+[[models]]
+id = "golemframe-qwen"
+endpoint = "golemframe-ollama"
+upstream_model = "qwen3:14b"
+replica_group = "qwen"
+context_window = 32768
+max_output_tokens = 8192
+capabilities = { general = 0.8, tool_use = 0.8 }
+
+[[models]]
+id = "pantheon-qwen"
+endpoint = "pantheon-studio"
+upstream_model = "qwen3-14b"
+replica_group = "qwen"
+context_window = 32768
+max_output_tokens = 8192
+capabilities = { general = 0.8, tool_use = 0.8 }

@@ -101,3 +101,31 @@ def test_rejects_non_string_base_url() -> None:
                 ],
             }
         )
+
+
+def test_endpoint_only_discovery_and_health_policy():
+    config = config_from_mapping({
+        "router": {"health_check_interval_seconds": 12, "health_check_timeout_seconds": 1.5},
+        "endpoints": {"laptop": {"adapter": "ollama-chat", "base_url": "http://laptop.vpn:11434", "machine_id": "pantheon", "discover": True, "health_path": "/api/version"}},
+    })
+    assert not config.models
+    assert config.endpoints["laptop"].machine_id == "pantheon"
+    assert config.endpoints["laptop"].discover
+    assert config.endpoints["laptop"].health_path == "/api/version"
+    assert config.policy.health_check_interval_seconds == 12
+    assert config.policy.health_check_timeout_seconds == 1.5
+
+
+@pytest.mark.parametrize("field,value", [("machine_id", ""), ("machine_id", 1), ("discover", "true"), ("health_path", " ")])
+def test_rejects_invalid_machine_settings(field, value):
+    with pytest.raises(ConfigError):
+        config_from_mapping({
+            "endpoints": {"laptop": {"adapter": "ollama-chat", "discover": True, field: value}},
+            "models": [{"id": "one", "endpoint": "laptop", "upstream_model": "qwen"}],
+        })
+
+
+def test_ha_example_produces_expected_aliases():
+    from llm_router.aliases import build_aliases
+    config = load_config("config/router.ha.example.toml")
+    assert {"qwen-ha", "qwen-golemframe", "qwen-pantheon", "qwen-golemframe-nofailover", "qwen-pantheon-nofailover"} == set(build_aliases(config))

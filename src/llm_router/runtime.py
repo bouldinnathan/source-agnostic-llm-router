@@ -20,18 +20,40 @@ class DeploymentState:
     last_error: str | None = None
 
 
+@dataclass(slots=True)
+class EndpointState:
+    """API reachability is independent of model inference circuit breakers."""
+
+    reachable: bool | None = None
+    last_checked_at: float | None = None
+    last_error: str | None = None
+
+
 class RuntimeRegistry:
     """Tracks ephemeral deployment health for one router process."""
 
     def __init__(self, policy: PolicyConfig) -> None:
         self.policy = policy
         self._states: dict[str, DeploymentState] = {}
+        self._endpoint_states: dict[str, EndpointState] = {}
 
     def state(self, deployment: str) -> DeploymentState:
         return self._states.setdefault(deployment, DeploymentState())
 
     def is_available(self, deployment: str) -> bool:
         return self.state(deployment).circuit_open_until <= time.monotonic()
+
+    def endpoint_available(self, endpoint: str) -> bool:
+        state = self._endpoint_states.get(endpoint)
+        return state is None or state.reachable is not False
+
+    def record_endpoint_probe(
+        self, endpoint: str, reachable: bool | None, error: str | None = None
+    ) -> None:
+        state = self._endpoint_states.setdefault(endpoint, EndpointState())
+        state.reachable = reachable
+        state.last_checked_at = time.time() if reachable is not None else None
+        state.last_error = error
 
     def begin(self, deployment: str) -> None:
         self.state(deployment).active_requests += 1
@@ -84,6 +106,7 @@ class RuntimeRegistry:
                 {
                     "deployment": model.id,
                     "endpoint": model.endpoint,
+                    "endpoint_available": self.endpoint_available(model.endpoint),
                     "enabled": model.enabled,
                     "circuit_open": state.circuit_open_until > now,
                     "circuit_open_for_seconds": round(max(0.0, state.circuit_open_until - now), 3),
@@ -100,4 +123,14 @@ class RuntimeRegistry:
                     "last_error": state.last_error,
                 }
             )
-        return {"deployments": deployments}
+        endpoint_names = set(self._endpoint_states) | {model.endpoint for model in models}
+        endpoints: dict[str, dict[str, Any]] = {}
+        for name in sorted(endpoint_names):
+            endpoint_state = self._endpoint_states.get(name, EndpointState())
+            endpoints[name] = {
+                "reachable": endpoint_state.reachable,
+                "probed": endpoint_state.reachable is not None,
+                "last_checked_at": endpoint_state.last_checked_at,
+                "last_error": endpoint_state.last_error,
+            }
+        return {"deployments": deployments, "endpoints": endpoints}

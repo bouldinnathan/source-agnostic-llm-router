@@ -133,7 +133,10 @@ class LLMRouter:
                     "adapter": self.config.endpoints[model.endpoint].adapter,
                     "upstream_model": model.upstream_model,
                     "enabled": model.enabled,
-                    "available": self.runtime.is_available(model.id),
+                    "available": self.runtime.is_available(model.id)
+                    and self.runtime.endpoint_available(model.endpoint),
+                    "machine_id": self.config.endpoints[model.endpoint].machine_id or model.endpoint,
+                    "replica_group": model.replica_group or model.upstream_model,
                     "quality": model.quality,
                     "priority": model.priority,
                     "routing_weight": model.routing_weight,

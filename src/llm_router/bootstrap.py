@@ -34,10 +34,10 @@ async def bootstrap_router(
     effective_settings = settings or DiscoverySettings.from_env()
     if not discovery:
         effective_settings = replace(effective_settings, enabled=False)
-    discoverer = model_discovery or ModelDiscovery(effective_settings)
+    discoverer = model_discovery or ModelDiscovery(effective_settings, configured=configured)
     report = await discoverer.discover()
     merged = merge_router_configs(configured, report.config)
-    if not merged.models:
+    if not merged.models and not any(endpoint.discover for endpoint in merged.endpoints.values()):
         raise ConfigError(
             "No LLM models were configured or discovered. Start Ollama/LM Studio/vLLM, "
             "set a supported provider API-key environment variable, supply "

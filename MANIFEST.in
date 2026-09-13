@@ -1,5 +1,6 @@
 include install.sh
 include config/router.example.toml
+include config/router.ha.example.toml
 include config/router.env.example
 include plugins/llm-router/.mcp.json
 include plugins/llm-router/.codex-plugin/plugin.json

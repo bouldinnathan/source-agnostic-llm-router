@@ -13,6 +13,11 @@ circuit_breaker_failures = 3
 circuit_breaker_cooldown_seconds = 30
 latency_ewma_alpha = 0.25
 diversify_fallbacks = true
+health_check_interval_seconds = 15
+health_check_timeout_seconds = 2
+
+# See router.ha.example.toml for machine_id, DNS/VPN names, discover=true,
+# and replica_group aliases with preferred-machine / -nofailover behavior.
 
 # Two independent addresses can expose the same logical model. They remain
 # separate deployments so health, latency, and failover are source-specific.

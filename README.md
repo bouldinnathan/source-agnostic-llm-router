@@ -138,9 +138,120 @@ In Home Assistant, use its [official Ollama integration](https://www.home-assist
 4. Add a Conversation or AI Task entry and select model `auto`.
 5. When enabling Home Assistant control, expose only the intended entities. Requests containing Assist tools automatically require a tool-capable deployment.
 
-Home Assistant sees only virtual models—`auto`, `auto:quality`, `auto:balanced`, `auto:cost`, `auto:latency`, `auto:priority`, `auto:local`, and `auto:cloud`. It does not need to know whether an answer came from Ollama, another LAN host, or a cloud provider. Use the Ollama path because Home Assistant's [official OpenAI integration](https://www.home-assistant.io/integrations/openai_conversation) intentionally accepts only the official OpenAI endpoint.
+Home Assistant sees virtual models: the `auto` presets plus model-specific HA, preferred-machine, and machine-only aliases described below. It does not need to know whether an answer came from Ollama, another LAN host, or a cloud provider. Response `router` metadata identifies the actual deployment for diagnostics. Use the Ollama path because Home Assistant's [official OpenAI integration](https://www.home-assistant.io/integrations/openai_conversation) intentionally accepts only the official OpenAI endpoint.
 
 The gateway also serves OpenAI-compatible `GET /v1/models` and `POST /v1/chat/completions`, plus health and diagnostics at `/healthz` and authenticated `/router/status`.
+
+### Model replicas, preferred machines, and HA
+
+Every enabled model automatically gets an HA alias and two aliases for each machine
+hosting it. Both the Ollama and OpenAI model lists advertise them. For a model group
+named `qwen` on machines `golemframe` and `pantheon`:
+
+| Client model | Routing behavior |
+|---|---|
+| `qwen-ha` | Rank matching replicas by latency, load, health, and capability; retry on failure. |
+| `qwen-golemframe` | Try Golemframe first when eligible, then matching replicas elsewhere. |
+| `qwen-pantheon` | Try Pantheon first when eligible, then matching replicas elsewhere. |
+| `qwen-golemframe-nofailover` | Only Golemframe may receive the request; return 503 if it cannot serve. |
+| `qwen-pantheon-nofailover` | Only Pantheon may receive the request; return 503 if it cannot serve. |
+
+The default group is the exact upstream model name, including its version/size tag.
+For example, `qwen3:14b` produces `qwen3-14b-ha`. Names are lowercased with punctuation
+converted to hyphens. Distinct names are never merged just because their aliases
+look alike: ambiguous aliases are omitted and reported under `alias_conflicts` in
+`/router/status`.
+
+Set `replica_group = "qwen"` on explicit model entries to use a short group name or
+map equivalent models that Ollama and LM Studio advertise under different names.
+This is an operator declaration of equivalence: verify weights, version, size, and
+quantization yourself. Automatic matching by name is not a checksum verification.
+All fallbacks must remain in the selected group and satisfy tool, vision, context,
+and other request requirements. Machine preference overrides scoring only after
+those hard requirements pass. The existing `auto` presets can still choose other
+models across the fleet.
+
+If several service endpoints share a `machine_id`, the machine aliases cover those
+services together. `-nofailover` restricts the machine, not a particular port.
+Requests keep their selected alias in responses, even when another replica answers.
+Failover retries inference with the supplied history; the agent still owns tool
+execution and must include conversation/tool results in subsequent requests. The
+gateway does not migrate backend-owned sessions, files, or tool execution.
+
+### Known machines, health checks, and changing IP addresses
+
+Use a stable DNS or VPN hostname and give each machine a persistent name:
+
+```bash
+export LLM_ROUTER_DISCOVERY_URLS="ollama@golemframe=http://golemframe.home.arpa:11434,openai@pantheon=http://pantheon.example-vpn:1234/v1"
+```
+
+The `@name` is the router's machine identity. Changing its URL retains its deployment
+IDs and aliases; keeping the hostname while its DNS address changes needs no router
+configuration update. Plain `ollama=URL`/`openai=URL` still works, with machine labels
+derived from the hostname or IP (`local` for loopback). Two distinct services of the
+same protocol on one machine should use separate configured endpoint names and the
+same `machine_id`.
+
+An endpoints-only configuration can discover all models without maintaining lists:
+
+```toml
+[router]
+health_check_interval_seconds = 15
+health_check_timeout_seconds = 2
+
+[endpoints.golemframe-ollama]
+adapter = "ollama-chat"
+base_url = "http://golemframe.home.arpa:11434"
+machine_id = "golemframe"
+discover = true
+
+[endpoints.pantheon-studio]
+adapter = "openai-compatible"
+base_url = "http://pantheon.example-vpn:1234/v1"
+machine_id = "pantheon"
+discover = true
+auth = { scheme = "none" }
+```
+
+Replace those hostnames with names resolvable from the router. For authenticated
+servers, configure `auth`/`api_key_env` as with inference. See
+[`config/router.ha.example.toml`](config/router.ha.example.toml) for an explicit
+cross-runtime group example. Existing configured endpoints with enabled models are
+also discovered when gateway discovery is enabled; explicit model metadata takes
+precedence over discovered metadata, including disabled entries.
+
+The gateway probes each enabled or explicitly discoverable endpoint's model-list
+API every 15 seconds by default, with a 2-second timeout and bounded concurrency.
+These checks verify API reachability without loading a model or making an inference
+request. Failed endpoints are skipped until a probe succeeds. Model inference
+failures retain their own circuit breakers: a successful model-list probe does not
+prove generation will work or clear an inference circuit prematurely. Preferred
+machines become eligible again on later requests after recovery; in-flight work
+continues on its selected backend.
+
+Health checks run even with `serve --no-discovery`. Model discovery separately runs
+every `LLM_ROUTER_DISCOVERY_REFRESH` seconds (300 by default), and recovering known
+endpoints trigger another scan promptly when discovery is enabled. Failed discovery
+retains previously discovered model aliases while health marks the source offline.
+Explicit discoverable sources can start offline and be enrolled when they return.
+For custom/generic adapters, set an API-relative `health_path` (for example `/health`)
+to enable probes; otherwise they use inference failures for health. Probe paths are
+appended to `base_url`, and configured credentials/TLS settings apply.
+
+There is no common machine UUID in the model-list APIs used by this router. Ollama's
+[`digest`](https://docs.ollama.com/api/tags) identifies a model artifact, and
+[LM Studio's API](https://lmstudio.ai/docs/developer/rest) exposes models and inference
+state; those are not a cross-runtime machine identity. `machine_id` is a configured
+label, not proof of the remote machine's identity. For a laptop/VPN, use stable DNS
+or update its configured URL. The router does not guess that a newly seen IP belongs
+to an old machine from model names, and a name alone cannot locate an unknown address.
+
+Health timestamps and errors appear under `/router/status`; `/readyz` returns 503
+when no enabled deployment is currently usable. Backend HA still requires a surviving
+eligible replica within the configured retry budget and the client's timeout. The
+gateway itself needs separate redundancy if its host must also tolerate failure.
+Streaming responses are currently buffered until an entire upstream answer completes.
 
 ### CLI routing
 
@@ -245,6 +356,7 @@ Built-in adapters are `openai-responses`, `openai-chat`/`openai-compatible`, `an
 ## Operational notes
 
 - Runtime health is intentionally process-local; restarting resets learned latency and circuits.
+- API health probes run independently of discovery and keep offline endpoints out of routing until recovery.
 - Gateway discovery refreshes atomically. A total refresh failure leaves the previous router active and marks status as degraded.
 - Individual unreachable discovery probes are reported but never cancel healthy probes.
 - Provisioning checks CPU, available memory, free disk, artifact cap, and disk reserve before a local pull; failures remain isolated status data.

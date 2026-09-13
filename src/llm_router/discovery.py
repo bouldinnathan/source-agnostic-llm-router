@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import math
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
 import httpx
 
+from .adapters import BUILTIN_ADAPTERS
+from .errors import ConfigError
 from .schema import AuthConfig, EndpointConfig, ModelConfig, PolicyConfig, RouterConfig
 
 
@@ -79,6 +82,9 @@ class ProbeSpec:
     auth_prefix: str | None = None
     request_headers: Mapping[str, str] = field(default_factory=dict)
     request_query_param: str | None = None
+    machine_id: str | None = None
+    configured_endpoint: EndpointConfig | None = None
+    discover: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +95,7 @@ class ProbeResult:
     reachable: bool
     enrolled_models: int = 0
     error: str | None = None
+    endpoint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -100,6 +107,8 @@ class ProbeResult:
         }
         if self.error:
             payload["error"] = self.error
+        if self.endpoint is not None:
+            payload["endpoint"] = self.endpoint
         return payload
 
 
@@ -141,9 +150,11 @@ class ModelDiscovery:
         settings: DiscoverySettings | None = None,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        configured: RouterConfig | None = None,
     ) -> None:
         self.settings = settings or DiscoverySettings.from_env()
         self.transport = transport
+        self.configured = configured
 
     async def discover(self) -> DiscoveryReport:
         if not self.settings.enabled:
@@ -165,7 +176,7 @@ class ModelDiscovery:
         results: list[ProbeResult] = []
         for source in enrolled:
             results.append(source.result)
-            if not source.models:
+            if not source.models and not source.endpoint.discover:
                 continue
             endpoints[source.endpoint.name] = source.endpoint
             for model in source.models:
@@ -182,6 +193,11 @@ class ModelDiscovery:
         self, client: httpx.AsyncClient, probe: ProbeSpec
     ) -> _EnrolledSource:
         try:
+            if probe.configured_endpoint and not probe.configured_endpoint.verify_tls:
+                async with httpx.AsyncClient(
+                    transport=self.transport, verify=False, follow_redirects=False
+                ) as endpoint_client:
+                    return await self._probe(endpoint_client, probe)
             return await self._probe(client, probe)
         except asyncio.CancelledError:
             raise
@@ -198,8 +214,9 @@ class ModelDiscovery:
             message = f"HTTP client error ({type(exc).__name__})"
         except Exception as exc:  # Discovery plugins/endpoints must not stop the gateway.
             message = f"probe failed ({type(exc).__name__})"
+        endpoint = _endpoint_for_probe(probe)
         return _EnrolledSource(
-            endpoint=_endpoint_for_probe(probe),
+            endpoint=endpoint,
             models=(),
             result=ProbeResult(
                 source=probe.name,
@@ -207,6 +224,7 @@ class ModelDiscovery:
                 base_url=probe.base_url,
                 reachable=False,
                 error=message,
+                endpoint=endpoint.name,
             ),
         )
 
@@ -230,6 +248,10 @@ class ModelDiscovery:
             entries = await self._ollama_details(client, probe, entries, headers, params)
 
         endpoint = _endpoint_for_probe(probe)
+        if probe.configured_endpoint is None:
+            # A server with an empty model catalog is still a known server.
+            # Keep checking it so newly loaded models can be enrolled later.
+            endpoint = replace(endpoint, discover=True)
         models: list[ModelConfig] = []
         seen: set[str] = set()
         for entry in entries:
@@ -253,6 +275,7 @@ class ModelDiscovery:
             reachable=True,
             enrolled_models=len(models),
             error=None if models else "reachable but no chat-capable models were listed",
+            endpoint=endpoint.name,
         )
         return _EnrolledSource(endpoint=endpoint, models=tuple(models), result=result)
 
@@ -292,10 +315,10 @@ class ModelDiscovery:
         return list(await asyncio.gather(*(enrich(entry) for entry in entries)))
 
     def _probes(self) -> tuple[ProbeSpec, ...]:
-        probes: list[ProbeSpec] = []
+        probes = _configured_probes(self.configured, self.settings.timeout_seconds)
+        probes.extend(_extra_probes(self.settings.extra_urls, self.settings.timeout_seconds))
         if self.settings.include_loopback:
             probes.extend(_loopback_probes(self.settings.timeout_seconds))
-        probes.extend(_extra_probes(self.settings.extra_urls, self.settings.timeout_seconds))
         probes.extend(
             _lan_probes(
                 self.settings.scan_cidrs,
@@ -305,9 +328,29 @@ class ModelDiscovery:
         )
         if self.settings.include_cloud:
             probes.extend(_cloud_probes(self.settings.cloud_timeout_seconds))
+        configured_addresses = {
+            _service_address(endpoint.base_url)
+            for endpoint in (self.configured.endpoints.values() if self.configured else ())
+            if endpoint.base_url.startswith(("http://", "https://"))
+        }
         unique: dict[tuple[str, str], ProbeSpec] = {}
+        identities: dict[str, tuple[str, str]] = {}
         for probe in probes:
-            unique.setdefault((probe.kind, probe.list_url), probe)
+            # Explicit configuration owns its service address even when all its
+            # deployments are disabled. Do not re-enroll those through another
+            # automatic name or the server's OpenAI compatibility endpoint.
+            if probe.configured_endpoint is None and _service_address(probe.base_url) in configured_addresses:
+                continue
+            key = (probe.kind, str(httpx.URL(probe.list_url)))
+            name = _endpoint_for_probe(probe).name
+            if name in identities and identities[name] != key:
+                raise ConfigError(
+                    f"Discovery endpoint '{name}' refers to multiple URLs or protocols. "
+                    "Use separately named configured endpoints for multiple services; "
+                    "they may share one machine_id."
+                )
+            identities[name] = key
+            unique.setdefault(key, probe)
         return tuple(unique.values())
 
 
@@ -320,7 +363,16 @@ def merge_router_configs(
         return discovered
     endpoints = dict(discovered.endpoints)
     endpoints.update(configured.endpoints)
-    models = {model.id: model for model in discovered.models}
+    # An explicit deployment can deliberately use a readable ID instead of the
+    # generated discovery ID. Its settings still override the same remote model.
+    explicit_replicas = {
+        (model.endpoint, model.upstream_model) for model in configured.models
+    }
+    models = {
+        model.id: model
+        for model in discovered.models
+        if (model.endpoint, model.upstream_model) not in explicit_replicas
+    }
     for model in configured.models:
         models[model.id] = model
     source = configured.source_path or "explicit config"
@@ -476,23 +528,24 @@ def _loopback_probes(timeout: float) -> list[ProbeSpec]:
 
 def _extra_probes(values: tuple[str, ...], timeout: float) -> list[ProbeSpec]:
     probes: list[ProbeSpec] = []
-    for index, raw in enumerate(values):
+    for raw in values:
         kind = "auto"
+        machine_id: str | None = None
         value = raw.strip()
-        for prefix in ("ollama=", "openai="):
-            if value.lower().startswith(prefix):
-                kind = prefix[:-1]
-                value = value[len(prefix) :]
-                break
+        prefix = re.match(r"^(ollama|openai)(?:@([^=]+))?=(.+)$", value, re.IGNORECASE)
+        if prefix:
+            kind = prefix.group(1).lower()
+            machine_id = prefix.group(2).strip() if prefix.group(2) else None
+            value = prefix.group(3).strip()
         parsed = urlparse(value)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             continue
         base = value.rstrip("/")
-        host_label = _slug(parsed.netloc)
+        host_label = _identity_slug(machine_id) if machine_id else _url_identity_label(base)
         if kind in {"auto", "ollama"} and not base.endswith("/v1"):
             probes.append(
                 ProbeSpec(
-                    name=f"custom-ollama-{index}-{host_label}",
+                    name=f"custom-ollama-{host_label}",
                     provider="ollama",
                     kind="ollama",
                     base_url=base,
@@ -500,13 +553,15 @@ def _extra_probes(values: tuple[str, ...], timeout: float) -> list[ProbeSpec]:
                     adapter="ollama-chat",
                     local=_is_private_host(parsed.hostname),
                     timeout_seconds=timeout,
+                    machine_id=machine_id,
+                    discover=True,
                 )
             )
         if kind in {"auto", "openai"}:
             api_base = base if base.endswith("/v1") else base + "/v1"
             probes.append(
                 ProbeSpec(
-                    name=f"custom-openai-{index}-{host_label}",
+                    name=f"custom-openai-{host_label}",
                     provider="openai-compatible",
                     kind="openai",
                     base_url=api_base,
@@ -514,8 +569,65 @@ def _extra_probes(values: tuple[str, ...], timeout: float) -> list[ProbeSpec]:
                     adapter="openai-chat",
                     local=_is_private_host(parsed.hostname),
                     timeout_seconds=timeout,
+                    machine_id=machine_id,
+                    discover=True,
                 )
             )
+    # Explicit names take precedence even if a bare URL appeared earlier.
+    return sorted(probes, key=lambda probe: probe.machine_id is None)
+
+
+def _configured_probes(config: RouterConfig | None, timeout: float) -> list[ProbeSpec]:
+    if config is None:
+        return []
+    active = {model.endpoint for model in config.models if model.enabled}
+    kinds = {
+        "ollama": "ollama",
+        "ollama-chat": "ollama",
+        "openai-chat": "openai",
+        "openai-compatible": "openai",
+        "openai-responses": "openai",
+        "anthropic": "anthropic",
+        "anthropic-messages": "anthropic",
+        "gemini": "gemini",
+        "gemini-generate": "gemini",
+    }
+    paths = {
+        "ollama": "/api/tags",
+        "openai": "/models",
+        "anthropic": "/v1/models",
+        "gemini": "/models",
+    }
+    probes: list[ProbeSpec] = []
+    for endpoint in config.endpoints.values():
+        kind = kinds.get(endpoint.adapter)
+        if kind is None or not (endpoint.discover or endpoint.name in active):
+            continue
+        parsed = urlparse(endpoint.base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        base = endpoint.base_url.rstrip("/")
+        list_path = paths[kind]
+        if kind == "anthropic" and parsed.path.rstrip("/").endswith("/v1"):
+            list_path = "/models"
+        probes.append(
+            ProbeSpec(
+                name=endpoint.name,
+                provider="openai-compatible" if kind == "openai" else kind,
+                kind=kind,
+                base_url=base,
+                list_url=base + list_path,
+                adapter=endpoint.adapter,
+                local=_is_private_host(parsed.hostname),
+                timeout_seconds=min(timeout, endpoint.timeout_seconds),
+                request_headers=(
+                    {"anthropic-version": str(endpoint.options.get("api_version", "2023-06-01"))}
+                    if kind == "anthropic" else {}
+                ),
+                machine_id=endpoint.machine_id or endpoint.name,
+                configured_endpoint=endpoint,
+            )
+        )
     return probes
 
 
@@ -675,11 +787,13 @@ def _cloud_probes(timeout: float) -> list[ProbeSpec]:
 
 
 def _endpoint_for_probe(probe: ProbeSpec) -> EndpointConfig:
+    if probe.configured_endpoint is not None:
+        return probe.configured_endpoint
     options: dict[str, Any] = {}
     if probe.provider == "openai":
         options["max_tokens_field"] = "max_completion_tokens"
     return EndpointConfig(
-        name=_slug("auto-" + probe.name),
+        name=_identity_slug("auto-" + probe.name),
         adapter=probe.adapter,
         base_url=probe.base_url.rstrip("/"),
         auth=AuthConfig(
@@ -691,10 +805,17 @@ def _endpoint_for_probe(probe: ProbeSpec) -> EndpointConfig:
         ),
         options=options,
         timeout_seconds=120.0 if probe.local else 90.0,
+        machine_id=probe.machine_id or (
+            probe.provider if probe.name.startswith("cloud-") else _machine_id(probe.base_url)
+        ),
+        discover=probe.discover,
     )
 
 
 def _probe_auth(probe: ProbeSpec) -> tuple[dict[str, str], dict[str, str]]:
+    if probe.configured_endpoint is not None:
+        adapter = BUILTIN_ADAPTERS[probe.adapter]()
+        return adapter.connection_metadata(probe.configured_endpoint, probe.request_headers)
     headers = dict(probe.request_headers)
     params: dict[str, str] = {}
     if not probe.key_env:
@@ -847,6 +968,25 @@ def _slug(value: str) -> str:
     return normalized[:96] or "auto-source"
 
 
+def _identity_slug(value: str) -> str:
+    """Keep normalized names readable without conflating distinct identities."""
+
+    slug = _slug(value)
+    if slug == value:
+        return slug
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    return f"{slug[:83]}-{digest}"
+
+
+def _url_identity_label(base_url: str) -> str:
+    url = httpx.URL(base_url)
+    host = url.host + (f"-{url.port}" if url.port is not None else "")
+    # Distinguish URL paths and transports without including credentials or
+    # private path/query components in deployment IDs returned to clients.
+    digest = hashlib.sha256(str(url).encode("utf-8")).hexdigest()[:12]
+    return f"{_slug(host)[:83]}-{digest}"
+
+
 def _is_private_host(host: str | None) -> bool:
     if not host:
         return False
@@ -859,6 +999,29 @@ def _is_private_host(host: str | None) -> bool:
     except ValueError:
         return False
     return address.is_private or address.is_loopback or address.is_link_local
+
+
+def _machine_id(base_url: str) -> str:
+    """Use address identity only; matching changed IPs needs an explicit name."""
+
+    host = (urlparse(base_url).hostname or "unknown").lower()
+    if host == "localhost":
+        return "local"
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return "local"
+    except ValueError:
+        pass
+    return host
+
+
+def _service_address(base_url: str) -> tuple[str, str, int | None, str]:
+    url = httpx.URL(base_url)
+    host = _machine_id(base_url)
+    # Ollama can expose both its native API and /v1 compatibility API at the
+    # same address. A disabled configured service must reserve both surfaces.
+    path = url.path.rstrip("/").removesuffix("/v1")
+    return url.scheme, host, url.port, path
 
 
 def _normalized_base_url(value: str) -> str:

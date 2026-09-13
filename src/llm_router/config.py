@@ -70,9 +70,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> RouterConfig:
 def config_from_mapping(payload: Mapping[str, Any], *, source_path: str | None = None) -> RouterConfig:
     root = _mapping(payload, "config")
     endpoints_raw = _mapping(root.get("endpoints"), "endpoints")
-    models_raw = root.get("models")
-    if not isinstance(models_raw, list) or not models_raw:
-        raise ConfigError("models must be a non-empty array")
+    models_raw = root.get("models", [])
+    if not isinstance(models_raw, list):
+        raise ConfigError("models must be an array")
 
     endpoints: dict[str, EndpointConfig] = {}
     for name, raw_value in endpoints_raw.items():
@@ -111,6 +111,9 @@ def config_from_mapping(payload: Mapping[str, Any], *, source_path: str | None =
                 raw.get("timeout_seconds", 90.0), f"endpoints.{name}.timeout_seconds"
             ),
             verify_tls=_boolean(raw.get("verify_tls", True), f"endpoints.{name}.verify_tls"),
+            machine_id=_optional_nonempty_string(raw, "machine_id", f"endpoints.{name}"),
+            discover=_boolean(raw.get("discover", False), f"endpoints.{name}.discover"),
+            health_path=_optional_nonempty_string(raw, "health_path", f"endpoints.{name}"),
         )
 
     models: list[ModelConfig] = []
@@ -175,9 +178,12 @@ def config_from_mapping(payload: Mapping[str, Any], *, source_path: str | None =
                     raw.get("routing_weight", 1.0), f"{location}.routing_weight"
                 ),
                 tags=tuple(dict.fromkeys(tag.strip() for tag in tags_value if tag.strip())),
+                replica_group=_optional_nonempty_string(raw, "replica_group", location),
             )
         )
 
+    if not models and not any(endpoint.discover for endpoint in endpoints.values()):
+        raise ConfigError("models must be a non-empty array unless an endpoint enables discovery")
     policy = _parse_policy(_mapping(root.get("router", {}), "router"))
     return RouterConfig(
         endpoints=endpoints,
@@ -235,6 +241,14 @@ def _parse_policy(raw: Mapping[str, Any]) -> PolicyConfig:
         diversify_fallbacks=_boolean(
             raw.get("diversify_fallbacks", True), "router.diversify_fallbacks"
         ),
+        health_check_interval_seconds=_positive_float(
+            raw.get("health_check_interval_seconds", 15.0),
+            "router.health_check_interval_seconds",
+        ),
+        health_check_timeout_seconds=_positive_float(
+            raw.get("health_check_timeout_seconds", 2.0),
+            "router.health_check_timeout_seconds",
+        ),
     )
 
 
@@ -258,6 +272,15 @@ def _optional_string(raw: Mapping[str, Any], key: str, location: str) -> str | N
     if not isinstance(value, str):
         raise ConfigError(f"{location}.{key} must be a string")
     return value
+
+
+def _optional_nonempty_string(raw: Mapping[str, Any], key: str, location: str) -> str | None:
+    value = _optional_string(raw, key, location)
+    if value is not None:
+        if not value.strip():
+            raise ConfigError(f"{location}.{key} must be a non-empty string")
+        return value.strip()
+    return None
 
 
 def _boolean(value: Any, location: str) -> bool:
