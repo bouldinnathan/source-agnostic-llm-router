@@ -2,9 +2,40 @@
 set -eu
 
 router_repo_url=${LLM_ROUTER_REPO_URL:-https://github.com/bouldinnathan/source-agnostic-llm-router.git}
-router_version=${LLM_ROUTER_VERSION:-v0.3.0}
+router_version=${LLM_ROUTER_VERSION:-main}
 router_install_dir=${LLM_ROUTER_INSTALL_DIR:-"${HOME}/.local/share/source-agnostic-llm-router"}
 router_bin_dir=${LLM_ROUTER_BIN_DIR:-"${HOME}/.local/bin"}
+router_config_home=${XDG_CONFIG_HOME:-"${HOME}/.config"}
+router_service=0
+
+for router_arg in "$@"; do
+    case "$router_arg" in
+        --service) router_service=1 ;;
+        --help|-h)
+            printf '%s\n' 'Usage: sh install.sh [--service]' \
+                'Installs/updates from main; set LLM_ROUTER_VERSION to pin a Git revision.' \
+                '--service: enable a systemd user service at boot and after logout.' \
+                'Run as your normal user. sudo may be needed for prerequisites/lingering.'
+            exit 0
+            ;;
+        *) printf 'Unknown argument: %s\n' "$router_arg" >&2; exit 2 ;;
+    esac
+done
+
+if [ "$router_service" -eq 1 ]; then
+    if [ "$(id -u)" -eq 0 ]; then
+        printf '%s\n' 'Run --service as your normal user, without sudo.' >&2
+        exit 2
+    fi
+    if ! command -v systemctl >/dev/null 2>&1 || ! command -v loginctl >/dev/null 2>&1; then
+        printf '%s\n' '--service requires Linux with systemd and loginctl.' >&2
+        exit 2
+    fi
+    if ! systemctl --user show-environment >/dev/null 2>&1; then
+        printf '%s\n' 'No systemd user session: run this from a normal local or SSH login.' >&2
+        exit 2
+    fi
+fi
 
 find_python() {
     if [ -n "${LLM_ROUTER_PYTHON:-}" ]; then
@@ -27,14 +58,11 @@ find_python() {
     return 1
 }
 
-install_ubuntu_prerequisites() {
+install_prerequisites() {
     if [ ! -r /etc/os-release ]; then
         return 1
     fi
     . /etc/os-release
-    if [ "${ID:-}" != "ubuntu" ]; then
-        return 1
-    fi
     if [ "$(id -u)" -eq 0 ]; then
         privilege=""
     elif command -v sudo >/dev/null 2>&1; then
@@ -42,33 +70,43 @@ install_ubuntu_prerequisites() {
     else
         return 1
     fi
-    $privilege apt-get update
-    $privilege apt-get install -y python3 python3-venv python3-pip git ca-certificates
+    case " ${ID:-} ${ID_LIKE:-} " in
+        *" ubuntu "*|*" debian "*)
+            $privilege apt-get update
+            $privilege apt-get install -y python3 python3-venv python3-pip git ca-certificates
+            ;;
+        *" arch "*|*" manjaro "*)
+            $privilege pacman -S --needed --noconfirm python python-pip git ca-certificates
+            ;;
+        *) return 1 ;;
+    esac
 }
 
 router_python=$(find_python || true)
 if [ -z "$router_python" ]; then
-    install_ubuntu_prerequisites || {
+    install_prerequisites || {
         printf '%s\n' "Python 3.10+ with venv support is required." >&2
         exit 2
     }
     router_python=$(find_python || true)
 fi
 if [ -z "$router_python" ]; then
-    printf '%s\n' "Ubuntu's installed Python is older than 3.10; use Ubuntu 22.04+ or set LLM_ROUTER_PYTHON." >&2
+    printf '%s\n' 'Python 3.10+ is required; upgrade your distribution or set LLM_ROUTER_PYTHON.' >&2
     exit 2
 fi
 
 if ! command -v git >/dev/null 2>&1 && [ -z "${LLM_ROUTER_SOURCE:-}" ]; then
-    install_ubuntu_prerequisites || {
+    install_prerequisites || {
         printf '%s\n' "git is required to install from the repository." >&2
         exit 2
     }
 fi
 
 mkdir -p "$router_install_dir" "$router_bin_dir"
+router_install_dir=$(cd "$router_install_dir" && pwd -P)
+router_bin_dir=$(cd "$router_bin_dir" && pwd -P)
 if ! "$router_python" -m venv "$router_install_dir/venv"; then
-    install_ubuntu_prerequisites
+    install_prerequisites
     "$router_python" -m venv "$router_install_dir/venv"
 fi
 
@@ -84,5 +122,11 @@ done
 "$router_bin_dir/llm-router" --help >/dev/null
 printf '%s\n' "Installed source-agnostic-llm-router ${router_version}."
 printf '%s\n' "Commands are in ${router_bin_dir}; add it to PATH if needed."
-printf '%s\n' "Run: ${router_bin_dir}/llm-router provision --dry-run"
-printf '%s\n' "Run: ${router_bin_dir}/llm-router serve --host 0.0.0.0 --port 8088"
+if [ "$router_service" -eq 1 ]; then
+    "$router_venv_python" -m llm_router.service \
+        --install-dir "$router_install_dir" --config-home "$router_config_home"
+else
+    printf '%s\n' "Run: ${router_bin_dir}/llm-router provision --dry-run"
+    printf '%s\n' "Run: ${router_bin_dir}/llm-router serve --host 127.0.0.1 --port 8088"
+    printf '%s\n' 'Or rerun this installer with --service for an always-on systemd service.'
+fi

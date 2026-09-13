@@ -22,13 +22,86 @@ The dry-run routing path never sends the prompt upstream. The completion path at
 
 Python 3.10 or newer is required, including Ubuntu 22.04's system Python. The MCP entry point uses the current v2 line of the official Python SDK.
 
-One-command Ubuntu install or update from the tagged GitHub release:
+### Copy-paste install with a background service (Linux/systemd)
+
+Run this as your **normal user**, not with `sudo`. Requires `curl` and a normal
+local/SSH login with a working systemd user session (Ubuntu 22.04+, Debian with
+Python 3.10+, Arch, or Manjaro). The installer can use `sudo` for missing package
+prerequisites and to enable startup at boot.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bouldinnathan/source-agnostic-llm-router/v0.3.0/install.sh | sh
+(
+  set -eu
+  router_installer="$(mktemp)"
+  trap 'rm -f -- "$router_installer"' EXIT
+  curl -fsSL https://raw.githubusercontent.com/bouldinnathan/source-agnostic-llm-router/main/install.sh -o "$router_installer"
+  sh "$router_installer" --service
+)
 ```
 
-The installer creates an isolated virtual environment under `~/.local/share`, links commands into `~/.local/bin`, and never modifies Ubuntu's system Python packages. Ubuntu compatibility is continuously checked on 22.04 and 24.04 in `.github/workflows/ubuntu.yml`.
+This installs the latest `main`, including the HA and preferred-machine aliases,
+and enables `llm-router.service` as a **systemd user service**. It starts immediately,
+restarts after crashes, starts at boot, and continues after logout using systemd
+lingering. If lingering cannot be enabled, installation reports an error with the
+administrator command needed; it does not claim boot persistence succeeded.
+
+Rerun the same block to update the package and restart the service. Updates preserve
+the service's environment file, API key, and optional `router.toml`. Changed unit
+definitions are backed up alongside the unit; use `systemctl --user edit
+llm-router.service` for persistent unit overrides. Updating this single proxy briefly
+interrupts it; backend HA does not make proxy updates zero-downtime.
+
+New service installs listen on **`http://127.0.0.1:8088`**; OpenAI clients use
+**`http://127.0.0.1:8088/v1`**. A random client API key is saved in
+`~/.config/llm-router/router.env` with owner-only permissions. If `XDG_CONFIG_HOME`
+is set, that directory replaces `~/.config` for both settings and the user unit.
+The service discovers local runtimes automatically and refreshes discovery every
+30 seconds. It does not download models by default. An empty fleet is allowed;
+`/healthz` reports unavailable until a usable backend/model is found.
+
+```bash
+# Edit settings and read the generated LLM_ROUTER_GATEWAY_API_KEY for your clients:
+nano "${XDG_CONFIG_HOME:-$HOME/.config}/llm-router/router.env"
+systemctl --user restart llm-router.service
+systemctl --user status llm-router.service --no-pager
+# Follow logs (Ctrl+C stops following, not the service):
+journalctl --user -u llm-router.service -f
+```
+
+For your fleet, add this to `router.env`, substituting real DNS/VPN hostnames:
+
+```ini
+LLM_ROUTER_DISCOVERY_URLS="ollama@golemframe=http://golemframe.home.arpa:11434,openai@pantheon=http://pantheon.example-vpn:1234/v1"
+```
+
+To allow clients on other machines, also change `LLM_ROUTER_HOST=127.0.0.1` to
+`LLM_ROUTER_HOST=0.0.0.0` in that file and restart the service. Keep the API key
+enabled, restrict access to your trusted LAN/VPN with your firewall, and use TLS
+when traffic is not protected by a trusted network/VPN. The installer does not
+open firewall ports. Clients connect to `http://ROUTER_HOST:8088` (Ollama) or
+`http://ROUTER_HOST:8088/v1` (OpenAI) and use the generated key. Shell `export`
+commands do not configure an already-running service; put settings in `router.env`
+(without `export`). You can also put explicit overrides in the same directory's
+`router.toml`, or set `LLM_ROUTER_CONFIG` in `router.env` to an absolute config path.
+
+To stop it and disable future startup: `systemctl --user disable --now llm-router.service`.
+This keeps the installation and configuration. Lingering is left enabled because
+other user services may depend on it.
+
+### Package only / pinned installs
+
+Omit `--service` from the copy-paste block to install only the commands, with no
+service or lingering changes. Set `LLM_ROUTER_VERSION` when invoking the downloaded
+installer to pin a Git tag or commit, for example
+`LLM_ROUTER_VERSION=YOUR_COMMIT sh "$router_installer" --service`. A pinned revision
+must include service support to use `--service`; the old `v0.3.0` tag predates both
+the HA update and this service installer.
+
+The installer creates an isolated virtual environment under `~/.local/share`, links
+commands into `~/.local/bin`, and never installs router dependencies into system
+Python. Ubuntu compatibility is continuously checked on 22.04 and 24.04 in
+`.github/workflows/ubuntu.yml`. If `curl` is missing, install it with `sudo apt-get
+install curl` (Ubuntu/Debian) or `sudo pacman -S --needed curl` (Arch/Manjaro).
 
 To install the local wheel instead:
 

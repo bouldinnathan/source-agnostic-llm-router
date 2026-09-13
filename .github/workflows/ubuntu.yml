@@ -39,6 +39,22 @@ jobs:
           LLM_ROUTER_INSTALL_DIR: ${{ runner.temp }}/llm-router-install
           LLM_ROUTER_BIN_DIR: ${{ runner.temp }}/llm-router-bin
         run: ./install.sh
+      - name: Validate generated systemd service
+        if: matrix.python-version == '3.10'
+        env:
+          LLM_ROUTER_INSTALL_DIR: ${{ runner.temp }}/llm-router-install
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from llm_router.service import write_user_service
+
+          write_user_service(
+              Path(os.environ["LLM_ROUTER_INSTALL_DIR"]),
+              Path(os.environ["RUNNER_TEMP"]) / "llm-router-config",
+          )
+          PY
+          systemd-analyze verify "$RUNNER_TEMP/llm-router-config/systemd/user/llm-router.service"
 
   package:
     runs-on: ubuntu-24.04
