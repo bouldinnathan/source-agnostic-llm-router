@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Sequence
 
 SERVICE_NAME = "llm-router.service"
+UPDATE_SERVICE_NAME = "llm-router-update.service"
+UPDATE_TIMER_NAME = "llm-router-update.timer"
 
 
 def _unit_path(value: Path) -> str:
@@ -79,15 +81,21 @@ def write_user_service(install_dir: Path, config_home: Path) -> tuple[Path, Path
                 'openai@pantheon=http://pantheon.example-vpn:1234/v1"\n'
                 "# Optional provider keys or LLM_ROUTER_CONFIG=/absolute/path/router.toml go here.\n"
             )
+    _write_unit(unit_path, unit)
+    return unit_path, env_path
+
+
+def _write_unit(unit_path: Path, unit: str) -> None:
+    unit_dir = unit_path.parent
     unit_dir.mkdir(parents=True, exist_ok=True)
     if unit_path.exists() and unit_path.read_text(encoding="utf-8") == unit:
-        return unit_path, env_path
+        return
     if unit_path.exists():
-        backup_fd, backup_name = tempfile.mkstemp(prefix=f"{SERVICE_NAME}.backup-", dir=unit_dir)
+        backup_fd, backup_name = tempfile.mkstemp(prefix=f"{unit_path.name}.backup-", dir=unit_dir)
         os.close(backup_fd)
         shutil.copy2(unit_path, backup_name)
         print(f"Previous service definition backed up to {backup_name}")
-    fd, staging_name = tempfile.mkstemp(prefix=f".{SERVICE_NAME}.", dir=unit_dir)
+    fd, staging_name = tempfile.mkstemp(prefix=f".{unit_path.name}.", dir=unit_dir)
     staging_path = Path(staging_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as unit_file:
@@ -96,7 +104,53 @@ def write_user_service(install_dir: Path, config_home: Path) -> tuple[Path, Path
         staging_path.replace(unit_path)
     finally:
         staging_path.unlink(missing_ok=True)
-    return unit_path, env_path
+
+
+def write_update_units(install_dir: Path, config_home: Path) -> tuple[Path, Path]:
+    """Render the opt-in updater without changing credentials or starting jobs."""
+
+    install_dir = install_dir.expanduser().resolve()
+    config_home = config_home.expanduser().resolve()
+    python = install_dir / "venv" / "bin" / "python"
+    if not python.is_file():
+        raise RuntimeError(f"Installed virtual environment not found: {python}")
+    unit_dir = config_home / "systemd" / "user"
+    # Validate the destination too, even though only the installation appears in
+    # these unit contents. Keep path rules consistent with the gateway service.
+    _unit_path(unit_dir)
+    service_path = unit_dir / UPDATE_SERVICE_NAME
+    timer_path = unit_dir / UPDATE_TIMER_NAME
+    update_service = (
+        "# Managed by source-agnostic-llm-router install.sh --service --auto-update.\n"
+        "[Unit]\n"
+        "Description=Check and install Source-Agnostic LLM Router updates\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"WorkingDirectory={_unit_path(install_dir)}\n"
+        f'ExecStart=:"{_unit_path(python)}" -m llm_router.updater '
+        f'--install-dir "{_unit_path(install_dir)}"\n'
+        "Environment=PYTHONUNBUFFERED=1\n"
+        "Environment=GIT_TERMINAL_PROMPT=0\n"
+        "Environment=PIP_NO_INPUT=1\n"
+        "TimeoutStartSec=45min\n"
+        "UMask=0077\n"
+        "NoNewPrivileges=true\n"
+    )
+    timer = (
+        "# Managed by source-agnostic-llm-router install.sh --service --auto-update.\n"
+        "[Unit]\n"
+        "Description=Daily Source-Agnostic LLM Router update check\n\n"
+        "[Timer]\n"
+        "OnCalendar=daily\n"
+        "RandomizedDelaySec=1h\n"
+        "Persistent=true\n"
+        f"Unit={UPDATE_SERVICE_NAME}\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+    _write_unit(service_path, update_service)
+    _write_unit(timer_path, timer)
+    return service_path, timer_path
 
 
 def preflight_user_service() -> None:
@@ -138,14 +192,27 @@ def preflight_user_service() -> None:
         ) from exc
 
 
-def install_user_service(install_dir: Path, config_home: Path) -> None:
+def install_user_service(install_dir: Path, config_home: Path, *, auto_update: bool = False) -> None:
+    if auto_update:
+        from .updater import installed_revision
+
+        # Validate actual installed provenance before enabling lingering, writing
+        # units or restarting anything, not merely the installer's environment.
+        installed_revision(install_dir)
     preflight_user_service()
     unit_path, env_path = write_user_service(install_dir, config_home)
+    if auto_update:
+        write_update_units(install_dir, config_home)
     for arguments in (
         ["daemon-reload"], ["enable", SERVICE_NAME], ["restart", SERVICE_NAME],
         ["is-active", "--quiet", SERVICE_NAME],
     ):
         subprocess.run(["systemctl", "--user", *arguments], check=True)
+    if auto_update:
+        subprocess.run(["systemctl", "--user", "enable", "--now", UPDATE_TIMER_NAME], check=True)
+        subprocess.run(["systemctl", "--user", "is-active", "--quiet", UPDATE_TIMER_NAME], check=True)
+        print("Automatic updates enabled: official main branch, daily with up to one hour of jitter.")
+        print("Update logs: journalctl --user -u llm-router-update.service")
     print(f"Service enabled and running: {SERVICE_NAME}")
     print(f"Service definition: {unit_path}")
     print(f"Settings and client API key (preserved on updates): {env_path}")
@@ -159,9 +226,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Install the router's systemd user service")
     parser.add_argument("--install-dir", type=Path, required=True)
     parser.add_argument("--config-home", type=Path, required=True)
+    parser.add_argument("--auto-update", action="store_true", help="Enable daily official-main updates")
     args = parser.parse_args(argv)
     try:
-        install_user_service(args.install_dir, args.config_home)
+        if args.auto_update:
+            install_user_service(args.install_dir, args.config_home, auto_update=True)
+        else:
+            install_user_service(args.install_dir, args.config_home)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"Service installation failed: {exc}", file=sys.stderr)
         print("Inspect logs: journalctl --user -u llm-router.service -n 50", file=sys.stderr)

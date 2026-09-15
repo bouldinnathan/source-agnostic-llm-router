@@ -480,3 +480,305 @@ def test_service_cli_passes_explicit_install_and_configuration_paths(
     ]) == 0
 
     assert calls == [install_paths]
+
+
+@pytest.fixture
+def update_source(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    from llm_router import updater
+
+    checked_paths: list[Path] = []
+
+    def installed_revision(install_dir: Path) -> str:
+        checked_paths.append(install_dir)
+        return "a" * 40
+
+    monkeypatch.setattr(updater, "installed_revision", installed_revision)
+    return checked_paths
+
+
+def test_write_update_units_creates_daily_persistent_timer_without_credentials(
+    install_paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_dir, config_home = install_paths
+    secret = "private-test-key-never-copy-to-an-update-unit"
+    monkeypatch.setenv("LLM_ROUTER_GATEWAY_API_KEY", secret)
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    env_path = config_home / "llm-router/router.env"
+    env_path.parent.mkdir(parents=True)
+    env_path.write_text(f"LLM_ROUTER_GATEWAY_API_KEY={secret}\n")
+    original_env = env_path.read_bytes()
+
+    update_path, timer_path = service.write_update_units(install_dir, config_home)
+
+    assert update_path == config_home / "systemd/user/llm-router-update.service"
+    assert timer_path == config_home / "systemd/user/llm-router-update.timer"
+    update = update_path.read_text()
+    timer = timer_path.read_text()
+    assert "Type=oneshot\n" in update
+    assert "TimeoutStartSec=45min\n" in update
+    assert f"WorkingDirectory={install_dir}\n" in update
+    assert (
+        f'ExecStart=:"{install_dir / "venv/bin/python"}" -m llm_router.updater '
+        f'--install-dir "{install_dir}"\n'
+    ) in update
+    assert "OnCalendar=daily\n" in timer
+    assert "RandomizedDelaySec=1h\n" in timer
+    assert "Persistent=true\n" in timer
+    assert "WantedBy=timers.target\n" in timer
+    assert "EnvironmentFile=" not in update
+    assert "router.env" not in update
+    assert secret not in update + timer
+    assert "API_KEY" not in update + timer
+    active_update = "\n".join(line for line in update.splitlines() if not line.startswith("#"))
+    assert "sudo" not in active_update
+    assert "curl" not in active_update
+    assert "bash" not in active_update
+    assert env_path.read_bytes() == original_env
+
+
+def test_write_update_units_is_idempotent_and_preserves_repeated_backups(
+    install_paths: tuple[Path, Path],
+) -> None:
+    install_dir, config_home = install_paths
+    gateway_path, env_path = service.write_user_service(install_dir, config_home)
+    gateway_before = gateway_path.read_bytes()
+    env_before = env_path.read_bytes()
+    update_path, timer_path = service.write_update_units(install_dir, config_home)
+    expected = {path: path.read_bytes() for path in (update_path, timer_path)}
+    unit_files_before = set(update_path.parent.iterdir())
+
+    assert service.write_update_units(install_dir, config_home) == (update_path, timer_path)
+
+    assert {path: path.read_bytes() for path in expected} == expected
+    assert set(update_path.parent.iterdir()) == unit_files_before
+    for generation in (1, 2):
+        old_units = {
+            update_path: f"# User-edited updater, version {generation}\n".encode(),
+            timer_path: f"# User-edited timer, version {generation}\n".encode(),
+        }
+        backups_before = {
+            path: path.read_bytes()
+            for path in update_path.parent.iterdir()
+            if path not in unit_files_before and path.is_file()
+        }
+        for path, content in old_units.items():
+            path.write_bytes(content)
+
+        service.write_update_units(install_dir, config_home)
+
+        assert {path: path.read_bytes() for path in expected} == expected
+        backups = [path for path in update_path.parent.iterdir() if path not in unit_files_before]
+        for content in old_units.values():
+            assert any(path.is_file() and path.read_bytes() == content for path in backups)
+        assert all(path.read_bytes() == content for path, content in backups_before.items())
+    assert gateway_path.read_bytes() == gateway_before
+    assert env_path.read_bytes() == env_before
+
+
+def test_update_unit_paths_are_absolute_with_literal_dollars_and_escaped_specifiers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    install_dir = Path("install space %n $HOME")
+    config_home = Path("config space %u $USER")
+    python = install_dir / "venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.touch(mode=0o755)
+
+    update_path, timer_path = service.write_update_units(install_dir, config_home)
+
+    assert update_path.is_absolute()
+    assert timer_path.is_absolute()
+    unit = update_path.read_text()
+    absolute_install = str(install_dir.resolve()).replace("%", "%%")
+    assert f"WorkingDirectory={absolute_install}\n" in unit
+    assert (
+        f'ExecStart=:"{absolute_install}/venv/bin/python" -m llm_router.updater '
+        f'--install-dir "{absolute_install}"\n'
+    ) in unit
+    assert "$$HOME" not in unit
+    assert not (config_home / "llm-router/router.env").exists()
+
+
+@pytest.mark.parametrize("character", ["'", '"', "\\", "*", "?", "[", "]", "\n", "\x7f"])
+@pytest.mark.parametrize("invalid_path", ["installation", "configuration"])
+def test_update_units_reject_unsafe_paths_before_writing(
+    tmp_path: Path, character: str, invalid_path: str,
+) -> None:
+    install_dir = tmp_path / (f"install{character}path" if invalid_path == "installation" else "installation")
+    config_home = tmp_path / (f"config{character}path" if invalid_path == "configuration" else "configuration")
+    python = install_dir / "venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.touch(mode=0o755)
+
+    with pytest.raises(ValueError):
+        service.write_update_units(install_dir, config_home)
+
+    assert not config_home.exists()
+
+
+def test_update_units_require_existing_python_before_writing(tmp_path: Path) -> None:
+    config_home = tmp_path / "configuration"
+
+    with pytest.raises((RuntimeError, FileNotFoundError), match="[Pp]ython|venv"):
+        service.write_update_units(tmp_path / "missing-install", config_home)
+
+    assert not config_home.exists()
+
+
+def test_auto_update_validates_source_then_enables_timer_after_gateway_is_active(
+    install_paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from llm_router import updater
+
+    install_dir, config_home = install_paths
+    events: list[object] = []
+
+    def validate(installation: Path) -> str:
+        assert installation == install_dir
+        events.append("validate-source")
+        return "a" * 40
+
+    def write_gateway(installation: Path, configuration: Path) -> tuple[Path, Path]:
+        assert (installation, configuration) == install_paths
+        events.append("write-gateway")
+        return config_home / "gateway-unit", config_home / "router.env"
+
+    def write_updates(installation: Path, configuration: Path) -> tuple[Path, Path]:
+        assert (installation, configuration) == install_paths
+        events.append("write-updates")
+        return config_home / "update-unit", config_home / "update-timer"
+
+    def run(args: list[str], *, check: bool, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert check is True
+        events.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(updater, "installed_revision", validate)
+    monkeypatch.setattr(service, "preflight_user_service", lambda: events.append("preflight"))
+    monkeypatch.setattr(service, "write_user_service", write_gateway)
+    monkeypatch.setattr(service, "write_update_units", write_updates)
+    monkeypatch.setattr(service.subprocess, "run", run)
+
+    service.install_user_service(install_dir, config_home, auto_update=True)
+
+    assert events == [
+        "validate-source", "preflight", "write-gateway", "write-updates",
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "llm-router.service"],
+        ["systemctl", "--user", "restart", "llm-router.service"],
+        ["systemctl", "--user", "is-active", "--quiet", "llm-router.service"],
+        ["systemctl", "--user", "enable", "--now", "llm-router-update.timer"],
+        ["systemctl", "--user", "is-active", "--quiet", "llm-router-update.timer"],
+    ]
+
+
+@pytest.mark.parametrize("explicit_false", [False, True])
+def test_auto_update_opt_out_does_not_validate_source_or_touch_existing_timer(
+    install_paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+    update_source: list[Path], explicit_false: bool,
+) -> None:
+    install_dir, config_home = install_paths
+    update_path = config_home / "systemd/user/llm-router-update.service"
+    timer_path = update_path.with_suffix(".timer")
+    update_path.parent.mkdir(parents=True)
+    update_path.write_bytes(b"# Preserve an existing custom update service\n")
+    timer_path.write_bytes(b"# Preserve the existing timer and its enabled state\n")
+    before = {path: path.read_bytes() for path in (update_path, timer_path)}
+    commands: list[list[str]] = []
+    monkeypatch.setattr(service, "preflight_user_service", lambda: None)
+
+    def run(args: list[str], *, check: bool, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert check is True
+        commands.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(service.subprocess, "run", run)
+    if explicit_false:
+        service.install_user_service(install_dir, config_home, auto_update=False)
+    else:
+        service.install_user_service(install_dir, config_home)
+
+    assert update_source == []
+    assert {path: path.read_bytes() for path in before} == before
+    assert not any("llm-router-update.timer" in command for command in commands)
+    assert not any("llm-router-update.service" in command for command in commands)
+
+
+def test_auto_update_invalid_source_fails_before_preflight_or_gateway_changes(
+    install_paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from llm_router import updater
+
+    install_dir, config_home = install_paths
+    gateway_path, env_path = service.write_user_service(install_dir, config_home)
+    before = {path: path.read_bytes() for path in (gateway_path, env_path)}
+    existing_paths = set(config_home.rglob("*"))
+
+    def invalid_source(installation: Path) -> str:
+        assert installation == install_dir
+        raise RuntimeError("Automatic updates require a verified installed Git revision")
+
+    def unexpected_preflight() -> None:
+        raise AssertionError("Invalid source must fail before changing linger or services")
+
+    monkeypatch.setattr(updater, "installed_revision", invalid_source)
+    monkeypatch.setattr(service, "preflight_user_service", unexpected_preflight)
+
+    with pytest.raises(RuntimeError, match="verified installed Git revision"):
+        service.install_user_service(install_dir, config_home, auto_update=True)
+
+    assert {path: path.read_bytes() for path in before} == before
+    assert set(config_home.rglob("*")) == existing_paths
+
+
+@pytest.mark.parametrize("failed_action", ["enable", "is-active"])
+def test_auto_update_timer_failure_is_reported_by_cli(
+    install_paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+    update_source: list[Path], capsys: pytest.CaptureFixture[str], failed_action: str,
+) -> None:
+    install_dir, config_home = install_paths
+    commands: list[list[str]] = []
+    monkeypatch.setattr(service, "preflight_user_service", lambda: None)
+
+    def run(args: list[str], *, check: bool, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert check is True
+        commands.append(args)
+        if "llm-router-update.timer" in args and failed_action in args:
+            raise subprocess.CalledProcessError(1, args, stderr="Update timer failed")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(service.subprocess, "run", run)
+
+    result = service.main([
+        "--install-dir", str(install_dir), "--config-home", str(config_home), "--auto-update",
+    ])
+
+    output = capsys.readouterr()
+    assert result == 2
+    assert "Service installation failed" in output.err
+    assert "llm-router-update.timer" in output.err
+    assert commands[-1][2] == failed_action
+    assert commands[-1][-1] == "llm-router-update.timer"
+    assert update_source == [install_dir]
+
+
+def test_service_cli_passes_auto_update_only_when_requested(
+    install_paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_dir, config_home = install_paths
+    calls: list[tuple[Path, Path, dict[str, bool]]] = []
+
+    def install(installation: Path, configuration: Path, **kwargs: bool) -> None:
+        calls.append((installation, configuration, kwargs))
+
+    monkeypatch.setattr(service, "install_user_service", install)
+
+    assert service.main([
+        "--install-dir", str(install_dir), "--config-home", str(config_home), "--auto-update",
+    ]) == 0
+    assert service.main([
+        "--install-dir", str(install_dir), "--config-home", str(config_home),
+    ]) == 0
+
+    assert calls == [(install_dir, config_home, {"auto_update": True}), (install_dir, config_home, {})]

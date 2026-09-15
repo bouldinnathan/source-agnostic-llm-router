@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 from pathlib import Path
 import subprocess
@@ -92,6 +93,74 @@ def test_service_flag_delegates_to_installed_helper_with_exact_paths(installer_e
         "--install-dir", installer_environment["LLM_ROUTER_INSTALL_DIR"],
         "--config-home", installer_environment["XDG_CONFIG_HOME"],
     ] in recorded
+
+
+def test_auto_update_flag_is_forwarded_only_when_requested(installer_environment):
+    result = run_installer(installer_environment, "--service", "--auto-update")
+    assert result.returncode == 0, result.stderr
+    service_calls = [call for call in calls(installer_environment) if "llm_router.service" in call]
+    assert len(service_calls) == 1
+    assert service_calls[0][-1] == "--auto-update"
+
+
+def test_auto_update_requires_service_before_any_installation(installer_environment):
+    result = run_installer(installer_environment, "--auto-update")
+    assert result.returncode == 2
+    assert "requires --service" in result.stderr
+    assert not calls(installer_environment)
+
+
+@pytest.mark.parametrize("override", [
+    {"LLM_ROUTER_VERSION": "v0.3.0"},
+    {"LLM_ROUTER_VERSION": "a" * 40},
+    {"LLM_ROUTER_SOURCE": "/local/source"},
+    {"LLM_ROUTER_REPO_URL": "https://example.invalid/fork.git"},
+])
+def test_auto_update_refuses_local_custom_and_pinned_sources(installer_environment, override):
+    installer_environment.update(override)
+    result = run_installer(installer_environment, "--service", "--auto-update")
+    assert result.returncode == 2
+    assert "official repository main branch" in result.stderr
+    assert not calls(installer_environment)
+    assert not Path(installer_environment["LLM_ROUTER_INSTALL_DIR"]).exists()
+
+
+def test_installer_respects_updater_lock_without_touching_active_runtime(installer_environment):
+    installation = Path(installer_environment["LLM_ROUTER_INSTALL_DIR"])
+    installation.mkdir()
+    sentinel = installation / "venv" / ".llm-router-update.json"
+    sentinel.parent.mkdir()
+    sentinel.write_text("preserve until lock is acquired")
+    with (installation / ".update.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = run_installer(installer_environment)
+    assert result.returncode == 2
+    assert "Another router installation/update" in result.stderr
+    assert not any(call[0] == "python" for call in calls(installer_environment))
+    assert sentinel.read_text() == "preserve until lock is acquired"
+
+
+def test_manual_reinstall_clears_prior_auto_update_provenance(installer_environment):
+    # A deliberate SHA pin must not be considered auto-managed just because the
+    # previous automatic update installed that exact same commit.
+    installer_environment["LLM_ROUTER_VERSION"] = "a" * 40
+    installation = Path(installer_environment["LLM_ROUTER_INSTALL_DIR"])
+    provenance = installation / "venv" / ".llm-router-update.json"
+    provenance.parent.mkdir(parents=True)
+    provenance.write_text('{"commit": "previous auto-update"}')
+    result = run_installer(installer_environment)
+    assert result.returncode == 0, result.stderr
+    assert not provenance.exists()
+
+
+def test_rerun_reuses_existing_runtime_without_replacing_its_python(installer_environment):
+    first = run_installer(installer_environment)
+    assert first.returncode == 0, first.stderr
+    second = run_installer(installer_environment)
+    assert second.returncode == 0, second.stderr
+    recorded = calls(installer_environment)
+    assert sum(call[1:3] == ["-m", "venv"] for call in recorded) == 1
+    assert ["python", "-m", "pip", "--version"] in recorded
 
 
 def test_relative_install_directories_produce_working_absolute_links(

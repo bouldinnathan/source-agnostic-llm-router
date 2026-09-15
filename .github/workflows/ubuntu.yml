@@ -47,14 +47,19 @@ jobs:
           python - <<'PY'
           import os
           from pathlib import Path
-          from llm_router.service import write_user_service
+          from llm_router.service import write_user_service, write_update_units
 
           write_user_service(
               Path(os.environ["LLM_ROUTER_INSTALL_DIR"]),
               Path(os.environ["RUNNER_TEMP"]) / "llm-router-config",
           )
+          write_update_units(
+              Path(os.environ["LLM_ROUTER_INSTALL_DIR"]),
+              Path(os.environ["RUNNER_TEMP"]) / "llm-router-config",
+          )
           PY
           systemd-analyze verify "$RUNNER_TEMP/llm-router-config/systemd/user/llm-router.service"
+          systemd-analyze verify "$RUNNER_TEMP/llm-router-config/systemd/user/llm-router-update.service" "$RUNNER_TEMP/llm-router-config/systemd/user/llm-router-update.timer"
 
   package:
     runs-on: ubuntu-24.04

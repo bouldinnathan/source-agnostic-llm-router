@@ -7,20 +7,35 @@ router_install_dir=${LLM_ROUTER_INSTALL_DIR:-"${HOME}/.local/share/source-agnost
 router_bin_dir=${LLM_ROUTER_BIN_DIR:-"${HOME}/.local/bin"}
 router_config_home=${XDG_CONFIG_HOME:-"${HOME}/.config"}
 router_service=0
+router_auto_update=0
 
 for router_arg in "$@"; do
     case "$router_arg" in
         --service) router_service=1 ;;
+        --auto-update) router_auto_update=1 ;;
         --help|-h)
-            printf '%s\n' 'Usage: sh install.sh [--service]' \
+            printf '%s\n' 'Usage: sh install.sh [--service [--auto-update]]' \
                 'Installs/updates from main; set LLM_ROUTER_VERSION to pin a Git revision.' \
                 '--service: enable a systemd user service at boot and after logout.' \
+                '--auto-update: with --service, automatically install official-main updates daily.' \
                 'Run as your normal user. sudo may be needed for prerequisites/lingering.'
             exit 0
             ;;
         *) printf 'Unknown argument: %s\n' "$router_arg" >&2; exit 2 ;;
     esac
 done
+
+if [ "$router_auto_update" -eq 1 ]; then
+    if [ "$router_service" -ne 1 ]; then
+        printf '%s\n' '--auto-update requires --service.' >&2
+        exit 2
+    fi
+    if [ "$router_version" != main ] || [ -n "${LLM_ROUTER_SOURCE:-}" ] || \
+       [ "$router_repo_url" != https://github.com/bouldinnathan/source-agnostic-llm-router.git ]; then
+        printf '%s\n' '--auto-update only supports the official repository main branch, not local/custom/pinned installs.' >&2
+        exit 2
+    fi
+fi
 
 if [ "$router_service" -eq 1 ]; then
     if [ "$(id -u)" -eq 0 ]; then
@@ -105,7 +120,30 @@ fi
 mkdir -p "$router_install_dir" "$router_bin_dir"
 router_install_dir=$(cd "$router_install_dir" && pwd -P)
 router_bin_dir=$(cd "$router_bin_dir" && pwd -P)
-if ! "$router_python" -m venv "$router_install_dir/venv"; then
+if command -v flock >/dev/null 2>&1; then
+    # Share this lock with the scheduled updater; fd 9 stays open until exit.
+    exec 9>"$router_install_dir/.update.lock"
+    if ! flock -n 9; then
+        printf '%s\n' 'Another router installation/update is running; try again after it finishes.' >&2
+        exit 2
+    fi
+elif [ "$router_service" -eq 1 ] || [ -f "$router_install_dir/.update.lock" ]; then
+    printf '%s\n' 'flock (util-linux) is required to safely update a service installation.' >&2
+    exit 2
+fi
+# A manual reinstall must not inherit proof that a previous SHA was installed by
+# the main-branch updater. In particular, a deliberate pin must stay pinned.
+if [ -e "$router_install_dir/venv/.llm-router-update.json" ]; then
+    rm -f -- "$router_install_dir/venv/.llm-router-update.json"
+fi
+if [ -x "$router_install_dir/venv/bin/python" ]; then
+    # An updater-managed runtime may contain a copied Python executable which
+    # the gateway is currently using. Do not recreate/overwrite that executable.
+    if ! "$router_install_dir/venv/bin/python" -m pip --version >/dev/null 2>&1; then
+        printf '%s\n' 'The existing router virtual environment is unusable; stop the service and repair it before reinstalling.' >&2
+        exit 2
+    fi
+elif ! "$router_python" -m venv "$router_install_dir/venv"; then
     install_prerequisites
     "$router_python" -m venv "$router_install_dir/venv"
 fi
@@ -123,8 +161,13 @@ done
 printf '%s\n' "Installed source-agnostic-llm-router ${router_version}."
 printf '%s\n' "Commands are in ${router_bin_dir}; add it to PATH if needed."
 if [ "$router_service" -eq 1 ]; then
-    "$router_venv_python" -m llm_router.service \
-        --install-dir "$router_install_dir" --config-home "$router_config_home"
+    if [ "$router_auto_update" -eq 1 ]; then
+        "$router_venv_python" -m llm_router.service \
+            --install-dir "$router_install_dir" --config-home "$router_config_home" --auto-update
+    else
+        "$router_venv_python" -m llm_router.service \
+            --install-dir "$router_install_dir" --config-home "$router_config_home"
+    fi
 else
     printf '%s\n' "Run: ${router_bin_dir}/llm-router provision --dry-run"
     printf '%s\n' "Run: ${router_bin_dir}/llm-router serve --host 127.0.0.1 --port 8088"

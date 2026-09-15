@@ -35,17 +35,20 @@ prerequisites and to enable startup at boot.
   router_installer="$(mktemp)"
   trap 'rm -f -- "$router_installer"' EXIT
   curl -fsSL https://raw.githubusercontent.com/bouldinnathan/source-agnostic-llm-router/main/install.sh -o "$router_installer"
-  sh "$router_installer" --service
+  sh "$router_installer" --service --auto-update
 )
 ```
 
 This installs the latest `main`, including the HA and preferred-machine aliases,
 and enables `llm-router.service` as a **systemd user service**. It starts immediately,
 restarts after crashes, starts at boot, and continues after logout using systemd
-lingering. If lingering cannot be enabled, installation reports an error with the
+lingering. The explicit `--auto-update` option also enables a daily software-update
+timer. Omit `--auto-update` if you want manual software updates only. If lingering
+cannot be enabled, installation reports an error with the
 administrator command needed; it does not claim boot persistence succeeded.
 
-Rerun the same block to update the package and restart the service. Updates preserve
+Rerun the same block to update an older installation and enable the timer, or to
+manually update the package and restart the service. Updates preserve
 the service's environment file, API key, and optional `router.toml`. Changed unit
 definitions are backed up alongside the unit; use `systemctl --user edit
 llm-router.service` for persistent unit overrides. Updating this single proxy briefly
@@ -84,13 +87,62 @@ commands do not configure an already-running service; put settings in `router.en
 (without `export`). You can also put explicit overrides in the same directory's
 `router.toml`, or set `LLM_ROUTER_CONFIG` in `router.env` to an absolute config path.
 
-To stop it and disable future startup: `systemctl --user disable --now llm-router.service`.
-This keeps the installation and configuration. Lingering is left enabled because
-other user services may depend on it.
+### Automatic software updates
+
+`sh install.sh --service --auto-update` opts into installing future commits from
+the **official repository's `main` branch**, not just tagged releases. It creates
+`llm-router-update.timer` and `llm-router-update.service` alongside the gateway's
+user service. Existing installations do not acquire this behavior until you opt
+in. This updates the router software and its Python dependencies, not Ollama,
+LM Studio, your operating system, or backend model files.
+
+The timer checks daily around midnight in the server's local timezone, with up to
+one hour of randomized delay. Missed checks are caught up after downtime. An
+unchanged commit causes no reinstall or restart. Network/download failures leave
+the active runtime alone and are retried at the next scheduled check.
+
+For a new commit, the updater installs that exact commit into a separate virtual
+environment and checks imports and gateway startup without contacting your
+backends. It switches runtimes only after these checks pass. If restarting the
+gateway fails its process-stability checks, it restores the previous runtime and
+attempts to restart it. These checks do not guarantee that every application-level
+behavior in a new version is correct. Updates briefly interrupt a running proxy;
+backend HA does not provide redundancy for the proxy itself. A deliberately
+stopped gateway is not started by the updater.
+
+Configuration and credentials are preserved. Previous runtimes are retained under
+`~/.local/share/source-agnostic-llm-router/releases` (or your chosen installation
+directory) for recovery and are not automatically pruned; allow disk space for
+them. A shared lock prevents manual installs and scheduled updates from modifying
+the same installation concurrently.
+
+```bash
+# Next scheduled check:
+systemctl --user list-timers llm-router-update.timer --all
+# Check/install now:
+systemctl --user start llm-router-update.service
+# Update logs:
+journalctl --user -u llm-router-update.service -n 50 --no-pager
+# Disable future checks, then cancel any in-progress update:
+systemctl --user disable --now llm-router-update.timer
+systemctl --user stop llm-router-update.service
+```
+
+Rerunning the installer without `--auto-update` does not disable an existing timer;
+use the commands above. Local, editable, fork, wheel and explicitly pinned installs
+are not eligible for automatic updates. Combining those sources with
+`--auto-update` fails before package installation. If you later manually pin or
+replace an auto-updated installation, the updater refuses to switch it back to
+`main`; disable the timer as well to stop unnecessary scheduled checks.
+
+To stop the gateway and disable future startup, disable/cancel updates as above,
+then run `systemctl --user disable --now llm-router.service`. This keeps the
+installation and configuration. Lingering is left enabled because other user
+services may depend on it.
 
 ### Package only / pinned installs
 
-Omit `--service` from the copy-paste block to install only the commands, with no
+Omit both `--service` and `--auto-update` from the copy-paste block to install only the commands, with no
 service or lingering changes. Set `LLM_ROUTER_VERSION` when invoking the downloaded
 installer to pin a Git tag or commit, for example
 `LLM_ROUTER_VERSION=YOUR_COMMIT sh "$router_installer" --service`. A pinned revision
