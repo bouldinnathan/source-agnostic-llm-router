@@ -36,7 +36,7 @@ class Element {
   addEventListener(name, callback) { this.events[name] = callback; }
 }
 
-function harness(authRequired = true, autoLoadHosts = true) {
+function harness(authRequired = true, autoLoadHosts = true, options = {}) {
   const elements = new Map();
   for (const match of markup.matchAll(/<([a-z][a-z0-9]*)\b[^>]*\bid="([^"]+)"[^>]*>/g)) {
     const node = new Element(match[1]);
@@ -50,6 +50,9 @@ function harness(authRequired = true, autoLoadHosts = true) {
   const requests = [];
   const hostRequests = [];
   const allRequests = [];
+  const historyCalls = [];
+  const timeline = [];
+  const location = new URL(options.url || "http://router.example:8088/status");
   const intervals = new Map();
   const timeouts = new Map();
   const windowEvents = {};
@@ -61,15 +64,26 @@ function harness(authRequired = true, autoLoadHosts = true) {
       createElement: tag => new Element(tag),
       createDocumentFragment: () => new Element("#fragment"),
     },
-    window: {location: {origin: "http://router.example:8088"}, addEventListener: (name, callback) => { windowEvents[name] = callback; }},
+    window: {
+      location,
+      history: {replaceState: (state, title, url) => {
+        timeline.push("replaceState");
+        historyCalls.push({state, title, url});
+        if (options.replaceStateThrows) throw new Error("history blocked");
+        location.href = new URL(url, location.href).href;
+      }},
+      addEventListener: (name, callback) => { windowEvents[name] = callback; },
+    },
     Node: Element,
     URL,
+    URLSearchParams,
     AbortController,
     setTimeout: callback => { const id = ++timerId; timeouts.set(id, callback); return id; },
     clearTimeout: id => timeouts.delete(id),
     setInterval: callback => { const id = ++timerId; intervals.set(id, callback); return id; },
     clearInterval: id => intervals.delete(id),
     fetch: (url, options) => new Promise((resolve, reject) => {
+      timeline.push("fetch");
       const hostRequest = /^\/status\/hosts(?:\/[^/?#]+)?$/.test(url);
       assert.ok(["/healthz", "/status/data", "/status/self-test"].includes(url) || hostRequest, "Only same-origin status endpoints may be fetched");
       if (!hostRequest) assert.equal(options.method, url === "/status/self-test" ? "POST" : "GET");
@@ -95,7 +109,7 @@ function harness(authRequired = true, autoLoadHosts = true) {
   };
   vm.runInNewContext(script, context);
   return {
-    element, requests, hostRequests, allRequests, timeouts,
+    element, requests, hostRequests, allRequests, timeouts, historyCalls, timeline, location,
     tick: () => { for (const callback of Array.from(intervals.values())) callback(); },
     enterKey: key => {
       element("api-key").value = key;
@@ -503,8 +517,8 @@ async function savedHostLifecycle() {
   assert.equal(app.element("host-save-button").disabled, false);
   assert.equal(app.element("hosts-check-button").disabled, false);
   assert.match(app.element("hosts-message").textContent, /Address saved.*1 backend API found/);
-  assert.match(app.element("hosts-body").textContent, /LM Studio \/ OpenAI-compatibleFound/);
-  assert.match(app.element("hosts-body").textContent, /OllamaNot confirmed/);
+  assert.match(app.element("hosts-body").textContent, /LM Studio \/ OpenAI-compatible Found/);
+  assert.match(app.element("hosts-body").textContent, /Ollama Not confirmed/);
   assert.match(app.element("hosts-body").textContent, /12 ms/);
   assert.match(app.element("hosts-body").textContent, /HTTP 200/);
   assert.match(app.element("hosts-body").textContent, /192\.168\.194\.0:1234\/v1/);
@@ -595,9 +609,9 @@ async function savedHostFailuresAndSafeRendering() {
   const row = app.element("hosts-body").children[0];
   assert.equal(row.children[0]._text, unsafe.address);
   const check = row.children[1].children[0].children[0];
-  assert.equal(check.children[0]._text, unsafe.checks[0].provider);
-  assert.equal(check.children[2]._text, unsafe.checks[0].base_url);
-  assert.ok(check.children[3]._text.startsWith(unsafe.checks[0].detail));
+  assert.equal(check.children[0].children[0]._text, unsafe.checks[0].provider + " ");
+  assert.equal(check.children[1]._text, "API base: " + unsafe.checks[0].base_url);
+  assert.ok(check.children[2]._text.startsWith(unsafe.checks[0].detail));
   app.hostAction(0, 1);
   assert.equal(app.hostRequests.at(-1).url, "/status/hosts/unsafe%2Fid%3Fredirect%3Dother");
   await reply(app.hostRequests.at(-1), 500, {});
@@ -686,8 +700,353 @@ async function savedHostAuthRejectionAndTimeout() {
   assert.equal(timedOut.element("hosts-reload-button").disabled, false);
 }
 
+function hostWithCatalog(overrides = {}) {
+  const host = savedHost("host-one", true);
+  host.checks[0] = {
+    ...host.checks[0], catalog_status: "ok", catalog_detail: "Model list is reachable",
+    catalog_url: "http://192.168.194.0:1234/v1/models", model_count: 2, models_truncated: false,
+    models: [
+      {id: "qwen3.5:9b", address: "http://192.168.194.0:1234/v1"},
+      {id: "gemma3:12b", address: "http://192.168.194.0:1234/v1"},
+    ], ...overrides,
+  };
+  return host;
+}
+
+function descendants(node, className) {
+  const matches = node.className.split(" ").includes(className) ? [node] : [];
+  return matches.concat(...node.children.map(child => descendants(child, className)));
+}
+
+async function savedHostModelCatalogs() {
+  const host = hostWithCatalog();
+  host.checks.push({
+    provider: "Ollama", base_url: "http://192.168.194.0:11434", status: "pass", detail: "Ollama server reachable",
+    http_status: 200, elapsed_ms: 18, catalog_status: "ok", catalog_detail: "Model list is reachable",
+    catalog_url: "http://192.168.194.0:11434/api/tags", model_count: 1, models_truncated: false,
+    models: [{id: "qwen3.5:9b", address: "http://192.168.194.0:11434"}],
+  });
+  const app = await unlockedHosts([host]);
+  assert.ok(app.allRequests.every(request => request.options.method === "GET"), "Displaying cached model lists must not run backend operations");
+  const body = app.element("hosts-body");
+  assert.match(body.textContent, /2 models listed by this server/);
+  assert.match(body.textContent, /1 model listed by this server/);
+  assert.match(body.textContent, /API base: http:\/\/192\.168\.194\.0:11434/);
+  assert.match(body.textContent, /Model-list endpoint: http:\/\/192\.168\.194\.0:11434\/api\/tags/);
+  assert.match(body.textContent, /Listed models may not be loaded; inference is not tested/);
+  const tables = descendants(body, "host-model-table");
+  assert.equal(tables.length, 2, "Each server needs its own labeled model table");
+  const first = tables[0].children[2].children;
+  assert.equal(first.length, 2);
+  assert.equal(first[0].children[0].children[0].textContent, "qwen3.5:9b");
+  assert.equal(first[0].children[1].children[0].textContent, "http://192.168.194.0:1234/v1");
+  assert.equal(first[1].children[0].children[0].textContent, "gemma3:12b");
+  assert.equal(tables[1].children[2].children[0].children[1].children[0].textContent, "http://192.168.194.0:11434", "A repeated model on another provider must show that provider's address");
+  assert.equal(tables[0].children[1].children[0].children[0].textContent, "Model ID");
+  assert.equal(tables[0].children[1].children[0].children[1].textContent, "API address");
+  const headers = descendants(body, "host-check-heading");
+  assert.equal(headers[0].children[0].textContent, "LM Studio / OpenAI-compatible ", "Provider and status need a text-space, not only CSS spacing");
+  assert.equal(headers[1].children[1].textContent, "Found");
+  const unicode = hostWithCatalog({models: [{id: "😀".repeat(512), address: "http://192.168.194.0:1234/v1"}], model_count: 1});
+  app.reloadHosts();
+  await reply(app.hostRequests.at(-1), 200, {hosts: [unicode], limit: 16});
+  assert.ok(body.textContent.includes("😀".repeat(512)), "Model-ID limit must match backend Unicode code points, not UTF-16 units");
+}
+
+async function savedHostCatalogEmptyErrorTruncatedAndLegacy() {
+  const empty = await unlockedHosts([hostWithCatalog({models: [], model_count: 0})]);
+  assert.match(empty.element("hosts-body").textContent, /No models listed by this server/);
+  assert.equal(descendants(empty.element("hosts-body"), "host-model-table").length, 0);
+  assert.doesNotMatch(empty.element("hosts-body").textContent, /unavailable|unknown/);
+  const unavailable = await unlockedHosts([hostWithCatalog({catalog_status: "error", catalog_detail: "Model catalog timed out", models: [], model_count: null})]);
+  assert.match(unavailable.element("hosts-body").textContent, /OpenAI-compatible Found/);
+  assert.match(unavailable.element("hosts-body").textContent, /Model list unavailable; model count is unknown. Model catalog timed out/);
+  assert.doesNotMatch(unavailable.element("hosts-body").textContent, /No models listed|0 models/);
+  assert.equal(descendants(unavailable.element("hosts-body"), "host-model-table").length, 0);
+  const truncated = await unlockedHosts([hostWithCatalog({model_count: 251, models_truncated: true})]);
+  assert.match(truncated.element("hosts-body").textContent, /251 models listed/);
+  assert.match(truncated.element("hosts-body").textContent, /Showing 2 of 251 models. The list is truncated/);
+  const legacy = await unlockedHosts([savedHost("host-one", true)]);
+  assert.match(legacy.element("hosts-body").textContent, /Check again to retrieve model list/);
+  assert.doesNotMatch(legacy.element("hosts-body").textContent, /No models listed|0 models/);
+}
+
+async function savedHostCatalogEscapingAndValidation() {
+  const hostile = hostWithCatalog({
+    catalog_url: "javascript:alert(1)", catalog_detail: '<script>alert("detail")</script>', model_count: 1,
+    models: [{id: '<img src=x onerror="alert(1)">', address: "javascript:alert(2)"}],
+  });
+  const app = await unlockedHosts([hostile]);
+  const body = app.element("hosts-body");
+  const row = descendants(body, "host-model-table")[0].children[2].children[0];
+  assert.equal(row.children[0].children[0].tagName, "code");
+  assert.equal(row.children[0].children[0]._text, hostile.checks[0].models[0].id);
+  assert.equal(row.children[1].children[0]._text, hostile.checks[0].models[0].address);
+  const source = descendants(body, "host-api-address").at(-1);
+  assert.equal(source.tagName, "p");
+  assert.equal(source._text, "Model-list endpoint: javascript:alert(1)");
+  assert.equal(source.children.length, 0, "Catalog addresses must remain inert text, not payload links");
+  app.reloadHosts();
+  hostile.checks[0].catalog_status = "error";
+  hostile.checks[0].model_count = null;
+  hostile.checks[0].models = [];
+  await reply(app.hostRequests.at(-1), 200, {hosts: [hostile], limit: 16});
+  const warning = descendants(body, "catalog-warning")[0];
+  assert.equal(warning._text, 'Model list unavailable; model count is unknown. <script>alert("detail")</script>');
+  assert.equal(warning.children.length, 0);
+  const invalidCases = [
+    {catalog_status: "constructor"}, {models: null}, {models: [{id: "ok", address: null}]},
+    {models: [{id: "x".repeat(513), address: "http://backend:11434"}]},
+    {models: [{id: "😀".repeat(513), address: "http://backend:11434"}]},
+    {models: [{id: "ok", address: "x".repeat(513)}]},
+    {models: Array.from({length: 201}, (_, i) => ({id: String(i), address: "http://backend:11434"})), model_count: 201},
+    {model_count: -1}, {model_count: null}, {model_count: 1}, {models_truncated: "yes"}, {catalog_url: null},
+  ];
+  for (const invalid of invalidCases) {
+    app.reloadHosts();
+    await reply(app.hostRequests.at(-1), 200, {hosts: [hostWithCatalog(invalid)], limit: 16});
+    assert.match(app.element("hosts-message").textContent, /response was invalid/);
+    assert.equal(app.element("hosts-reload-button").disabled, false);
+  }
+}
+
+async function savedHostCatalogStaleAndPrivate() {
+  const app = await unlockedHosts([hostWithCatalog()]);
+  assert.match(app.element("hosts-body").textContent, /qwen3\.5:9b/);
+  app.checkHosts();
+  const pending = app.hostRequests.at(-1);
+  assert.doesNotMatch(app.element("hosts-body").textContent, /qwen3\.5:9b/, "A new check must clear stale model lists while pending");
+  await reply(pending, 200, {hosts: [hostWithCatalog({catalog_status: "error", catalog_detail: "Catalog unavailable", model_count: null, models: []})]});
+  assert.doesNotMatch(app.element("hosts-body").textContent, /qwen3\.5:9b/);
+  assert.match(app.element("hosts-body").textContent, /model count is unknown/);
+  app.checkHosts();
+  const late = app.hostRequests.at(-1);
+  app.lock();
+  await reply(late, 200, {hosts: [hostWithCatalog()]});
+  assert.equal(app.element("hosts-body").textContent, "", "Locked sessions must not restore model IDs from late responses");
+  const completed = await unlockedHosts([hostWithCatalog()]);
+  completed.event("pagehide");
+  assert.equal(completed.element("hosts-body").textContent, "", "Page navigation clears private cached model IDs and addresses");
+}
+
+async function publicCachedSummary() {
+  assert.ok(markup.indexOf('id="public-summary-title"') < markup.indexOf('id="details"'), "Public summary must be outside the locked detail section");
+  const app = harness();
+  await reply(app.requests[0], 200, {status: "ready", summary: {servers: 3, models: 8, last_verified_at: "2026-09-16T12:00:00Z", models_truncated: false}});
+  assert.equal(app.element("details").hidden, true);
+  assert.equal(app.element("public-count-servers").textContent, "3");
+  assert.equal(app.element("public-count-models").textContent, "8");
+  assert.notEqual(app.element("public-last-verified").textContent, "Unknown");
+  assert.match(app.element("public-summary-note").textContent, /cached metadata, not a live network scan/);
+  assert.equal(app.hostRequests.length, 0, "Public summary must not list or check saved hosts");
+  app.tick();
+  await reply(app.requests.at(-1), 503, {status: "unavailable", summary: {servers: 0, models: 0, last_verified_at: null, models_truncated: false}});
+  assert.equal(app.element("public-count-servers").textContent, "0");
+  assert.equal(app.element("public-count-models").textContent, "0");
+  assert.equal(app.element("public-last-verified").textContent, "Not yet verified");
+  app.tick();
+  await reply(app.requests.at(-1), 200, {status: "ready", summary: {servers: 2, models: 200, last_verified_at: null, models_truncated: true}});
+  assert.equal(app.element("public-count-models").textContent, "200+");
+  assert.match(app.element("public-summary-note").textContent, /lower bound/);
+  app.tick();
+  app.requests.at(-1).reject(new Error("offline"));
+  await flush();
+  for (const id of ["public-count-servers", "public-count-models", "public-last-verified"]) assert.equal(app.element(id).textContent, "Unknown", "Network failure clears stale public stats");
+  app.enterKey("secret-key");
+  const detailed = snapshot();
+  detailed.summary = {servers: 4, models: 5, last_verified_at: "2026-09-16T12:00:00Z", models_truncated: false};
+  await reply(app.requests.at(-1), 200, detailed);
+  assert.equal(app.element("public-count-servers").textContent, "4");
+  assert.equal(app.element("public-count-models").textContent, "5");
+  app.event("pagehide");
+  assert.equal(app.element("public-count-models").textContent, "Unknown");
+
+  for (const summary of [undefined, {}, {servers: "private-backend", models: -1, last_verified_at: "not-a-date"}, {servers: null, models: null, last_verified_at: 0}]) {
+    const invalid = harness();
+    await reply(invalid.requests[0], 200, {status: "ready", summary});
+    for (const id of ["public-count-servers", "public-count-models", "public-last-verified"]) assert.equal(invalid.element(id).textContent, "Unknown");
+  }
+}
+
+async function urlKeyBootstrapAndImmediateScrub() {
+  for (const [url, expectedClean, key, queryWarning] of [
+    ["http://router.example:8088/status?api_key=query-secret&view=summary#models", "/status?view=summary#models", "query-secret", true],
+    ["http://router.example:8088/status?view=summary#api_key=fragment-secret&tab=hosts", "/status?view=summary#tab=hosts", "fragment-secret", false],
+    ["http://router.example:8088/?view=summary#api_key=a%2Bb%2Fc%3D%3D", "/?view=summary", "a+b/c==", false],
+    ["http://router.example:8088/status?%61pi_key=encoded-secret", "/status", "encoded-secret", true],
+  ]) {
+    const app = harness(true, true, {url});
+    assert.deepEqual(app.timeline.slice(0, 2), ["replaceState", "fetch"], "Key must be removed from URL before first request");
+    assert.equal(app.historyCalls.length, 1);
+    assert.equal(app.historyCalls[0].state, null, "Never put a key in history.state");
+    assert.equal(app.historyCalls[0].url, expectedClean);
+    assert.equal(app.location.pathname + app.location.search + app.location.hash, expectedClean);
+    assert.equal(app.requests[0].url, "/status/data");
+    assert.equal(app.requests[0].options.headers.Authorization, `Bearer ${key}`);
+    assert.equal(app.element("api-key").value, "");
+    assert.equal(app.element("url-key-message").hidden, !queryWarning);
+    if (queryWarning) assert.match(app.element("url-key-message").textContent, /may already be recorded.*prefer #api_key=/);
+    for (const id of ["url-key-message", "auth-message", "router-origin"]) assert.equal(app.element(id).textContent.includes(key), false, "Key must never appear in page text");
+    await reply(app.requests[0], 200, snapshot());
+    assert.equal(app.element("details").hidden, false);
+    assert.equal(app.hostRequests[0].options.headers.Authorization, `Bearer ${key}`);
+    app.lock();
+    assert.equal(app.requests.at(-1).url, "/healthz");
+    assert.equal(app.requests.at(-1).options.headers.Authorization, undefined);
+    app.event("pagehide");
+    app.event("pageshow", {persisted: true});
+    assert.equal(app.historyCalls.length, 1, "BFCache restoration must not reconsume the URL key");
+    assert.equal(app.requests.at(-1).options.headers.Authorization, undefined);
+  }
+  const max = harness(true, true, {url: "http://router.example:8088/status#api_key=" + "x".repeat(4096)});
+  assert.equal(max.requests[0].options.headers.Authorization.length, 7 + 4096);
+  assert.equal(max.location.hash, "");
+}
+
+async function urlKeyInvalidAmbiguousAndCleanupFailure() {
+  for (const suffix of [
+    "?api_key=one&api_key=two&view=hosts#models", "#api_key=one&api_key=two&tab=hosts",
+    "?api_key=one#api_key=two", "?api_key=", "#api_key=%20%20", "#api_key=a%0Ab",
+    "#api_key=" + "x".repeat(4097),
+  ]) {
+    const app = harness(true, true, {url: "http://router.example:8088/status" + suffix});
+    assert.equal(app.requests[0].url, "/healthz");
+    assert.equal(app.requests[0].options.headers.Authorization, undefined);
+    assert.equal(app.location.search.includes("api_key"), false);
+    assert.equal(app.location.hash.includes("api_key"), false);
+    assert.match(app.element("url-key-message").textContent, /removed but not used/);
+    assert.equal(app.element("api-key").value, "");
+  }
+  const failure = harness(true, true, {url: "http://router.example:8088/status?api_key=do-not-send&view=hosts", replaceStateThrows: true});
+  assert.equal(failure.requests[0].url, "/healthz");
+  assert.equal(failure.requests[0].options.headers.Authorization, undefined);
+  assert.match(failure.element("url-key-message").textContent, /could not be removed.*was not used/);
+  assert.doesNotMatch(failure.element("url-key-message").textContent, /do-not-send/);
+  const noKey = harness(false, true, {url: "http://router.example:8088/status#api_key=not-required"});
+  assert.equal(noKey.location.hash, "");
+  assert.equal(noKey.requests[0].options.headers.Authorization, undefined);
+  assert.match(noKey.element("url-key-message").textContent, /removed and was not used/);
+  const wrongPage = harness(true, true, {url: "http://router.example:8088/v1/models#api_key=not-an-api-key-login"});
+  assert.equal(wrongPage.location.hash, "");
+  assert.equal(wrongPage.requests[0].options.headers.Authorization, undefined);
+  const ordinary = harness(true, true, {url: "http://router.example:8088/status?view=hosts#models"});
+  assert.equal(ordinary.historyCalls.length, 0);
+  assert.equal(ordinary.location.search + ordinary.location.hash, "?view=hosts#models");
+}
+
+async function urlKeyAuthenticationFailureAndPageRestore() {
+  for (const status of [401, 403]) {
+    const app = harness(true, true, {url: "http://router.example:8088/status#api_key=rejected-url-key"});
+    assert.equal(app.requests[0].options.headers.Authorization, "Bearer rejected-url-key");
+    await reply(app.requests[0], status, {});
+    assert.equal(app.element("details").hidden, true);
+    assert.equal(app.element("key-form").hidden, false);
+    assert.match(app.element("auth-message").textContent, /key was rejected/);
+    app.tick();
+    assert.equal(app.requests.at(-1).url, "/healthz");
+    assert.equal(app.requests.at(-1).options.headers.Authorization, undefined);
+  }
+  const app = harness(true, true, {url: "http://router.example:8088/status#api_key=memory-only-url-key"});
+  await reply(app.requests[0], 200, snapshot());
+  app.event("pagehide");
+  app.event("pageshow", {persisted: true});
+  assert.equal(app.requests.at(-1).url, "/healthz");
+  assert.equal(app.requests.at(-1).options.headers.Authorization, undefined);
+  assert.equal(app.element("hosts-body").textContent, "");
+  assert.equal(app.element("models-body").textContent, "");
+}
+
+async function liveFragmentKeyUnlockAndNavigation() {
+  const app = harness();
+  await reply(app.requests[0], 200, {status: "ready"});
+  const before = app.allRequests.length;
+  app.location.hash = "#models";
+  app.event("hashchange");
+  assert.equal(app.allRequests.length, before, "Ordinary anchor navigation must not fetch or probe");
+  assert.equal(app.historyCalls.length, 0);
+  app.location.hash = "#api_key=live%2Bkey%2F%3D&tab=hosts";
+  const beforeKey = app.timeline.length;
+  app.event("hashchange");
+  assert.deepEqual(app.timeline.slice(beforeKey, beforeKey + 2), ["replaceState", "fetch"]);
+  assert.equal(app.location.hash, "#tab=hosts");
+  assert.equal(app.requests.at(-1).url, "/status/data");
+  assert.equal(app.requests.at(-1).options.headers.Authorization, "Bearer live+key/=");
+  assert.equal(app.element("api-key").value, "");
+  await reply(app.requests.at(-1), 200, snapshot());
+  assert.equal(app.element("details").hidden, false);
+  assert.equal(app.hostRequests.at(-1).options.headers.Authorization, "Bearer live+key/=");
+  const unlockedCount = app.allRequests.length;
+  app.location.hash = "#backends-title";
+  app.event("hashchange");
+  assert.equal(app.allRequests.length, unlockedCount);
+  app.event("pagehide");
+  const hiddenCount = app.allRequests.length;
+  app.location.hash = "#api_key=hidden-page-key";
+  app.event("hashchange");
+  assert.equal(app.location.hash, "", "Even a hidden page must scrub a URL secret");
+  assert.equal(app.allRequests.length, hiddenCount, "A hidden page must not unlock or send the supplied key");
+  app.event("pageshow", {persisted: true});
+  assert.equal(app.requests.at(-1).url, "/healthz");
+  assert.equal(app.requests.at(-1).options.headers.Authorization, undefined, "Restoration must not reuse either fragment key");
+}
+
+async function liveFragmentKeyInvalidAndCleanupFailure() {
+  const options = {};
+  const app = harness(true, true, options);
+  await reply(app.requests[0], 200, {status: "ready"});
+  for (const hash of ["#api_key=one&api_key=two&tab=hosts", "#api_key=", "#api_key=a%0Ab", "#api_key=" + "x".repeat(4097)]) {
+    const before = app.allRequests.length;
+    app.location.hash = hash;
+    app.event("hashchange");
+    assert.equal(app.allRequests.length, before, "Invalid live fragment key must not trigger a request");
+    assert.equal(app.location.hash.includes("api_key"), false);
+    assert.match(app.element("url-key-message").textContent, /removed but not used/);
+    assert.equal(app.element("details").hidden, true);
+  }
+  options.replaceStateThrows = true;
+  const before = app.allRequests.length;
+  app.location.hash = "#api_key=cleanup-failed-key";
+  app.event("hashchange");
+  assert.equal(app.allRequests.length, before);
+  assert.equal(app.location.hash, "#api_key=cleanup-failed-key");
+  assert.match(app.element("url-key-message").textContent, /could not be removed.*was not used/);
+  assert.doesNotMatch(app.element("url-key-message").textContent, /cleanup-failed-key/);
+  app.tick();
+  assert.equal(app.requests.at(-1).options.headers.Authorization, undefined, "Failed URL cleanup must not install a key for later polling either");
+}
+
+async function liveFragmentKeyCancelsOldSession() {
+  const app = await unlockedHosts([hostWithCatalog()]);
+  app.checkHosts();
+  const oldHost = app.hostRequests.at(-1);
+  app.selfTest();
+  const oldTest = app.requests.at(-1);
+  app.tick();
+  const oldRefresh = app.requests.at(-1);
+  app.location.hash = "#api_key=new-live-key";
+  app.event("hashchange");
+  assert.equal(oldHost.options.signal.aborted, true);
+  assert.equal(oldTest.options.signal.aborted, true);
+  assert.equal(oldRefresh.options.signal.aborted, true);
+  assert.equal(app.element("details").hidden, true);
+  assert.equal(app.element("hosts-body").textContent, "");
+  assert.equal(app.requests.at(-1).options.headers.Authorization, "Bearer new-live-key");
+  const newer = snapshot();
+  newer.counts.endpoints = 9;
+  await reply(app.requests.at(-1), 200, newer);
+  assert.equal(app.hostRequests.at(-1).options.headers.Authorization, "Bearer new-live-key");
+  await reply(app.hostRequests.at(-1), 200, {hosts: [hostWithCatalog()], limit: 16});
+  await reply(oldRefresh, 200, snapshot());
+  await reply(oldHost, 401, {});
+  await reply(oldTest, 403, {});
+  assert.equal(app.element("details").hidden, false, "Late old-key errors must not lock the new URL-key session");
+  assert.equal(app.element("count-endpoints").textContent, "9", "Late old-key snapshot must not replace new state");
+  assert.match(app.element("hosts-body").textContent, /qwen3\.5:9b/);
+  assert.doesNotMatch(app.element("auth-message").textContent, /rejected/);
+}
+
 (async () => {
-  for (const test of [publicReadiness, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout]) {
+  for (const test of [publicReadiness, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession]) {
     await test();
     console.log(`PASS ${test.name}`);
   }

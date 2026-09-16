@@ -32,3 +32,14 @@ def test_status_page_client_flows() -> None:
     assert "PASS savedHostFailuresAndSafeRendering" in result.stdout
     assert "PASS savedHostPrivacyAndRaceGuards" in result.stdout
     assert "PASS savedHostAuthRejectionAndTimeout" in result.stdout
+    assert "PASS savedHostModelCatalogs" in result.stdout
+    assert "PASS savedHostCatalogEmptyErrorTruncatedAndLegacy" in result.stdout
+    assert "PASS savedHostCatalogEscapingAndValidation" in result.stdout
+    assert "PASS savedHostCatalogStaleAndPrivate" in result.stdout
+    assert "PASS publicCachedSummary" in result.stdout
+    assert "PASS urlKeyBootstrapAndImmediateScrub" in result.stdout
+    assert "PASS urlKeyInvalidAmbiguousAndCleanupFailure" in result.stdout
+    assert "PASS urlKeyAuthenticationFailureAndPageRestore" in result.stdout
+    assert "PASS liveFragmentKeyUnlockAndNavigation" in result.stdout
+    assert "PASS liveFragmentKeyInvalidAndCleanupFailure" in result.stdout
+    assert "PASS liveFragmentKeyCancelsOldSession" in result.stdout

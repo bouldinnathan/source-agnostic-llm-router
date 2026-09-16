@@ -19,6 +19,7 @@ import stat
 import tempfile
 import time
 from typing import Mapping
+import unicodedata
 from urllib.parse import urlsplit
 import weakref
 
@@ -33,6 +34,7 @@ except ImportError:  # Normal gateway imports must still work off POSIX.
 MAX_HOSTS = 16
 MAX_RESPONSE_BYTES = 1024 * 1024
 PROBE_TIMEOUT_SECONDS = 1.5
+MAX_CATALOG_MODELS = 200
 _MAX_STATE_BYTES = 32 * 1024
 _SEMAPHORES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
@@ -266,14 +268,13 @@ def _probe_semaphore() -> asyncio.Semaphore:
     return semaphore
 
 
-async def _check(provider: str, origin: str, path: str, *, transport: httpx.AsyncBaseTransport | None) -> dict:
+async def _metadata_request(origin: str, path: str, *, transport: httpx.AsyncBaseTransport | None) -> dict:
     result = {
-        "provider": provider,
-        "base_url": origin if provider == "Ollama" else origin + "/v1",
         "status": "fail",
-        "detail": "Server check failed.",
+        "detail": "Metadata request failed.",
         "http_status": None,
         "elapsed_ms": 0,
+        "payload": None,
     }
 
     async def fetch() -> None:
@@ -308,19 +309,12 @@ async def _check(provider: str, origin: str, path: str, *, transport: httpx.Asyn
                     body.extend(chunk)
                     if len(body) > MAX_RESPONSE_BYTES:
                         raise ValueError
-                payload = json.loads(body)
+                payload = json.loads(body, object_pairs_hook=_unique_object)
                 if not isinstance(payload, dict):
                     raise ValueError
-                if provider == "Ollama":
-                    version = payload.get("version")
-                    if not isinstance(version, str) or not version.strip():
-                        raise ValueError
-                    result["detail"] = "Ollama version endpoint responded; no model was invoked."
-                else:
-                    if not isinstance(payload.get("data"), list):
-                        raise ValueError
-                    result["detail"] = "OpenAI-compatible model list responded; this does not uniquely identify LM Studio."
+                result["payload"] = payload
                 result["status"] = "pass"
+                result["detail"] = "Metadata endpoint responded."
 
     async with _probe_semaphore():
         started = time.monotonic()
@@ -340,8 +334,111 @@ async def _check(provider: str, origin: str, path: str, *, transport: httpx.Asyn
     return result
 
 
+def _catalog(payload: dict, *, ollama: bool, address: str) -> tuple[list[dict], int]:
+    items = payload.get("models" if ollama else "data")
+    if not isinstance(items, list):
+        raise ValueError("Invalid model catalog")
+    seen = set()
+    models = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("Invalid model catalog entry")
+        model_id = item.get("name", item.get("model")) if ollama else item.get("id")
+        if (
+            not isinstance(model_id, str)
+            or not model_id
+            or len(model_id) > 512
+            or model_id != model_id.strip()
+            or any(unicodedata.category(char)[0] == "C" or char in "\u2028\u2029" for char in model_id)
+        ):
+            raise ValueError("Invalid model identifier")
+        if model_id in seen:
+            continue
+        seen.add(model_id)
+        if len(models) < MAX_CATALOG_MODELS:
+            # This address is derived only from the validated saved destination,
+            # never from a URL or other field returned by the backend.
+            models.append({"id": model_id, "address": address})
+    return models, len(seen)
+
+
+def _catalog_result(response: dict, *, ollama: bool, base_url: str, catalog_url: str) -> dict:
+    result = {
+        "catalog_status": "error",
+        "catalog_detail": response["detail"],
+        "catalog_url": catalog_url,
+        "models": [],
+        "model_count": None,
+        "models_truncated": False,
+    }
+    if response["status"] != "pass":
+        return result
+    try:
+        models, count = _catalog(response["payload"], ollama=ollama, address=base_url)
+    except ValueError:
+        result["catalog_detail"] = "Model catalog response was malformed; available models could not be determined."
+    else:
+        result.update({
+            "catalog_status": "ok",
+            "catalog_detail": "Model catalog retrieved without invoking, loading, or downloading a model.",
+            "models": models,
+            "model_count": count,
+            "models_truncated": count > len(models),
+        })
+    return result
+
+
+async def _check_ollama(origin: str, *, transport: httpx.AsyncBaseTransport | None) -> dict:
+    version_response, catalog_response = await asyncio.gather(
+        _metadata_request(origin, "/api/version", transport=transport),
+        _metadata_request(origin, "/api/tags", transport=transport),
+    )
+    payload = version_response["payload"] or {}
+    version = payload.get("version")
+    version_ok = version_response["status"] == "pass" and isinstance(version, str) and bool(version.strip())
+    catalog = _catalog_result(catalog_response, ollama=True, base_url=origin, catalog_url=origin + "/api/tags")
+    catalog_ok = catalog["catalog_status"] == "ok"
+    if version_ok and catalog_ok:
+        detail = "Ollama version endpoint and model catalog responded; no model was invoked."
+    elif version_ok:
+        detail = "Ollama version endpoint responded, but its model catalog is unavailable; no model was invoked."
+    elif catalog_ok:
+        detail = "Ollama model catalog responded; no model was invoked."
+    elif version_response["status"] == "pass":
+        detail = "Response was not a valid Ollama version or model catalog."
+    else:
+        detail = version_response["detail"]
+    chosen_response = version_response if version_ok or not catalog_ok else catalog_response
+    return {
+        "provider": "Ollama",
+        "base_url": origin,
+        "status": "pass" if version_ok or catalog_ok else "fail",
+        "detail": detail,
+        "http_status": chosen_response["http_status"],
+        "elapsed_ms": max(version_response["elapsed_ms"], catalog_response["elapsed_ms"]),
+        **catalog,
+    }
+
+
+async def _check_openai(origin: str, *, transport: httpx.AsyncBaseTransport | None) -> dict:
+    response = await _metadata_request(origin, "/v1/models", transport=transport)
+    catalog = _catalog_result(response, ollama=False, base_url=origin + "/v1", catalog_url=origin + "/v1/models")
+    return {
+        "provider": "LM Studio / OpenAI-compatible",
+        "base_url": origin + "/v1",
+        "status": "pass" if catalog["catalog_status"] == "ok" else "fail",
+        "detail": (
+            "OpenAI-compatible model catalog responded; this does not uniquely identify LM Studio."
+            if catalog["catalog_status"] == "ok" else catalog["catalog_detail"]
+        ),
+        "http_status": response["http_status"],
+        "elapsed_ms": response["elapsed_ms"],
+        **catalog,
+    }
+
+
 async def check_saved_host(entry: Mapping, *, transport: httpx.AsyncBaseTransport | None = None) -> dict:
-    """Probe two fixed metadata URLs concurrently; never send inference requests."""
+    """Read three fixed metadata URLs concurrently; never send inference requests."""
     address = normalize_address(entry["address"])
     if "://" in address:
         ollama_origin = openai_origin = address
@@ -349,8 +446,8 @@ async def check_saved_host(entry: Mapping, *, transport: httpx.AsyncBaseTranspor
         ollama_origin = f"http://{address}:11434"
         openai_origin = f"http://{address}:1234"
     checks = await asyncio.gather(
-        _check("Ollama", ollama_origin, "/api/version", transport=transport),
-        _check("LM Studio / OpenAI-compatible", openai_origin, "/v1/models", transport=transport),
+        _check_ollama(ollama_origin, transport=transport),
+        _check_openai(openai_origin, transport=transport),
     )
     return {
         "id": entry["id"],

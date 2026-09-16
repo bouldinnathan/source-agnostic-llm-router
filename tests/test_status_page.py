@@ -443,10 +443,11 @@ def test_custom_or_invalid_backend_urls_do_not_break_status_or_leak_full_value(b
     assert "private-command" not in response.text
 
 
-def test_browser_never_persists_api_keys_or_adds_them_to_query_strings() -> None:
+def test_browser_never_persists_api_keys_and_bootstraps_url_keys_into_headers() -> None:
     script = asyncio.run(request(create_app(gateway=RouterGateway(discovery=False)), "/status/assets/app.js"))
     assert script.status_code == 200
     assert "Authorization" in script.text
     assert "/status/data" in script.text
-    for forbidden in ("localStorage", "sessionStorage", "document.cookie", "api_key=", "?token="):
+    assert "replaceState" in script.text
+    for forbidden in ("localStorage", "sessionStorage", "document.cookie", "?token="):
         assert forbidden not in script.text

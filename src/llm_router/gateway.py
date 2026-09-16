@@ -15,13 +15,14 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Mapping, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import unquote_to_bytes, urlsplit
 
 import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.routing import Route
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .bootstrap import BootstrapResult, bootstrap_router
 from .aliases import ModelAlias, alias_conflicts, build_aliases
@@ -29,6 +30,7 @@ from .discovery import DiscoveryReport, DiscoverySettings, ProbeResult
 from .errors import AllModelsFailed, NoEligibleModel, RequestError, RouterError
 from .health import probe_endpoints
 from .provisioning import OllamaProvisioner, ProvisioningReport, ProvisioningSettings
+from .public_status import public_summary
 from .router import LLMRouter
 from .schema import QueryRequest, RoutedCompletion, RouterConfig
 from .saved_hosts import SavedHostStore, check_saved_host
@@ -54,6 +56,33 @@ VIRTUAL_PREFERRED_TAGS: dict[str, tuple[str, ...]] = {
 
 class GatewayUnavailable(RuntimeError):
     pass
+
+
+class RedactStatusQueryKey:
+    """Keep optional page URL keys out of the gateway's normal access logs.
+
+    The browser reads its original URL, erases the key, and sends Bearer headers.
+    The API itself never authenticates query parameters. Mutate the ASGI scope
+    in place so Uvicorn's access logger also sees the redacted query. This cannot
+    protect upstream proxy logs or a browser's previously recorded URL; a URL
+    fragment or the password field remains preferable to a query parameter.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope.get("query_string"):
+            parts = scope["query_string"].split(b"&")
+            changed = False
+            for index, part in enumerate(parts):
+                key = part.partition(b"=")[0]
+                if unquote_to_bytes(key) == b"api_key":
+                    parts[index] = b"api_key=REDACTED"
+                    changed = True
+            if changed:
+                scope["query_string"] = b"&".join(parts)
+        await self.app(scope, receive, send)
 
 
 class RouterGateway:
@@ -604,7 +633,9 @@ def create_app(
 
     async def status_data(request: Request) -> Response:
         denied = _authorize(request, openai=True)
-        response = denied or JSONResponse(service.dashboard_status())
+        response = denied or JSONResponse({
+            **service.dashboard_status(), "summary": public_summary(service, host_results),
+        })
         response.headers.update(page_headers)
         return response
 
@@ -664,10 +695,14 @@ def create_app(
 
     async def health(request: Request) -> Response:
         status = service.status()
-        public_status = {"status": status["status"], "version": status["version"]}
+        public_status = {
+            "status": status["status"], "version": status["version"],
+            "summary": public_summary(service, host_results),
+        }
         return JSONResponse(
             public_status,
             status_code=200 if status.get("ready", status["status"] == "ready") else 503,
+            headers=page_headers,
         )
 
     async def router_status(request: Request) -> Response:
@@ -902,6 +937,7 @@ def create_app(
         Route("/v1/chat/completions", openai_chat, methods=["POST"]),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)
+    app.add_middleware(RedactStatusQueryKey)
     app.state.router_gateway = service
     return app
 

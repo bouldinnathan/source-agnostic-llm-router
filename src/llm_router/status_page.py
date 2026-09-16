@@ -49,6 +49,16 @@ _STATUS_HTML = """<!doctype html>
       <div class="overview-item"><span class="label">Last checked</span><strong id="checked-at">—</strong></div>
     </section>
 
+    <section class="card public-summary" aria-labelledby="public-summary-title">
+      <div class="card-heading"><div><h2 id="public-summary-title">Network summary</h2><p class="muted">Cached counts only; this summary does not include addresses or model names. No network scan or inference runs when this page refreshes.</p></div></div>
+      <div class="public-summary-counts">
+        <div><span class="label">Known servers</span><strong id="public-count-servers">Unknown</strong></div>
+        <div><span class="label">Listed model copies</span><strong id="public-count-models">Unknown</strong></div>
+        <div><span class="label">Last successful metadata check</span><strong id="public-last-verified">Unknown</strong></div>
+      </div>
+      <p id="public-summary-note" class="muted">Waiting for a current summary. Counts do not prove models are loaded or inference works.</p>
+    </section>
+
     <section class="card quick-links" aria-labelledby="links-title">
       <h2 id="links-title">Router links</h2>
       <p class="muted">This router: <code id="router-origin">Current server</code>. Links open in a new tab.</p>
@@ -64,6 +74,7 @@ _STATUS_HTML = """<!doctype html>
       <p class="muted">These are API responses, not separate apps. Protected links may show 401 because new tabs do not receive this page’s API key. Model-list links list metadata; they do not run models.</p>
     </section>
 
+    <p id="url-key-message" class="help-box" role="status" hidden></p>
     <section id="auth-section" class="card auth-card" aria-labelledby="auth-title" hidden>
       <div><h2 id="auth-title">Unlock backend details</h2>
         <p class="muted">Use the router’s client API key from <code>router.env</code>, not an LM Studio key.
@@ -86,7 +97,7 @@ _STATUS_HTML = """<!doctype html>
       <div class="section-heading"><h2>Backend details</h2></div>
       <section class="card" aria-labelledby="hosts-title">
         <div class="card-heading"><div><h2 id="hosts-title">Saved backend addresses</h2>
-          <p class="muted">Save an IP address or hostname on this router for quick future checks. Checks read metadata only: no prompts, model loading, or downloads. Saving an address does not add its models to routing.</p>
+          <p class="muted">Save an IP address or hostname on this router for quick future checks. See each server’s model names and API addresses using metadata only: no prompts, model loading, or downloads. Listed models may not be loaded; inference is not tested. Saving an address does not add its models to routing.</p>
         </div></div>
         <form id="host-form" class="host-form" autocomplete="off">
           <label for="host-address">IP address, hostname, or backend URL</label>
@@ -97,7 +108,7 @@ _STATUS_HTML = """<!doctype html>
         <div class="hosts-toolbar"><p id="hosts-message" class="muted" role="status">Unlock details to manage saved addresses.</p>
           <div class="hosts-actions"><button id="hosts-reload-button" type="button">Reload saved</button><button id="hosts-check-button" type="button">Check all saved</button></div></div>
         <div id="hosts-results" class="table-scroll"><table><caption class="sr-only">Saved addresses and metadata checks</caption>
-          <thead><tr><th scope="col">Saved address</th><th scope="col">Latest metadata checks</th><th scope="col">Last checked</th><th scope="col">Actions</th></tr></thead>
+          <thead><tr><th scope="col">Saved address</th><th scope="col">Servers and model lists</th><th scope="col">Last checked</th><th scope="col">Actions</th></tr></thead>
           <tbody id="hosts-body"></tbody>
         </table></div>
       </section>
@@ -169,8 +180,11 @@ main{max-width:1208px;margin:auto;padding:38px 24px 24px}.heading,.section-headi
 @media(max-width:500px){main{padding:24px 16px}.topbar{padding:16px}.readonly{display:none}.heading{display:block}h1{font-size:28px}.heading button{width:100%;margin-top:18px}.health-panel{padding:18px}.auth-card{padding:18px}.key-controls{flex-direction:column}.auth-actions{align-items:flex-start;flex-direction:column}.stats{gap:10px}.stat{padding:14px}.stat strong{font-size:25px}.section-heading{align-items:flex-start;flex-direction:column;gap:3px}footer{padding:0 16px 24px}.brand{font-size:17px}}
 .quick-links{padding:19px 22px}.quick-links p{margin-top:6px}.quick-links nav{display:flex;flex-wrap:wrap;gap:8px 20px;margin:12px 0}.quick-links nav a{font-size:13px}.self-test-message{padding:0 22px 19px}.self-test-message.result-pass{color:var(--green)}.self-test-message.result-fail{color:var(--red)}.self-test-message.result-partial{color:var(--amber)}
 .host-form{padding:0 22px 16px}.host-form label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}.host-form p{margin-top:7px}.hosts-toolbar{padding:0 22px 19px;display:flex;align-items:center;justify-content:space-between;gap:16px}.hosts-actions{display:flex;flex-wrap:wrap;gap:8px}.hosts-actions button{padding:6px 10px;font-size:12px}.host-check+.host-check{margin-top:12px}.host-check .badge{margin-left:6px}.host-check .secondary{overflow-wrap:anywhere}#hosts-message.result-fail{color:var(--red)}#hosts-message.result-pass{color:var(--green)}
+.host-check{padding:14px;border:1px solid var(--line);border-radius:8px;background:#fafcfe}.host-check-heading{display:flex;align-items:center;flex-wrap:wrap;gap:5px}.host-check p{margin-top:7px}.host-check .host-api-address{display:block;font-size:12px;overflow-wrap:anywhere}.host-catalog{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}.host-catalog h3{font-size:13px;margin-bottom:5px}.host-catalog .catalog-warning{color:var(--amber)}.host-model-table{margin-top:10px;table-layout:fixed}.host-model-table th,.host-model-table td{padding:8px 10px;max-width:none;overflow-wrap:anywhere}.host-model-table th{white-space:normal}.host-model-table td{background:var(--surface)}.host-model-table th:first-child{width:43%}#hosts-results>table>thead>tr>th:nth-child(2){width:55%}#hosts-results>table>tbody>tr>td:nth-child(2){min-width:330px;max-width:none}
+.public-summary-counts{display:grid;grid-template-columns:1fr 1fr 1.6fr;gap:18px;padding:0 22px 16px}.public-summary-counts strong{display:block;font-size:20px;line-height:1.5;overflow-wrap:anywhere}.public-summary-counts>div:last-child strong{font-size:15px}.public-summary>p{padding:0 22px 19px}
 @media(max-width:800px){.self-test-heading{align-items:flex-start;flex-direction:column}}
 @media(max-width:600px){.hosts-toolbar{align-items:flex-start;flex-direction:column}.host-form .key-controls{flex-direction:column}}
+@media(max-width:600px){.public-summary-counts{grid-template-columns:1fr 1fr}.public-summary-counts>div:last-child{grid-column:1/-1}}
 """
 
 
@@ -180,6 +194,7 @@ STATUS_JS = r"""
   const el = (id) => document.getElementById(id);
   const authRequired = document.body.dataset.authRequired === "true";
   let apiKey = "";
+  let pageActive = true;
   let generation = 0;
   let activeRequest = null;
   let selfTestGeneration = 0;
@@ -242,6 +257,39 @@ STATUS_JS = r"""
     text("auth-title", apiKey ? "Backend details unlocked" : "Unlock backend details");
     text("auth-message", message || (apiKey ? "Your key is held only in this page’s memory." : "Backend addresses and model details are locked."));
   }
+  function consumeURLKey() {
+    const query = new URLSearchParams(window.location.search || "");
+    const originalHash = window.location.hash || "";
+    const fragment = new URLSearchParams(originalHash.replace(/^#/, ""));
+    const queryKeys = query.getAll("api_key");
+    const fragmentKeys = fragment.getAll("api_key");
+    const keys = queryKeys.concat(fragmentKeys);
+    if (!keys.length) return "";
+    el("url-key-message").hidden = true;
+    text("url-key-message", "");
+    const warn = message => { el("url-key-message").hidden = false; text("url-key-message", message); };
+    const logWarning = queryKeys.length ? " Query-string keys may already be recorded in server, proxy, or browser logs; prefer #api_key= over HTTPS or a trusted connection." : "";
+    let search = window.location.search || "";
+    let hash = originalHash;
+    if (queryKeys.length) { query.delete("api_key"); search = query.toString() ? `?${query}` : ""; }
+    if (fragmentKeys.length) { fragment.delete("api_key"); hash = fragment.toString() ? `#${fragment}` : ""; }
+    try {
+      window.history.replaceState(null, "", `${window.location.pathname}${search}${hash}`);
+    } catch (error) {
+      warn("The URL key could not be removed from the address bar, so it was not used. Remove api_key from the URL and unlock manually." + logWarning);
+      return "";
+    }
+    if (keys.length !== 1 || !keys[0].trim() || keys[0].trim().length > 4096 || /[\u0000-\u0020\u007f]/.test(keys[0].trim())) {
+      warn("The URL key was removed but not used because it was empty, invalid, or supplied more than once. Unlock manually with one router API key." + logWarning);
+      return "";
+    }
+    if (!authRequired || !["/", "/status"].includes(window.location.pathname)) {
+      warn("The URL key was removed and was not used. This page does not accept an unlock key in its current configuration." + logWarning);
+      return "";
+    }
+    if (queryKeys.length) warn("The URL key was removed from the address bar and will be held only in this page’s memory." + logWarning);
+    return keys[0].trim();
+  }
   function clearDetails() {
     clearSelfTest();
     clearHosts();
@@ -260,6 +308,7 @@ STATUS_JS = r"""
   }
   function unavailable(message) {
     clearDetails();
+    clearSummary();
     text("checked-at", "No current snapshot");
     health("error", "Status could not be confirmed", message, "Unconfirmed", "Unknown");
   }
@@ -333,12 +382,99 @@ STATUS_JS = r"""
       (item.checked_at === null || typeof item.checked_at === "string") &&
       Array.isArray(item.checks) && item.checks.length <= 8 && item.checks.every(check => check &&
         ["pass", "fail"].includes(check.status) && typeof check.provider === "string" &&
-        typeof check.base_url === "string" && typeof check.detail === "string");
+        typeof check.base_url === "string" && typeof check.detail === "string" && validCatalog(check));
+  }
+  function validCatalog(check) {
+    // Cached checks from an older router version do not include a catalog.
+    if (check.catalog_status === undefined) return true;
+    return ["ok", "error"].includes(check.catalog_status) &&
+      typeof check.catalog_detail === "string" && typeof check.catalog_url === "string" &&
+      typeof check.models_truncated === "boolean" && Array.isArray(check.models) && check.models.length <= 200 &&
+      check.models.every(model => model && typeof model.id === "string" && model.id.length > 0 && model.id.length <= 1024 && Array.from(model.id).length <= 512 &&
+        typeof model.address === "string" && model.address.length > 0 && model.address.length <= 512) &&
+      (check.catalog_status === "error" ? check.model_count === null :
+        Number.isSafeInteger(check.model_count) && check.model_count >= check.models.length);
   }
   function validatedHosts(data) {
     if (!data || !Array.isArray(data.hosts) || data.hosts.length > 16 || !data.hosts.every(validHost) ||
       new Set(data.hosts.map(item => item.id)).size !== data.hosts.length) throw new Error("invalid-hosts-response");
     return data.hosts;
+  }
+  function hostCatalog(check) {
+    const catalog = document.createElement("div");
+    catalog.className = "host-catalog";
+    const title = document.createElement("h3");
+    title.textContent = "Models listed by this server";
+    const summary = document.createElement("p");
+    summary.className = "muted";
+    catalog.append(title, summary);
+    if (check.catalog_status === undefined) {
+      summary.textContent = "Check again to retrieve model list.";
+      return catalog;
+    }
+    if (check.catalog_status === "error") {
+      summary.className = "muted catalog-warning";
+      summary.textContent = `Model list unavailable; model count is unknown. ${check.catalog_detail}`;
+    } else {
+      summary.textContent = check.model_count === 0 ? "No models listed by this server." : `${check.model_count} model${check.model_count === 1 ? "" : "s"} listed by this server.`;
+      if (check.models_truncated) {
+        const truncated = document.createElement("p");
+        truncated.className = "muted catalog-warning";
+        truncated.textContent = `Showing ${check.models.length} of ${check.model_count} models. The list is truncated.`;
+        catalog.append(truncated);
+      }
+      if (check.models.length) {
+        const table = document.createElement("table");
+        table.className = "host-model-table";
+        const caption = document.createElement("caption");
+        caption.className = "sr-only";
+        caption.textContent = `Model IDs and API addresses reported by ${check.provider}`;
+        const head = document.createElement("thead");
+        const heading = document.createElement("tr");
+        for (const label of ["Model ID", "API address"]) {
+          const column = document.createElement("th");
+          column.setAttribute("scope", "col");
+          column.textContent = label;
+          heading.append(column);
+        }
+        head.append(heading);
+        const body = document.createElement("tbody");
+        for (const model of check.models) {
+          const row = document.createElement("tr");
+          for (const value of [model.id, model.address]) {
+            const code = document.createElement("code");
+            code.textContent = value;
+            cell(row, code);
+          }
+          body.append(row);
+        }
+        table.append(caption, head, body);
+        catalog.append(table);
+      }
+    }
+    const source = document.createElement("p");
+    source.className = "muted host-api-address";
+    source.textContent = `Model-list endpoint: ${check.catalog_url}`;
+    const notice = document.createElement("p");
+    notice.className = "muted";
+    notice.textContent = "Metadata only. Listed models may not be loaded; inference is not tested.";
+    catalog.append(source, notice);
+    return catalog;
+  }
+  function clearSummary() {
+    for (const id of ["public-count-servers", "public-count-models", "public-last-verified"]) text(id, "Unknown");
+    text("public-summary-note", "No current summary. Counts do not prove models are loaded or inference works.");
+  }
+  function renderSummary(summary) {
+    clearSummary();
+    if (!summary || typeof summary !== "object") return;
+    text("public-count-servers", Number.isSafeInteger(summary.servers) && summary.servers >= 0 ? summary.servers : "Unknown");
+    text("public-count-models", Number.isSafeInteger(summary.models) && summary.models >= 0 ? `${summary.models}${summary.models_truncated === true ? "+" : ""}` : "Unknown");
+    if (summary.last_verified_at === null) text("public-last-verified", "Not yet verified");
+    else if (typeof summary.last_verified_at === "string") text("public-last-verified", date(summary.last_verified_at));
+    text("public-summary-note", summary.models_truncated === true
+      ? "Model lists are incomplete; the model count is a lower bound. Cached metadata does not prove models are loaded or inference works."
+      : "Counts reflect cached metadata, not a live network scan. They do not prove models are loaded or inference works.");
   }
   function renderHosts() {
     rows("hosts-body", savedHosts, 4, "No saved addresses. Add a machine above to check its backend ports.", (row, item) => {
@@ -348,17 +484,19 @@ STATUS_JS = r"""
       for (const check of item.checks) {
         const result = document.createElement("div");
         result.className = "host-check";
+        const heading = document.createElement("div");
+        heading.className = "host-check-heading";
         const name = document.createElement("strong");
-        name.textContent = check.provider;
-        result.append(name, badge(check.status === "pass" ? "Found" : "Not confirmed", check.status === "pass" ? "ready" : "warning"));
-        const address = document.createElement("span");
-        address.className = "secondary address";
-        address.textContent = check.base_url;
-        const detail = document.createElement("span");
-        detail.className = "secondary";
+        name.textContent = `${check.provider} `;
+        heading.append(name, badge(check.status === "pass" ? "Found" : "Not confirmed", check.status === "pass" ? "ready" : "warning"));
+        const address = document.createElement("p");
+        address.className = "host-api-address address";
+        address.textContent = `API base: ${check.base_url}`;
+        const detail = document.createElement("p");
+        detail.className = "muted";
         const elapsed = Number.isFinite(check.elapsed_ms) && check.elapsed_ms >= 0 ? ` · ${Math.round(check.elapsed_ms)} ms` : "";
         detail.textContent = `${check.detail}${Number.isInteger(check.http_status) ? ` · HTTP ${check.http_status}` : ""}${elapsed}`;
-        result.append(address, detail);
+        result.append(heading, address, detail, hostCatalog(check));
         results.append(result);
       }
       cell(row, results);
@@ -469,6 +607,7 @@ STATUS_JS = r"""
     }
   }
   function renderHealth(data, detailed) {
+    renderSummary(data.summary);
     const ready = data.ready === true;
     const degraded = data.status === "degraded";
     const tone = ready ? (degraded ? "warning" : "ready") : "warning";
@@ -636,17 +775,21 @@ STATUS_JS = r"""
       }
     }
   }
-  el("key-form").addEventListener("submit", (event) => {
-    event.preventDefault();
-    const enteredKey = el("api-key").value.trim();
-    el("api-key").value = "";
-    if (!enteredKey) return;
+  function unlockWithKey(enteredKey) {
+    if (!enteredKey || !pageActive) return;
     cancelRefresh();
     apiKey = enteredKey;
+    el("api-key").value = "";
     clearDetails();
     authControls("Checking your key…");
     health("pending", "Checking router…", "Requesting a fresh authenticated status snapshot.", "Checking…", "Checking…");
     refresh();
+  }
+  el("key-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const enteredKey = el("api-key").value.trim();
+    el("api-key").value = "";
+    unlockWithKey(enteredKey);
   });
   el("lock-button").addEventListener("click", () => {
     cancelRefresh();
@@ -663,20 +806,29 @@ STATUS_JS = r"""
   el("hosts-reload-button").addEventListener("click", () => hostOperation("load"));
   el("hosts-check-button").addEventListener("click", () => hostOperation("check"));
   text("router-origin", safeOrigin(window.location.origin) || "Current server");
-  authControls();
+  apiKey = consumeURLKey();
+  authControls(apiKey ? "Checking your URL key…" : undefined);
   refresh();
   let timer = setInterval(refresh, 10000);
+  window.addEventListener("hashchange", () => {
+    // Same-page fragment navigation does not rerun this script. Scrub a newly
+    // supplied key before deciding whether to unlock; ordinary anchors are inert.
+    unlockWithKey(consumeURLKey());
+  });
   window.addEventListener("pagehide", () => {
+    pageActive = false;
     apiKey = "";
     el("api-key").value = "";
     cancelRefresh();
     clearDetails();
+    clearSummary();
     authControls();
     text("checked-at", "No current snapshot");
     health("pending", "Checking router…", "Waiting for a fresh status snapshot.", "Checking…", "Checking…");
     clearInterval(timer);
   });
   window.addEventListener("pageshow", (event) => {
+    pageActive = true;
     if (!event.persisted) return;
     refresh();
     timer = setInterval(refresh, 10000);

@@ -134,11 +134,45 @@ will succeed. Losing contact with the router marks the display stale instead of
 leaving a green success indicator behind.
 
 Enter the **router's** `LLM_ROUTER_GATEWAY_API_KEY` from `router.env` to unlock fleet
-details. This is not an LM Studio/provider token. The key is kept only in the
-page's memory, never placed in the URL or browser storage, and is cleared when you
-lock details or reload/close the page. The public locked view shows only the same
-basic readiness/version information as `/healthz`. If gateway authentication is
+details. This is not an LM Studio/provider token. A key entered in the password
+field is kept only in the page's memory, never added to URLs or browser storage,
+and cleared when you lock details or reload/close the page. The public locked
+view shows readiness/version, **known server count**, **listed model-copy count**,
+and the **last successful cached metadata check**. `/healthz` and `/readyz` expose
+the same aggregate `summary` object; no server addresses, model names,
+credentials, or private error messages are public. If gateway authentication is
 disabled, details follow that same unauthenticated-access policy.
+
+The summary combines the cached routing fleet and saved-address check results.
+Multiple APIs on the same server address are deduplicated; the same model on
+different server addresses counts as separate copies. It counts known/listed
+models, not necessarily loaded or currently usable models. A `+` after the model
+count means a catalog was truncated and the count is a lower bound. The last
+verified time comes from successful metadata checks or successful discovery,
+not from viewing the page; it is unknown when no successful cached check exists.
+Viewing public status never triggers a network scan or model request.
+
+To unlock details directly from a URL, the status page accepts `api_key` in a URL
+fragment (preferred) or query parameter:
+
+```text
+http://ROUTER_IP:8088/status#api_key=YOUR_ROUTER_API_KEY
+http://ROUTER_IP:8088/status?api_key=YOUR_ROUTER_API_KEY
+```
+
+The browser removes the key from the address bar before making API requests,
+then uses the normal Bearer header. Duplicate/ambiguous key parameters are
+rejected. This works only for the browser status page, not as query-string
+authentication for the API endpoints. Manually entered keys are never added to
+links, and backend servers never receive your router key.
+
+**Treat URLs containing keys as secrets.** Query-string keys may already have
+reached proxy logs or browser history before the page clears them. The router
+redacts `api_key` from its normal Uvicorn access logs, but cannot erase upstream
+logs, shared links, or browser history/sync. URL fragments are not sent to the
+server, making `#api_key=` preferable; entering the key in the password field
+avoids putting it in a URL altogether. Use HTTPS or a trusted VPN and URL-encode
+keys containing special characters. Rotate any key shared accidentally.
 
 Quick links expose the router's health, readiness, diagnostics and compatible API
 catalog endpoints on the same port. The page also shows your current router
@@ -174,8 +208,9 @@ an SSH tunnel instead of exposing port 8088. Manually launched `llm-router serve
 and `llm-router-gateway` commands still default to localhost unless `--host` or
 `LLM_ROUTER_HOST` says otherwise; they do not generate an API key for you.
 Do not expose the dashboard or send your API key over an untrusted plaintext
-HTTP connection; use TLS or a trusted VPN. Backend credentials and URL paths/query strings are excluded
-from the dashboard data.
+HTTP connection; use TLS or a trusted VPN. Backend credentials and private URL
+query strings are never included in dashboard data; saved checks display only
+validated addresses and fixed metadata API paths.
 
 ### Save and quickly check backend addresses
 
@@ -193,10 +228,31 @@ a subnet or port-range scanner. Checks run concurrently with short timeouts and
 report elapsed time, HTTP status, and the latest check time. A bare address checks
 only the two standard ports; an explicit port checks only that port.
 
-Checks make fixed metadata GET requests (`/api/version` and `/v1/models`), never
-prompts, inference, model loading or downloads. An OpenAI-compatible response is
-labelled accordingly: it does not prove that the server is specifically LM
-Studio. Authentication-required backends report their HTTP rejection; the router
+Each result now shows the server's **model IDs and the API address for those
+models**, not just a "Found" badge. Ollama's model list comes from
+[`GET /api/tags`](https://docs.ollama.com/api/tags); its version check remains
+[`GET /api/version`](https://docs.ollama.com/api/version). LM Studio and other
+OpenAI-compatible servers use
+[`GET /v1/models`](https://lmstudio.ai/docs/developer/openai-compat/models).
+These are metadata requests only: no prompts, inference, model loading or
+downloads. A listed model is not necessarily loaded, and listing it does not
+verify that generation would succeed. Embedding models can also appear.
+
+For example, enter `192.168.42.43:11434` to look for both Ollama and
+OpenAI-compatible APIs on **that IP and that port only**. Each displayed model
+has the correct API base address (including `/v1` for the OpenAI API). The same
+model can appear under both APIs if the server exposes both. The checker does
+not infer a subnet or scan other machines from an individual IP address.
+
+Successful empty lists explicitly show that no models were listed. A reachable
+server whose model-list request fails is shown separately from an empty catalog,
+with the catalog error instead of a stale list. Results show at most 200 unique
+model IDs per API, with the total count and a truncation notice for larger lists.
+The eight-request concurrency limit and 1.5-second per-request deadlines keep
+checks bounded; Ollama's version and catalog requests run in parallel.
+
+An OpenAI-compatible response does not uniquely identify LM Studio.
+Authentication-required backends report their HTTP rejection; the router
 API key is **never** forwarded to them. Redirects are not followed. Page refreshes
 do not run these checks, and saving an address does not by itself add models to
 the routing fleet or change routing health.
@@ -321,6 +377,30 @@ pytest
 ## Use it
 
 ### Automatic discovery
+
+#### What is automatic, and what needs configuration?
+
+| Feature | Behavior |
+|---|---|
+| Find and enroll servers on your LAN/VPN | Opt in with `LLM_ROUTER_SCAN_CIDRS`, or list known servers in `LLM_ROUTER_DISCOVERY_URLS`. A LAN/VPN range is never guessed from an entered IP. |
+| Keep the routing model list current | Discovery repeats every 30 seconds in a new service installation, or every 300 seconds by default when launched manually. Existing settings are preserved; change `LLM_ROUTER_DISCOVERY_REFRESH` to choose another interval. |
+| Status-page saved IP addresses | **Check-only:** saved for later manual checks, with model names and addresses. They are not automatically rechecked or added to routing. To route to one, also configure its discovery URL. |
+| Detect known backends going offline/online | Metadata health checks run every 15 seconds by default. Eligible replicas can serve fallback requests; this is not a guarantee of uninterrupted service. |
+| HA, preferred-machine and no-failover aliases | Generated for enrolled models. Replica groups use exact upstream model IDs unless `replica_group` explicitly joins different IDs. Use a stable `machine_id` and DNS/VPN hostname for a roaming machine. |
+| Install router software updates | Daily, with up to one hour of jitter, **only after** installing with `--service --auto-update`. Updates preserve settings and restart an active service; a single router can briefly be unavailable during restart. |
+| Status page and self-test | Public summaries and page refreshes read cached data. Saved checks and the self-test fetch metadata only; they never run inference, load models, or download models. |
+
+LAN discovery currently checks Ollama on `11434` and OpenAI-compatible APIs on
+`1234`, `8000`, and `8080`. It examines the **first 64 host addresses per configured
+range** by default, not necessarily every machine in that range. For a complete
+IPv4 `/24`, set `LLM_ROUTER_MAX_SCAN_HOSTS=254` (the maximum is 256). At most eight
+ranges are considered. Restricting a saved check to `IP:port` checks that one
+machine only; it does not start a single-port subnet scan.
+
+For the systemd installation, put discovery settings in the service user's
+`~/.config/llm-router/router.env`, then restart `llm-router.service` using that
+user's systemd manager. Saving an address in the dashboard does not edit this
+file. Choose only network ranges and servers you are authorized to contact.
 
 The default scan is bounded to well-known loopback services:
 

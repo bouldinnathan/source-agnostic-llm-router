@@ -277,11 +277,17 @@ def test_probes_only_fixed_metadata_without_credentials(address, origins, monkey
         assert "authorization" not in request.headers
         assert "cookie" not in request.headers
         assert "proxy-authorization" not in request.headers
-        payload = {"version": "private-version"} if request.url.path == "/api/version" else {"data": [{"id": "private-model"}]}
+        payload = {
+            "/api/version": {"version": "private-version"},
+            "/api/tags": {"models": [{"name": "qwen:latest", "private": "private-metadata"}]},
+            "/v1/models": {"data": [{"id": "qwen", "private": "private-metadata"}]},
+        }[request.url.path]
         return httpx.Response(200, json=payload, headers={"set-cookie": "private-cookie=secret"})
 
     result = asyncio.run(check_saved_host({"id": "entry", "address": address}, transport=httpx.MockTransport(handler)))
-    assert [str(request.url) for request in calls] == [origins[0] + "/api/version", origins[1] + "/v1/models"]
+    assert sorted(str(request.url) for request in calls) == sorted([
+        origins[0] + "/api/version", origins[0] + "/api/tags", origins[1] + "/v1/models",
+    ])
     assert result["id"] == "entry"
     assert result["address"] == normalize_address(address)
     assert result["checked_at"].endswith("+00:00")
@@ -290,7 +296,9 @@ def test_probes_only_fixed_metadata_without_credentials(address, origins, monkey
     assert [check["provider"] for check in result["checks"]] == ["Ollama", "LM Studio / OpenAI-compatible"]
     assert all(check["elapsed_ms"] >= 0 for check in result["checks"])
     assert all(options["trust_env"] is False and options["follow_redirects"] is False for options in client_options)
-    assert len(client_options) == 2
+    assert len(client_options) == 3
+    assert result["checks"][0]["models"] == [{"id": "qwen:latest", "address": origins[0]}]
+    assert result["checks"][1]["models"] == [{"id": "qwen", "address": origins[1] + "/v1"}]
     assert "private-" not in json.dumps(result)
     assert "gateway-secret" not in json.dumps(result)
 
@@ -304,7 +312,7 @@ def test_failed_statuses_never_follow_redirects_or_echo_body(status):
         return httpx.Response(status, text="private-body", headers={"location": "http://other.invalid/api/pull"})
 
     result = asyncio.run(check_saved_host({"id": "a", "address": "worker"}, transport=httpx.MockTransport(handler)))
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert all(check["status"] == "fail" and check["http_status"] == status for check in result["checks"])
     assert "private-body" not in json.dumps(result)
     assert "other.invalid" not in json.dumps(result)
@@ -344,7 +352,7 @@ def test_deadline_includes_response_body_and_closes_stream(monkeypatch):
     transport = httpx.MockTransport(lambda request: httpx.Response(200, stream=SlowStream(closed)))
     result = asyncio.run(check_saved_host({"id": "a", "address": "worker"}, transport=transport))
     assert all(check["status"] == "fail" and "timeout" in check["detail"] for check in result["checks"])
-    assert len(closed) == 2
+    assert len(closed) == 3
 
 
 class LargeStream(httpx.AsyncByteStream):
@@ -403,7 +411,7 @@ def test_concurrency_is_shared_across_hosts_and_reusable_across_event_loops():
             peak = max(peak, active)
             await asyncio.sleep(0.003)
             active -= 1
-            return httpx.Response(200, json={"version": "1", "data": []})
+            return httpx.Response(200, json={"version": "1", "data": [], "models": []})
 
         transport = httpx.MockTransport(handler)
         results = await asyncio.gather(*[
@@ -411,7 +419,7 @@ def test_concurrency_is_shared_across_hosts_and_reusable_across_event_loops():
             for index in range(16)
         ])
         assert peak == 8
-        assert count == 32
+        assert count == 48
         assert all(check["status"] == "pass" for result in results for check in result["checks"])
 
     asyncio.run(scenario())
@@ -427,6 +435,216 @@ def test_cancellation_closes_streams():
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert len(closed) == 2
+        assert len(closed) == 3
 
     asyncio.run(scenario())
+
+
+def catalog_check(*, ollama_models=None, openai_models=None, address="worker", version_status=200):
+    def handler(request):
+        if request.url.path == "/api/version":
+            return httpx.Response(version_status, json={"version": "1"})
+        if request.url.path == "/api/tags":
+            payload = {"models": [] if ollama_models is None else ollama_models}
+        else:
+            assert request.url.path == "/v1/models"
+            payload = {"data": [] if openai_models is None else openai_models}
+        # Default JSON encoding represents surrogate test inputs safely so the
+        # catalog validator, rather than the mock transport, rejects them.
+        return httpx.Response(200, content=json.dumps(payload).encode())
+
+    return asyncio.run(check_saved_host({"id": "catalog", "address": address}, transport=httpx.MockTransport(handler)))
+
+
+def test_catalog_lists_ollama_names_fallbacks_and_openai_ids():
+    result = catalog_check(
+        ollama_models=[{"name": "qwen:latest"}, {"model": "llama:8b"}, {"name": "qwen:latest", "model": "ignored"}],
+        openai_models=[{"id": "qwen/qwen3"}, {"id": "embed-small"}, {"id": "qwen/qwen3"}],
+    )
+    ollama, openai = result["checks"]
+    assert ollama["models"] == [
+        {"id": "qwen:latest", "address": "http://worker:11434"},
+        {"id": "llama:8b", "address": "http://worker:11434"},
+    ]
+    assert openai["models"] == [
+        {"id": "qwen/qwen3", "address": "http://worker:1234/v1"},
+        {"id": "embed-small", "address": "http://worker:1234/v1"},
+    ]
+    assert ollama["catalog_url"] == "http://worker:11434/api/tags"
+    assert openai["catalog_url"] == "http://worker:1234/v1/models"
+    for check in result["checks"]:
+        assert check["catalog_status"] == "ok"
+        assert check["model_count"] == 2
+        assert check["models_truncated"] is False
+        assert "without invoking, loading, or downloading" in check["catalog_detail"]
+
+
+def test_valid_empty_catalog_is_distinct_from_unavailable():
+    for check in catalog_check()["checks"]:
+        assert check["status"] == "pass"
+        assert check["catalog_status"] == "ok"
+        assert check["model_count"] == 0
+        assert check["models"] == []
+        assert check["models_truncated"] is False
+
+
+@pytest.mark.parametrize("provider", ["ollama", "openai"])
+@pytest.mark.parametrize("bad_id", [
+    "", " ", " leading", "trailing ", 123, True, None, [], {}, "x" * 513,
+    "private\nsecret", "private\rsecret", "private\x00secret", "private\x7fsecret",
+    "private\x85secret", "private\u202esecret", "private\u2028secret", "private\ud800secret",
+])
+def test_malformed_model_ids_fail_catalog_without_fake_zero(provider, bad_id):
+    kwargs = {"ollama_models": [{"name": bad_id}]} if provider == "ollama" else {"openai_models": [{"id": bad_id}]}
+    check = catalog_check(**kwargs)["checks"][0 if provider == "ollama" else 1]
+    assert check["catalog_status"] == "error"
+    assert check["model_count"] is None
+    assert check["models"] == []
+    assert check["models_truncated"] is False
+    assert "malformed" in check["catalog_detail"]
+    assert "private" not in json.dumps(check)
+    if provider == "ollama":
+        assert check["status"] == "pass"  # Valid version endpoint still establishes reachability.
+
+
+@pytest.mark.parametrize("provider", ["ollama", "openai"])
+@pytest.mark.parametrize("items", ["invalid", {}, [None], ["qwen"], [{}], [1]])
+def test_malformed_catalog_shape_is_explicit_error(provider, items):
+    kwargs = {"ollama_models": items} if provider == "ollama" else {"openai_models": items}
+    check = catalog_check(**kwargs)["checks"][0 if provider == "ollama" else 1]
+    assert check["catalog_status"] == "error"
+    assert check["model_count"] is None
+    assert check["models"] == []
+
+
+@pytest.mark.parametrize("provider", ["ollama", "openai"])
+def test_catalog_models_bounded_deduplicated_and_counted(provider):
+    field = "name" if provider == "ollama" else "id"
+    items = [{field: f"model-{index}"} for index in range(203)] * 2
+    kwargs = {"ollama_models": items} if provider == "ollama" else {"openai_models": items}
+    check = catalog_check(**kwargs)["checks"][0 if provider == "ollama" else 1]
+    assert check["catalog_status"] == "ok"
+    assert check["model_count"] == 203
+    assert len(check["models"]) == 200
+    assert check["models_truncated"] is True
+    assert [model["id"] for model in check["models"]] == [f"model-{index}" for index in range(200)]
+
+
+@pytest.mark.parametrize("provider", ["ollama", "openai"])
+def test_invalid_item_after_display_limit_is_not_silently_ignored(provider):
+    field = "name" if provider == "ollama" else "id"
+    items = [{field: f"model-{index}"} for index in range(201)] + [{field: "\nprivate-secret"}]
+    kwargs = {"ollama_models": items} if provider == "ollama" else {"openai_models": items}
+    check = catalog_check(**kwargs)["checks"][0 if provider == "ollama" else 1]
+    assert check["catalog_status"] == "error"
+    assert check["model_count"] is None
+    assert check["models"] == []
+    assert "private-secret" not in json.dumps(check)
+
+
+def test_model_identifier_maximum_and_non_ascii_names():
+    result = catalog_check(ollama_models=[{"name": "x" * 512}], openai_models=[{"id": "模型/qwen-32b"}])
+    assert result["checks"][0]["models"][0]["id"] == "x" * 512
+    assert result["checks"][1]["models"][0]["id"] == "模型/qwen-32b"
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 503])
+def test_version_reachable_catalog_error_does_not_claim_empty(status):
+    def handler(request):
+        if request.url.path == "/api/version":
+            return httpx.Response(200, json={"version": "1"})
+        return httpx.Response(status, text="private-backend-error")
+
+    result = asyncio.run(check_saved_host({"id": "a", "address": "worker"}, transport=httpx.MockTransport(handler)))
+    ollama, openai = result["checks"]
+    assert ollama["status"] == "pass"
+    assert ollama["http_status"] == 200
+    assert "catalog is unavailable" in ollama["detail"]
+    assert openai["status"] == "fail"
+    for check in result["checks"]:
+        assert check["catalog_status"] == "error"
+        assert check["model_count"] is None
+        assert check["models"] == []
+        assert "private-backend-error" not in json.dumps(check)
+
+
+def test_ollama_catalog_alone_identifies_server_if_version_fails():
+    check = catalog_check(ollama_models=[{"name": "qwen"}], version_status=404)["checks"][0]
+    assert check["status"] == "pass"
+    assert check["http_status"] == 200
+    assert check["catalog_status"] == "ok"
+    assert check["models"] == [{"id": "qwen", "address": "http://worker:11434"}]
+
+
+@pytest.mark.parametrize("slow_path", ["/api/version", "/api/tags"])
+def test_ollama_partial_timeout_preserves_other_success(monkeypatch, slow_path):
+    monkeypatch.setattr(saved_hosts, "PROBE_TIMEOUT_SECONDS", 0.025)
+    closed = []
+
+    def handler(request):
+        if request.url.path == slow_path:
+            return httpx.Response(200, stream=SlowStream(closed))
+        payload = {"/api/version": {"version": "1"}, "/api/tags": {"models": [{"name": "qwen"}]}, "/v1/models": {"data": []}}[request.url.path]
+        return httpx.Response(200, json=payload)
+
+    result = asyncio.run(check_saved_host({"id": "a", "address": "worker"}, transport=httpx.MockTransport(handler)))
+    check = result["checks"][0]
+    assert check["status"] == "pass"
+    assert len(closed) == 1
+    if slow_path == "/api/tags":
+        assert check["catalog_status"] == "error"
+        assert check["model_count"] is None
+        assert "timeout" in check["catalog_detail"]
+    else:
+        assert check["catalog_status"] == "ok"
+        assert check["model_count"] == 1
+
+
+def test_ollama_metadata_requests_run_concurrently():
+    async def scenario():
+        requested = set()
+        all_started = asyncio.Event()
+
+        async def handler(request):
+            requested.add(request.url.path)
+            if len(requested) == 3:
+                all_started.set()
+            await asyncio.wait_for(all_started.wait(), timeout=0.2)
+            return httpx.Response(200, json={"version": "1", "models": [], "data": []})
+
+        result = await check_saved_host({"id": "a", "address": "worker"}, transport=httpx.MockTransport(handler))
+        assert requested == {"/api/version", "/api/tags", "/v1/models"}
+        assert all(check["status"] == "pass" for check in result["checks"])
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("address", ["worker:11434", "https://worker:1234/v1", "http://[fd12::1]:4321"])
+def test_explicit_port_uses_one_origin_for_both_api_types_and_ignores_returned_addresses(address):
+    record = {
+        "name": "qwen", "id": "qwen", "address": "https://attacker.invalid", "base_url": "https://attacker.invalid",
+        "url": "javascript:alert(1)", "owned_by": "private-owner", "details": {"secret": "private-secret"},
+    }
+    result = catalog_check(ollama_models=[record], openai_models=[record], address=address)
+    origin = normalize_address(address)
+    assert result["checks"][0]["models"] == [{"id": "qwen", "address": origin}]
+    assert result["checks"][1]["models"] == [{"id": "qwen", "address": origin + "/v1"}]
+    assert result["checks"][0]["catalog_url"] == origin + "/api/tags"
+    assert result["checks"][1]["catalog_url"] == origin + "/v1/models"
+    for secret in ("attacker", "javascript", "private-owner", "private-secret"):
+        assert secret not in json.dumps(result)
+
+
+def test_catalog_results_are_not_saved_to_address_file(tmp_path):
+    path = tmp_path / "saved.json"
+    store = SavedHostStore(path)
+    entry = store.add("worker")
+    original = path.read_bytes()
+
+    def handler(request):
+        return httpx.Response(200, json={"version": "1", "models": [{"name": "qwen"}], "data": [{"id": "qwen"}]})
+
+    result = asyncio.run(check_saved_host(entry, transport=httpx.MockTransport(handler)))
+    assert all(check["models"] for check in result["checks"])
+    assert path.read_bytes() == original
+    assert "qwen" not in path.read_text()
