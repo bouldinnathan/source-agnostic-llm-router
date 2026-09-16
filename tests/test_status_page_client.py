@@ -27,3 +27,8 @@ def test_status_page_client_flows() -> None:
     assert "PASS selfTestFailuresAndSafeRendering" in result.stdout
     assert "PASS selfTestPrivacyAndRaceGuards" in result.stdout
     assert "PASS selfTestAuthenticationFailure" in result.stdout
+    assert "PASS savedHostLifecycle" in result.stdout
+    assert "PASS savedHostsRestoreAndRequireAuthentication" in result.stdout
+    assert "PASS savedHostFailuresAndSafeRendering" in result.stdout
+    assert "PASS savedHostPrivacyAndRaceGuards" in result.stdout
+    assert "PASS savedHostAuthRejectionAndTimeout" in result.stdout

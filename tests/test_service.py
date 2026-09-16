@@ -48,7 +48,7 @@ def test_write_service_creates_safe_defaults_and_unit(
     assert unit_path == config_home / "systemd" / "user" / "llm-router.service"
     assert env_path == config_home / "llm-router" / "router.env"
     values = env_values(env_path)
-    assert values["LLM_ROUTER_HOST"] == "127.0.0.1"
+    assert values["LLM_ROUTER_HOST"] == "0.0.0.0"
     assert values["LLM_ROUTER_PORT"] == "8088"
     assert values["LLM_ROUTER_AUTO_PROVISION"] == "0"
     assert len(values["LLM_ROUTER_GATEWAY_API_KEY"]) >= 32

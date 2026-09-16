@@ -1,4 +1,4 @@
-"""Dependency-free status page with read-only metadata diagnostics."""
+"""Dependency-free status page with saved targets and metadata diagnostics."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ _STATUS_HTML = """<!doctype html>
     <div class="brand"><span class="brand-mark" aria-hidden="true">↗</span>
       <span>LLM Router <span class="brand-subtitle">/ Status</span></span>
     </div>
-    <span class="readonly">Read-only dashboard</span>
+    <span class="readonly">Status &amp; connection checks</span>
   </header>
   <main id="main">
     <section class="heading" aria-labelledby="page-title">
@@ -84,6 +84,23 @@ _STATUS_HTML = """<!doctype html>
 
     <section id="details" aria-label="Backend details" hidden>
       <div class="section-heading"><h2>Backend details</h2></div>
+      <section class="card" aria-labelledby="hosts-title">
+        <div class="card-heading"><div><h2 id="hosts-title">Saved backend addresses</h2>
+          <p class="muted">Save an IP address or hostname on this router for quick future checks. Checks read metadata only: no prompts, model loading, or downloads. Saving an address does not add its models to routing.</p>
+        </div></div>
+        <form id="host-form" class="host-form" autocomplete="off">
+          <label for="host-address">IP address, hostname, or backend URL</label>
+          <div class="key-controls"><input id="host-address" name="backend-address" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="256" placeholder="192.168.194.0" required aria-describedby="host-help hosts-message">
+            <button id="host-save-button" type="submit" class="primary">Save &amp; check</button></div>
+          <p id="host-help" class="muted">A bare IP address or hostname checks Ollama on 11434 and LM Studio on 1234. A URL checks only its own port, for example http://192.168.194.0:1234/v1. Do not include passwords or API keys.</p>
+        </form>
+        <div class="hosts-toolbar"><p id="hosts-message" class="muted" role="status">Unlock details to manage saved addresses.</p>
+          <div class="hosts-actions"><button id="hosts-reload-button" type="button">Reload saved</button><button id="hosts-check-button" type="button">Check all saved</button></div></div>
+        <div id="hosts-results" class="table-scroll"><table><caption class="sr-only">Saved addresses and metadata checks</caption>
+          <thead><tr><th scope="col">Saved address</th><th scope="col">Latest metadata checks</th><th scope="col">Last checked</th><th scope="col">Actions</th></tr></thead>
+          <tbody id="hosts-body"></tbody>
+        </table></div>
+      </section>
       <section class="card" aria-labelledby="self-test-title">
         <div class="card-heading self-test-heading"><div><h2 id="self-test-title">Connection self-test</h2>
           <p class="muted">Checks router APIs and backend metadata only. Never sends prompts, runs inference, loads models, or downloads anything.</p>
@@ -134,7 +151,7 @@ _STATUS_HTML = """<!doctype html>
     </section>
     <noscript><p class="help-box">Enable JavaScript to view live status. The JSON readiness endpoint is <a href="/healthz">/healthz</a>.</p></noscript>
   </main>
-  <footer><p id="version"></p><p>Status refreshes every 10 seconds · self-test runs only on click · metadata checks do not prove inference works</p></footer>
+  <footer><p id="version"></p><p>Status refreshes every 10 seconds · metadata checks run only when requested · metadata checks do not prove inference works</p></footer>
 </body>
 </html>
 """
@@ -151,7 +168,9 @@ main{max-width:1208px;margin:auto;padding:38px 24px 24px}.heading,.section-headi
 @media(max-width:800px){.auth-card{grid-template-columns:1fr}.stats,.overview{grid-template-columns:repeat(2,1fr)}.auth-actions{grid-column:auto}th,td{padding:12px 16px}.heading{align-items:flex-start}.heading button{margin-top:12px}}
 @media(max-width:500px){main{padding:24px 16px}.topbar{padding:16px}.readonly{display:none}.heading{display:block}h1{font-size:28px}.heading button{width:100%;margin-top:18px}.health-panel{padding:18px}.auth-card{padding:18px}.key-controls{flex-direction:column}.auth-actions{align-items:flex-start;flex-direction:column}.stats{gap:10px}.stat{padding:14px}.stat strong{font-size:25px}.section-heading{align-items:flex-start;flex-direction:column;gap:3px}footer{padding:0 16px 24px}.brand{font-size:17px}}
 .quick-links{padding:19px 22px}.quick-links p{margin-top:6px}.quick-links nav{display:flex;flex-wrap:wrap;gap:8px 20px;margin:12px 0}.quick-links nav a{font-size:13px}.self-test-message{padding:0 22px 19px}.self-test-message.result-pass{color:var(--green)}.self-test-message.result-fail{color:var(--red)}.self-test-message.result-partial{color:var(--amber)}
+.host-form{padding:0 22px 16px}.host-form label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}.host-form p{margin-top:7px}.hosts-toolbar{padding:0 22px 19px;display:flex;align-items:center;justify-content:space-between;gap:16px}.hosts-actions{display:flex;flex-wrap:wrap;gap:8px}.hosts-actions button{padding:6px 10px;font-size:12px}.host-check+.host-check{margin-top:12px}.host-check .badge{margin-left:6px}.host-check .secondary{overflow-wrap:anywhere}#hosts-message.result-fail{color:var(--red)}#hosts-message.result-pass{color:var(--green)}
 @media(max-width:800px){.self-test-heading{align-items:flex-start;flex-direction:column}}
+@media(max-width:600px){.hosts-toolbar{align-items:flex-start;flex-direction:column}.host-form .key-controls{flex-direction:column}}
 """
 
 
@@ -165,6 +184,11 @@ STATUS_JS = r"""
   let activeRequest = null;
   let selfTestGeneration = 0;
   let activeSelfTest = null;
+  let hostsGeneration = 0;
+  let activeHosts = null;
+  let hostsLoaded = false;
+  let savedHosts = [];
+  let hostsLimit = 16;
   const text = (id, value) => { el(id).textContent = String(value); };
   const count = (value) => Number.isFinite(value) && value >= 0 ? String(value) : "—";
   const date = (value) => {
@@ -220,6 +244,7 @@ STATUS_JS = r"""
   }
   function clearDetails() {
     clearSelfTest();
+    clearHosts();
     el("details").hidden = true;
     for (const id of ["endpoints-body", "models-body", "aliases-body"]) el(id).replaceChildren();
     for (const id of ["count-endpoints", "count-online", "count-models", "count-aliases", "uptime", "last-discovery"]) text(id, "—");
@@ -278,6 +303,171 @@ STATUS_JS = r"""
     }
     body.append(fragment);
   }
+  function hostControls() {
+    const enabled = authRequired && Boolean(apiKey) && !el("details").hidden;
+    const busy = Boolean(activeHosts);
+    el("host-address").disabled = !enabled || busy;
+    el("host-save-button").disabled = !enabled || busy || savedHosts.length >= hostsLimit;
+    el("hosts-reload-button").disabled = !enabled || busy;
+    el("hosts-check-button").disabled = !enabled || busy || savedHosts.length === 0;
+    el("hosts-results").setAttribute("aria-busy", String(busy));
+  }
+  function hostMessage(message, tone = "") {
+    el("hosts-message").className = tone ? `muted result-${tone}` : "muted";
+    text("hosts-message", message);
+  }
+  function clearHosts() {
+    hostsGeneration += 1;
+    if (activeHosts) activeHosts.abort();
+    activeHosts = null;
+    hostsLoaded = false;
+    savedHosts = [];
+    el("host-address").value = "";
+    el("hosts-body").replaceChildren();
+    hostMessage(authRequired ? "Unlock details to manage saved addresses." : "Address management is disabled. Set LLM_ROUTER_GATEWAY_API_KEY in router.env and restart the router to enable it.");
+    hostControls();
+  }
+  function validHost(item) {
+    return item && typeof item.id === "string" && item.id.length > 0 && item.id.length <= 64 &&
+      typeof item.address === "string" && item.address.length > 0 && item.address.length <= 256 &&
+      (item.checked_at === null || typeof item.checked_at === "string") &&
+      Array.isArray(item.checks) && item.checks.length <= 8 && item.checks.every(check => check &&
+        ["pass", "fail"].includes(check.status) && typeof check.provider === "string" &&
+        typeof check.base_url === "string" && typeof check.detail === "string");
+  }
+  function validatedHosts(data) {
+    if (!data || !Array.isArray(data.hosts) || data.hosts.length > 16 || !data.hosts.every(validHost) ||
+      new Set(data.hosts.map(item => item.id)).size !== data.hosts.length) throw new Error("invalid-hosts-response");
+    return data.hosts;
+  }
+  function renderHosts() {
+    rows("hosts-body", savedHosts, 4, "No saved addresses. Add a machine above to check its backend ports.", (row, item) => {
+      cell(row, item.address, null, "address");
+      const results = document.createElement("div");
+      if (!item.checks.length) results.textContent = "Not checked in this router session";
+      for (const check of item.checks) {
+        const result = document.createElement("div");
+        result.className = "host-check";
+        const name = document.createElement("strong");
+        name.textContent = check.provider;
+        result.append(name, badge(check.status === "pass" ? "Found" : "Not confirmed", check.status === "pass" ? "ready" : "warning"));
+        const address = document.createElement("span");
+        address.className = "secondary address";
+        address.textContent = check.base_url;
+        const detail = document.createElement("span");
+        detail.className = "secondary";
+        const elapsed = Number.isFinite(check.elapsed_ms) && check.elapsed_ms >= 0 ? ` · ${Math.round(check.elapsed_ms)} ms` : "";
+        detail.textContent = `${check.detail}${Number.isInteger(check.http_status) ? ` · HTTP ${check.http_status}` : ""}${elapsed}`;
+        result.append(address, detail);
+        results.append(result);
+      }
+      cell(row, results);
+      cell(row, date(item.checked_at));
+      const actions = document.createElement("div");
+      actions.className = "hosts-actions";
+      for (const [label, action] of [["Check", "check"], ["Remove", "remove"]]) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = label;
+        button.disabled = Boolean(activeHosts) || !authRequired || !apiKey;
+        button.setAttribute("aria-label", `${label} ${item.address}`);
+        button.addEventListener("click", () => hostOperation(action, item.id));
+        actions.append(button);
+      }
+      cell(row, actions);
+    });
+    hostControls();
+  }
+  async function hostOperation(action, id) {
+    if (activeHosts || el("details").hidden || !authRequired || !apiKey) return;
+    const address = el("host-address").value.trim();
+    if (action === "save" && !address) return;
+    const currentGeneration = ++hostsGeneration;
+    const controller = new AbortController();
+    activeHosts = controller;
+    hostsLoaded = true;
+    let addressSaved = false;
+    if (action === "check") savedHosts = savedHosts.map(item => !id || item.id === id ? {...item, checked_at: null, checks: []} : item);
+    renderHosts();
+    hostMessage(action === "load" ? "Loading saved addresses…" : action === "remove" ? "Removing saved address…" : action === "save" ? "Saving address, then checking metadata…" : "Checking saved addresses… No models are being used.");
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    const request = async (path, method = "GET", body) => {
+      const headers = {Accept: "application/json", Authorization: `Bearer ${apiKey}`};
+      if (method !== "GET") {
+        headers["X-LLM-Router-Hosts"] = "1";
+        headers["Content-Type"] = "application/json";
+      }
+      const options = {method, headers, credentials: "omit", cache: "no-store", redirect: "error", signal: controller.signal};
+      if (body !== undefined) options.body = JSON.stringify(body);
+      const response = await fetch(path, options);
+      if (currentGeneration !== hostsGeneration || controller.signal.aborted) throw new Error("cancelled-hosts-request");
+      if (!response.ok) {
+        const error = new Error("hosts-response");
+        error.httpStatus = response.status;
+        throw error;
+      }
+      const data = await response.json();
+      if (currentGeneration !== hostsGeneration || controller.signal.aborted) throw new Error("cancelled-hosts-request");
+      return data;
+    };
+    try {
+      if (action === "load") {
+        const data = await request("/status/hosts");
+        savedHosts = validatedHosts(data);
+        if (Number.isInteger(data.limit) && data.limit > 0 && data.limit <= 16) hostsLimit = data.limit;
+        hostMessage(`${savedHosts.length} / ${hostsLimit} addresses saved on this router. Checks run only when requested; results reset when the router restarts.`);
+      } else if (action === "remove") {
+        const data = await request(`/status/hosts/${encodeURIComponent(id)}`, "DELETE");
+        if (!data || data.removed !== true) throw new Error("invalid-hosts-response");
+        savedHosts = savedHosts.filter(item => item.id !== id);
+        hostMessage("Address removed from future saved checks. Backend and router settings are unchanged.");
+      } else {
+        if (action === "save") {
+          const data = await request("/status/hosts", "POST", {address});
+          if (!data || !validHost(data.host)) throw new Error("invalid-hosts-response");
+          const existing = savedHosts.findIndex(item => item.id === data.host.id);
+          if (existing >= 0) savedHosts[existing] = data.host;
+          else savedHosts.push(data.host);
+          addressSaved = true;
+          id = data.host.id;
+          el("host-address").value = "";
+          renderHosts();
+        }
+        const checked = validatedHosts(await request("/status/hosts/check", "POST", id ? {id} : {}));
+        if (!id) savedHosts = checked;
+        else {
+          if (checked.length !== 1 || checked[0].id !== id) throw new Error("invalid-hosts-response");
+          savedHosts = savedHosts.map(item => item.id === id ? checked[0] : item);
+        }
+        const found = checked.reduce((total, item) => total + item.checks.filter(check => check.status === "pass").length, 0);
+        hostMessage(`${addressSaved ? "Address saved. " : ""}Check complete: ${found} backend API${found === 1 ? "" : "s"} found. Metadata only; no models were used.`, found ? "pass" : "");
+      }
+    } catch (error) {
+      if (currentGeneration !== hostsGeneration) return;
+      if (error.httpStatus === 401 || error.httpStatus === 403) {
+        cancelRefresh();
+        apiKey = "";
+        el("api-key").value = "";
+        authControls("The key was rejected. Enter the router’s client API key to try again.");
+        unavailable("Authentication failed. Backend details and saved-address results have been cleared.");
+        return;
+      }
+      const messages = {
+        400: "Enter one valid IP address, hostname, or HTTP(S) backend URL without credentials, query strings, or fragments. At most 16 addresses can be saved; remove one if the list is full.",
+        404: "That saved address no longer exists. Reload the saved list and try again.",
+        409: "The saved-address limit was reached or the list changed. Reload the list or remove an address, then try again.",
+        429: "Checks are busy or were requested too recently. Wait a moment, then try again.",
+        503: "Saved-address storage or checks are unavailable. Check that the service account can access its saved-address file and configuration directory, then retry.",
+      };
+      hostMessage(`${addressSaved ? "Address saved, but its check did not complete. " : ""}${messages[error.httpStatus] || "The request timed out, the connection failed, or the response was invalid. Reload saved addresses to confirm any changes before retrying."}`, "fail");
+    } finally {
+      clearTimeout(timeout);
+      if (currentGeneration === hostsGeneration) {
+        activeHosts = null;
+        renderHosts();
+      }
+    }
+  }
   function renderHealth(data, detailed) {
     const ready = data.ready === true;
     const degraded = data.status === "degraded";
@@ -324,6 +514,9 @@ STATUS_JS = r"""
       cell(row, count(item.deployments));
     });
     el("details").hidden = false;
+    hostControls();
+    if (authRequired && apiKey && !hostsLoaded && !activeHosts) hostOperation("load");
+    if (!authRequired) hostMessage("Address management is disabled. Set LLM_ROUTER_GATEWAY_API_KEY in router.env and restart the router to enable it.");
   }
   function cancelRefresh() {
     generation += 1;
@@ -466,6 +659,9 @@ STATUS_JS = r"""
   });
   el("refresh-button").addEventListener("click", refresh);
   el("self-test-button").addEventListener("click", runSelfTest);
+  el("host-form").addEventListener("submit", (event) => { event.preventDefault(); hostOperation("save"); });
+  el("hosts-reload-button").addEventListener("click", () => hostOperation("load"));
+  el("hosts-check-button").addEventListener("click", () => hostOperation("check"));
   text("router-origin", safeOrigin(window.location.origin) || "Current server");
   authControls();
   refresh();

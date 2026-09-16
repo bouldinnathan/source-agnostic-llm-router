@@ -35,6 +35,8 @@ prerequisites and to enable startup at boot.
   router_installer="$(mktemp)"
   trap 'rm -f -- "$router_installer"' EXIT
   curl -fsSL https://raw.githubusercontent.com/bouldinnathan/source-agnostic-llm-router/main/install.sh -o "$router_installer"
+  # New installs: LAN/VPN access. Updates: preserve the existing binding.
+  # Add --localhost for this machine only, or --lan to explicitly enable LAN.
   sh "$router_installer" --service --auto-update
 )
 ```
@@ -48,19 +50,47 @@ cannot be enabled, installation reports an error with the
 administrator command needed; it does not claim boot persistence succeeded.
 
 Rerun the same block to update an older installation and enable the timer, or to
-manually update the package and restart the service. Updates preserve
-the service's environment file, API key, and optional `router.toml`. Changed unit
-definitions are backed up alongside the unit; use `systemctl --user edit
+manually update the package and restart the service. Updates without an access-mode
+flag preserve the service's environment file, API key, and optional `router.toml`.
+Changed unit definitions are backed up alongside the unit; use `systemctl --user edit
 llm-router.service` for persistent unit overrides. Updating this single proxy briefly
 interrupts it; backend HA does not make proxy updates zero-downtime.
 
-New service installs listen on **`http://127.0.0.1:8088`**; OpenAI clients use
-**`http://127.0.0.1:8088/v1`**. A random client API key is saved in
+**New service installs default to LAN/VPN access: `0.0.0.0:8088`.** Choose access
+explicitly by adding one of these flags to the installer command above:
+
+```bash
+# Other machines can connect; also enables LAN on an existing installation:
+sh install.sh --service --auto-update --lan
+# Only this machine can connect:
+sh install.sh --service --auto-update --localhost
+```
+
+These examples assume `install.sh` is in your current directory; in the download
+block above, use `sh "$router_installer"` instead. Both flags require `--service`
+and cannot be combined. Without either flag, new service installs use LAN, while
+existing installations keep their current binding. An automatic software update
+never switches an existing localhost installation to LAN.
+
+`0.0.0.0` is a **listening address, not a client URL**. Use your router machine's
+actual LAN/VPN IP or DNS name: **`http://ROUTER_IP:8088/status`** for the dashboard
+and **`http://ROUTER_IP:8088/v1`** for OpenAI clients. Localhost-only installations
+use `http://127.0.0.1:8088` and cannot be reached directly from another computer.
+This includes any public IPv4 interface: `--lan` does not itself
+enforce a LAN-only firewall rule. A random client API key is saved in
 `~/.config/llm-router/router.env` with owner-only permissions. If `XDG_CONFIG_HOME`
 is set, that directory replaces `~/.config` for both settings and the user unit.
 The service discovers local runtimes automatically and refreshes discovery every
 30 seconds. It does not download models by default. An empty fleet is allowed;
 `/healthz` reports unavailable until a usable backend/model is found.
+
+Explicit access-mode changes preserve existing nonempty API keys, ports, and
+backend settings. Enabling LAN generates a key if the existing key is missing or
+empty; it never deliberately exposes a keyless service. Configuration changes
+are backed up privately beside `router.env`. Ambiguous hand-written environment
+files must be edited manually instead of being rewritten automatically. A
+service-unit override that sets the host separately still needs to be adjusted
+with `systemctl --user edit llm-router.service`.
 
 ```bash
 # Edit settings and read the generated LLM_ROUTER_GATEWAY_API_KEY for your clients:
@@ -77,11 +107,13 @@ For your fleet, add this to `router.env`, substituting real DNS/VPN hostnames:
 LLM_ROUTER_DISCOVERY_URLS="ollama@golemframe=http://golemframe.home.arpa:11434,openai@pantheon=http://pantheon.example-vpn:1234/v1"
 ```
 
-To allow clients on other machines, also change `LLM_ROUTER_HOST=127.0.0.1` to
-`LLM_ROUTER_HOST=0.0.0.0` in that file and restart the service. Keep the API key
-enabled, restrict access to your trusted LAN/VPN with your firewall, and use TLS
-when traffic is not protected by a trusted network/VPN. The installer does not
-open firewall ports. Clients connect to `http://ROUTER_HOST:8088` (Ollama) or
+For an older localhost-only installation, use `--service --lan`, or change
+`LLM_ROUTER_HOST=127.0.0.1` to `LLM_ROUTER_HOST=0.0.0.0` in that file and restart
+the service. To switch back, use `--service --localhost` or set `127.0.0.1`.
+Keep the API key enabled, restrict access to your trusted LAN/VPN with your
+firewall, and use TLS when traffic is not protected by a trusted network/VPN.
+The installer does not open firewall ports. Clients connect to
+`http://ROUTER_HOST:8088` (Ollama) or
 `http://ROUTER_HOST:8088/v1` (OpenAI) and use the generated key. Shell `export`
 commands do not configure an already-running service; put settings in `router.env`
 (without `export`). You can also put explicit overrides in the same directory's
@@ -137,11 +169,46 @@ the gateway process, not the systemd service/timer state. The update timer can
 still be checked with the commands below. No external fonts, scripts or analytics
 are used.
 
-The default localhost binding remains unchanged. You can use an SSH tunnel instead
-of exposing port 8088, or bind it to a trusted network interface. Do not expose the
-dashboard or send your API key over an untrusted plaintext HTTP connection; use
-TLS or a trusted VPN. Backend credentials and URL paths/query strings are excluded
+For localhost-only access, select `--localhost` at installation; you can then use
+an SSH tunnel instead of exposing port 8088. Manually launched `llm-router serve`
+and `llm-router-gateway` commands still default to localhost unless `--host` or
+`LLM_ROUTER_HOST` says otherwise; they do not generate an API key for you.
+Do not expose the dashboard or send your API key over an untrusted plaintext
+HTTP connection; use TLS or a trusted VPN. Backend credentials and URL paths/query strings are excluded
 from the dashboard data.
+
+### Save and quickly check backend addresses
+
+On `/status`, unlock details with your router API key, then use **Saved backend
+addresses** to enter an IP address or hostname and click **Save & check**. For
+example, enter `192.168.194.0` to check Ollama on port `11434` and LM Studio's
+OpenAI-compatible API on port `1234`. To check a custom port, enter
+`192.168.194.0:1234` or `http://192.168.194.0:1234/v1`. DNS/VPN hostnames are useful
+for machines whose IP addresses change; an IP address alone cannot identify a
+machine after it moves.
+
+Use **Check** beside an address or **Check all saved** to run another check, and
+**Remove** to forget one. Up to 16 individual addresses can be saved; this is not
+a subnet or port-range scanner. Checks run concurrently with short timeouts and
+report elapsed time, HTTP status, and the latest check time. A bare address checks
+only the two standard ports; an explicit port checks only that port.
+
+Checks make fixed metadata GET requests (`/api/version` and `/v1/models`), never
+prompts, inference, model loading or downloads. An OpenAI-compatible response is
+labelled accordingly: it does not prove that the server is specifically LM
+Studio. Authentication-required backends report their HTTP rejection; the router
+API key is **never** forwarded to them. Redirects are not followed. Page refreshes
+do not run these checks, and saving an address does not by itself add models to
+the routing fleet or change routing health.
+
+Addresses are saved on the **router**, not just in browser storage, in
+`~/.config/llm-router/saved-hosts.json` under the account running the service
+(`/home/llmrouter/.config/llm-router/saved-hosts.json` for the dedicated account).
+`XDG_CONFIG_HOME` changes the config root; `LLM_ROUTER_SAVED_HOSTS_FILE` can select
+a different file. The private file survives service restarts and software updates.
+Check results are cached in memory and reset after a restart; saved addresses
+remain available to check again. The controls require a configured router API key,
+even if other gateway APIs intentionally allow keyless access.
 
 ### Automatic software updates
 

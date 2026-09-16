@@ -31,6 +31,7 @@ from .health import probe_endpoints
 from .provisioning import OllamaProvisioner, ProvisioningReport, ProvisioningSettings
 from .router import LLMRouter
 from .schema import QueryRequest, RoutedCompletion, RouterConfig
+from .saved_hosts import SavedHostStore, check_saved_host
 from .self_test import run_backend_checks
 from .status_page import STATUS_CSS, STATUS_JS, render_status_html
 
@@ -430,6 +431,7 @@ def create_app(
     provisioning_settings: ProvisioningSettings | None = None,
     provisioner: OllamaProvisioner | None = None,
     gateway: RouterGateway | None = None,
+    saved_host_store: SavedHostStore | None = None,
 ) -> Starlette:
     service = gateway or RouterGateway(
         config_path=config_path,
@@ -458,6 +460,135 @@ def create_app(
     }
     self_test_lock = asyncio.Lock()
     self_test_next_allowed = 0.0
+    host_store = saved_host_store if saved_host_store is not None else SavedHostStore()
+    host_store_lock = asyncio.Lock()
+    host_check_lock = asyncio.Lock()
+    host_check_next_allowed = 0.0
+    host_results: dict[str, dict[str, Any]] = {}
+
+    def hosts_reply(payload: Mapping[str, Any], code: int = 200) -> Response:
+        return JSONResponse(payload, status_code=code, headers=page_headers)
+
+    def hosts_authorize(request: Request) -> Response | None:
+        # These endpoints grant permission to contact and save new network
+        # targets, so deliberately keyless inference gateways cannot use them.
+        if not os.environ.get("LLM_ROUTER_GATEWAY_API_KEY", "").strip():
+            return hosts_reply({"error": "Set LLM_ROUTER_GATEWAY_API_KEY to manage saved addresses."}, 403)
+        denied = _authorize(request, openai=True)
+        if denied is not None:
+            denied.headers.update(page_headers)
+            return denied
+        if request.url.query:
+            return hosts_reply({"error": "Saved-address endpoints do not accept query parameters."}, 400)
+        if request.method != "GET":
+            origin = request.headers.get("origin")
+            if (
+                request.headers.get("x-llm-router-hosts") != "1"
+                or origin is not None and origin != str(request.base_url).rstrip("/")
+            ):
+                return hosts_reply({"error": "Use the saved-address controls on this router's status page."}, 403)
+        return None
+
+    async def hosts_body(request: Request, fields: set[str]) -> dict[str, Any]:
+        if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+            raise ValueError("Send a JSON object with Content-Type application/json.")
+
+        async def read() -> bytes:
+            body = bytearray()
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > 4096:
+                    raise ValueError("Saved-address request is too large.")
+                body.extend(chunk)
+            return bytes(body)
+
+        try:
+            payload = json.loads(await asyncio.wait_for(read(), timeout=3.0))
+        except (UnicodeError, json.JSONDecodeError, RecursionError, asyncio.TimeoutError) as exc:
+            raise ValueError("Send a valid, small JSON object.") from exc
+        if not isinstance(payload, dict) or set(payload) - fields:
+            raise ValueError("Unexpected saved-address request fields.")
+        return payload
+
+    def host_snapshot(entry: Mapping[str, Any]) -> dict[str, Any]:
+        cached = host_results.get(entry["id"])
+        if cached is not None and cached["address"] == entry["address"]:
+            return dict(cached)
+        return {**entry, "checked_at": None, "checks": []}
+
+    async def saved_hosts(request: Request) -> Response:
+        denied = hosts_authorize(request)
+        if denied is not None:
+            return denied
+        try:
+            body = await hosts_body(request, {"address"}) if request.method == "POST" else None
+            async with host_store_lock:
+                if body is not None:
+                    if not isinstance(body.get("address"), str):
+                        raise ValueError("Enter a single IP address, hostname, or HTTP(S) URL.")
+                    entry = host_store.add(body["address"])
+                    return hosts_reply({"host": host_snapshot(entry)}, 201)
+                entries = host_store.list()
+                return hosts_reply({"hosts": [host_snapshot(entry) for entry in entries], "limit": 16})
+        except ValueError as exc:
+            return hosts_reply({"error": str(exc)}, 400)
+        except (OSError, RuntimeError):
+            return hosts_reply({"error": "Saved addresses could not be read or saved. Check the router's storage permissions and saved-address file."}, 503)
+
+    async def remove_saved_host(request: Request) -> Response:
+        denied = hosts_authorize(request)
+        if denied is not None:
+            return denied
+        try:
+            async with host_store_lock:
+                identifier = request.path_params["host_id"]
+                if not host_store.remove(identifier):
+                    return hosts_reply({"error": "Saved address not found."}, 404)
+                host_results.pop(identifier, None)
+                return hosts_reply({"removed": True})
+        except ValueError:
+            return hosts_reply({"error": "Invalid saved-address identifier."}, 400)
+        except (OSError, RuntimeError):
+            return hosts_reply({"error": "Saved address could not be removed. Check the router's saved-address file."}, 503)
+
+    async def check_saved_hosts(request: Request) -> Response:
+        nonlocal host_check_next_allowed
+        denied = hosts_authorize(request)
+        if denied is not None:
+            return denied
+        try:
+            body = await hosts_body(request, {"id"})
+            if "id" in body and (not isinstance(body["id"], str) or not body["id"] or len(body["id"]) > 64):
+                raise ValueError("Choose a saved address to check.")
+            async with host_store_lock:
+                entries = host_store.list()
+                if "id" in body:
+                    entries = [entry for entry in entries if entry["id"] == body["id"]]
+                    if not entries:
+                        return hosts_reply({"error": "Saved address not found."}, 404)
+            if host_check_lock.locked() or time.monotonic() < host_check_next_allowed:
+                response = hosts_reply({"error": "Address checks are running or just finished; retry in a few seconds."}, 429)
+                response.headers["Retry-After"] = "3"
+                return response
+            async with host_check_lock:
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*(check_saved_host(entry) for entry in entries)), timeout=12.0,
+                    )
+                    async with host_store_lock:
+                        current = {entry["id"]: entry for entry in host_store.list()}
+                        # Removing an address while a probe is in flight must
+                        # not resurrect it in cached status or in the browser.
+                        results = [row for row in results if current.get(row["id"], {}).get("address") == row["address"]]
+                        host_results.update({row["id"]: row for row in results})
+                    return hosts_reply({"hosts": results})
+                finally:
+                    host_check_next_allowed = time.monotonic() + 3.0
+        except ValueError as exc:
+            return hosts_reply({"error": str(exc)}, 400)
+        except asyncio.TimeoutError:
+            return hosts_reply({"error": "Address checks timed out; try checking one saved address."}, 504)
+        except (OSError, RuntimeError):
+            return hosts_reply({"error": "Saved-address checks could not complete. Check the saved-address file and retry."}, 503)
 
     async def status_page(request: Request) -> Response:
         return HTMLResponse(
@@ -751,6 +882,9 @@ def create_app(
         Route("/status", status_page, methods=["GET"]),
         Route("/status/data", status_data, methods=["GET"]),
         Route("/status/self-test", status_self_test, methods=["POST"]),
+        Route("/status/hosts", saved_hosts, methods=["GET", "POST"]),
+        Route("/status/hosts/check", check_saved_hosts, methods=["POST"]),
+        Route("/status/hosts/{host_id}", remove_saved_host, methods=["DELETE"]),
         Route("/status/assets/style.css", status_css, methods=["GET"]),
         Route("/status/assets/app.js", status_js, methods=["GET"]),
         Route("/healthz", health, methods=["GET"]),
@@ -1164,7 +1298,7 @@ def _authorize(request: Request, *, openai: bool = False) -> Response | None:
         return None
     authorization = request.headers.get("authorization", "")
     supplied = authorization[7:] if authorization.lower().startswith("bearer ") else ""
-    if supplied and hmac.compare_digest(supplied, expected):
+    if supplied and hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
         return None
     if openai:
         return _openai_error("Invalid or missing gateway API key", 401, "authentication_error")

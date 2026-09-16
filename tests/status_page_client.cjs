@@ -36,7 +36,7 @@ class Element {
   addEventListener(name, callback) { this.events[name] = callback; }
 }
 
-function harness(authRequired = true) {
+function harness(authRequired = true, autoLoadHosts = true) {
   const elements = new Map();
   for (const match of markup.matchAll(/<([a-z][a-z0-9]*)\b[^>]*\bid="([^"]+)"[^>]*>/g)) {
     const node = new Element(match[1]);
@@ -48,6 +48,8 @@ function harness(authRequired = true) {
     return elements.get(id);
   };
   const requests = [];
+  const hostRequests = [];
+  const allRequests = [];
   const intervals = new Map();
   const timeouts = new Map();
   const windowEvents = {};
@@ -68,8 +70,16 @@ function harness(authRequired = true) {
     setInterval: callback => { const id = ++timerId; intervals.set(id, callback); return id; },
     clearInterval: id => intervals.delete(id),
     fetch: (url, options) => new Promise((resolve, reject) => {
-      assert.ok(["/healthz", "/status/data", "/status/self-test"].includes(url), "Only same-origin status endpoints may be fetched");
-      assert.equal(options.method, url === "/status/self-test" ? "POST" : "GET");
+      const hostRequest = /^\/status\/hosts(?:\/[^/?#]+)?$/.test(url);
+      assert.ok(["/healthz", "/status/data", "/status/self-test"].includes(url) || hostRequest, "Only same-origin status endpoints may be fetched");
+      if (!hostRequest) assert.equal(options.method, url === "/status/self-test" ? "POST" : "GET");
+      if (hostRequest) {
+        assert.match(options.headers.Authorization, /^Bearer .+/);
+        if (options.method !== "GET") {
+          assert.equal(options.headers["X-LLM-Router-Hosts"], "1");
+          assert.equal(options.headers["Content-Type"], "application/json");
+        }
+      }
       if (url === "/status/self-test") {
         assert.equal(options.headers["X-LLM-Router-Self-Test"], "1");
         assert.equal(options.body, undefined);
@@ -77,12 +87,15 @@ function harness(authRequired = true) {
       assert.equal(options.credentials, "omit");
       assert.equal(options.cache, "no-store");
       assert.equal(options.redirect, "error");
-      requests.push({url, options, resolve, reject});
+      const pending = {url, options, resolve, reject};
+      allRequests.push(pending);
+      (hostRequest ? hostRequests : requests).push(pending);
+      if (hostRequest && autoLoadHosts && options.method === "GET") resolve({status: 200, ok: true, json: async () => ({hosts: [], limit: 16})});
     }),
   };
   vm.runInNewContext(script, context);
   return {
-    element, requests, timeouts,
+    element, requests, hostRequests, allRequests, timeouts,
     tick: () => { for (const callback of Array.from(intervals.values())) callback(); },
     enterKey: key => {
       element("api-key").value = key;
@@ -91,6 +104,13 @@ function harness(authRequired = true) {
     },
     lock: () => element("lock-button").events.click(),
     selfTest: () => element("self-test-button").events.click(),
+    saveHost: address => {
+      element("host-address").value = address;
+      element("host-form").events.submit({preventDefault() {}});
+    },
+    checkHosts: () => element("hosts-check-button").events.click(),
+    reloadHosts: () => element("hosts-reload-button").events.click(),
+    hostAction: (row, button) => element("hosts-body").children[row].children[3].children[0].children[button].events.click(),
     event: (name, event = {}) => windowEvents[name](event),
     intervalCount: () => intervals.size,
   };
@@ -438,8 +458,236 @@ async function selfTestAuthenticationFailure() {
   }
 }
 
+function savedHost(id = "host-one", checked = false) {
+  return {
+    id, address: "192.168.194.0", checked_at: checked ? "2026-09-16T12:00:00Z" : null,
+    checks: checked ? [{provider: "LM Studio / OpenAI-compatible", base_url: "http://192.168.194.0:1234/v1", status: "pass", detail: "Models metadata is reachable", http_status: 200, elapsed_ms: 12.3}] : [],
+  };
+}
+
+async function unlockedHosts(hosts = []) {
+  const app = harness(true, false);
+  app.enterKey("secret-key");
+  await reply(app.requests.at(-1), 200, snapshot());
+  assert.equal(app.hostRequests.length, 1);
+  assert.equal(app.hostRequests[0].options.method, "GET");
+  await reply(app.hostRequests[0], 200, {hosts, limit: 16});
+  return app;
+}
+
+async function savedHostLifecycle() {
+  const app = await unlockedHosts();
+  assert.match(app.element("hosts-body").textContent, /No saved addresses/);
+  assert.equal(app.element("hosts-check-button").disabled, true);
+  app.saveHost("  192.168.194.0  ");
+  const save = app.hostRequests.at(-1);
+  assert.equal(save.url, "/status/hosts");
+  assert.equal(save.options.method, "POST");
+  assert.deepEqual(JSON.parse(save.options.body), {address: "192.168.194.0"});
+  assert.equal(save.options.headers.Authorization, "Bearer secret-key");
+  assert.equal(save.url.includes("secret-key"), false);
+  assert.equal(app.element("host-save-button").disabled, true);
+  const pendingCount = app.hostRequests.length;
+  app.saveHost("ignored.example");
+  app.checkHosts();
+  app.reloadHosts();
+  assert.equal(app.hostRequests.length, pendingCount, "Only one host operation can be in flight");
+  await reply(save, 200, {host: savedHost()});
+  const check = app.hostRequests.at(-1);
+  assert.equal(check.url, "/status/hosts/check");
+  assert.deepEqual(JSON.parse(check.options.body), {id: "host-one"});
+  assert.equal(app.element("host-address").value, "");
+  const found = savedHost("host-one", true);
+  found.checks.push({provider: "Ollama", base_url: "http://192.168.194.0:11434", status: "fail", detail: "Connection unavailable", http_status: null, elapsed_ms: 1500});
+  await reply(check, 200, {hosts: [found]});
+  assert.equal(app.element("host-save-button").disabled, false);
+  assert.equal(app.element("hosts-check-button").disabled, false);
+  assert.match(app.element("hosts-message").textContent, /Address saved.*1 backend API found/);
+  assert.match(app.element("hosts-body").textContent, /LM Studio \/ OpenAI-compatibleFound/);
+  assert.match(app.element("hosts-body").textContent, /OllamaNot confirmed/);
+  assert.match(app.element("hosts-body").textContent, /12 ms/);
+  assert.match(app.element("hosts-body").textContent, /HTTP 200/);
+  assert.match(app.element("hosts-body").textContent, /192\.168\.194\.0:1234\/v1/);
+  const completedCount = app.hostRequests.length;
+  app.tick();
+  await reply(app.requests.at(-1), 200, snapshot());
+  assert.equal(app.hostRequests.length, completedCount, "Ordinary refresh must neither reload nor probe saved hosts");
+  assert.match(app.element("hosts-body").textContent, /Found/);
+
+  app.checkHosts();
+  assert.deepEqual(JSON.parse(app.hostRequests.at(-1).options.body), {});
+  assert.doesNotMatch(app.element("hosts-body").textContent, /Models metadata is reachable/, "New check must clear prior success while pending");
+  app.tick();
+  await reply(app.requests.at(-1), 200, snapshot());
+  assert.equal(app.hostRequests.at(-1).options.signal.aborted, false, "Status refresh must not interrupt explicit checks");
+  await reply(app.hostRequests.at(-1), 200, {hosts: [found]});
+  app.hostAction(0, 0);
+  assert.deepEqual(JSON.parse(app.hostRequests.at(-1).options.body), {id: "host-one"});
+  await reply(app.hostRequests.at(-1), 200, {hosts: [found]});
+  app.hostAction(0, 1);
+  assert.equal(app.hostRequests.at(-1).url, "/status/hosts/host-one");
+  assert.equal(app.hostRequests.at(-1).options.method, "DELETE");
+  assert.equal(app.hostRequests.at(-1).options.body, undefined);
+  await reply(app.hostRequests.at(-1), 200, {removed: true});
+  assert.match(app.element("hosts-body").textContent, /No saved addresses/);
+  assert.match(app.element("hosts-message").textContent, /Address removed/);
+}
+
+async function savedHostsRestoreAndRequireAuthentication() {
+  const locked = harness();
+  locked.saveHost("192.168.194.0");
+  locked.checkHosts();
+  locked.reloadHosts();
+  assert.equal(locked.hostRequests.length, 0, "Locked clients cannot list, save, or probe hosts");
+  const noKey = await unlocked(false);
+  noKey.saveHost("192.168.194.0");
+  noKey.checkHosts();
+  noKey.reloadHosts();
+  assert.equal(noKey.hostRequests.length, 0, "Keyless gateways never get address-management requests");
+  assert.equal(noKey.element("host-address").disabled, true);
+  assert.equal(noKey.element("host-save-button").disabled, true);
+  assert.equal(noKey.element("hosts-check-button").disabled, true);
+  assert.match(noKey.element("hosts-message").textContent, /LLM_ROUTER_GATEWAY_API_KEY/);
+
+  for (const checked of [true, false]) {
+    const app = await unlockedHosts([savedHost("saved-previously", checked)]);
+    assert.equal(app.hostRequests.length, 1);
+    assert.ok(app.allRequests.every(request => request.options.method === "GET"), "Reloading the page restores saved addresses without probing");
+    assert.match(app.element("hosts-body").textContent, /192\.168\.194\.0/);
+    assert.match(app.element("hosts-body").textContent, checked ? /Found/ : /Not checked/);
+    app.reloadHosts();
+    assert.equal(app.hostRequests.at(-1).options.method, "GET");
+    await reply(app.hostRequests.at(-1), 200, {hosts: [savedHost()], limit: 1});
+    assert.equal(app.element("host-save-button").disabled, true, "Save disabled at the server-provided limit");
+    assert.match(app.element("hosts-message").textContent, /1 \/ 1 addresses/);
+  }
+  assert.match(markup, /Saving an address does not add its models to routing/);
+  assert.doesNotMatch(markup, /Read-only dashboard/);
+  assert.match(markup, /no prompts, model loading, or downloads/);
+}
+
+async function savedHostFailuresAndSafeRendering() {
+  for (const [status, expected] of [[400, /valid IP/], [404, /no longer exists/], [409, /limit was reached/], [429, /busy/], [503, /unavailable/], [500, /connection failed/]]) {
+    const app = await unlockedHosts();
+    app.saveHost("invalid-address");
+    await reply(app.hostRequests.at(-1), status, {error: "secret-server-stack-trace"});
+    assert.match(app.element("hosts-message").textContent, expected);
+    assert.doesNotMatch(app.element("hosts-message").textContent, /secret-server-stack-trace/);
+    assert.equal(app.element("host-save-button").disabled, false);
+    assert.equal(app.element("host-address").value, "invalid-address");
+  }
+  const failedCheck = await unlockedHosts();
+  failedCheck.saveHost("192.168.194.0");
+  await reply(failedCheck.hostRequests.at(-1), 200, {host: savedHost()});
+  await reply(failedCheck.hostRequests.at(-1), 429, {});
+  assert.match(failedCheck.element("hosts-message").textContent, /Address saved, but its check did not complete/);
+  assert.match(failedCheck.element("hosts-body").textContent, /192\.168\.194\.0/);
+  assert.equal(failedCheck.element("hosts-check-button").disabled, false);
+
+  const app = await unlockedHosts();
+  const unsafe = savedHost("unsafe/id?redirect=other", true);
+  unsafe.address = '<img src=x onerror="alert(1)">';
+  unsafe.checks[0].provider = '<script>alert("name")</script>';
+  unsafe.checks[0].base_url = "javascript:alert(1)";
+  unsafe.checks[0].detail = '<img src=x onerror="alert(2)">';
+  app.reloadHosts();
+  await reply(app.hostRequests.at(-1), 200, {hosts: [unsafe], limit: 16});
+  const row = app.element("hosts-body").children[0];
+  assert.equal(row.children[0]._text, unsafe.address);
+  const check = row.children[1].children[0].children[0];
+  assert.equal(check.children[0]._text, unsafe.checks[0].provider);
+  assert.equal(check.children[2]._text, unsafe.checks[0].base_url);
+  assert.ok(check.children[3]._text.startsWith(unsafe.checks[0].detail));
+  app.hostAction(0, 1);
+  assert.equal(app.hostRequests.at(-1).url, "/status/hosts/unsafe%2Fid%3Fredirect%3Dother");
+  await reply(app.hostRequests.at(-1), 500, {});
+  assert.equal(app.element("hosts-body").children.length, 1, "Failed removal must retain saved row");
+  for (const invalid of [{}, {hosts: [{}]}, {hosts: [savedHost(), savedHost()]}, {hosts: [{...savedHost(), checks: [{status: "constructor"}]}]}]) {
+    app.reloadHosts();
+    await reply(app.hostRequests.at(-1), 200, invalid);
+    assert.match(app.element("hosts-message").textContent, /response was invalid/);
+    assert.equal(app.element("hosts-reload-button").disabled, false);
+  }
+}
+
+async function savedHostPrivacyAndRaceGuards() {
+  for (const action of ["lock", "key", "pagehide", "refresh-fail", "refresh-auth"]) {
+    const app = await unlockedHosts([savedHost()]);
+    app.hostAction(0, 0);
+    const old = app.hostRequests.at(-1);
+    if (action === "lock") app.lock();
+    if (action === "key") app.enterKey("new-key");
+    if (action === "pagehide") app.event("pagehide");
+    if (action === "refresh-fail" || action === "refresh-auth") {
+      app.tick();
+      if (action === "refresh-fail") app.requests.at(-1).reject(new Error("network lost"));
+      else await reply(app.requests.at(-1), 401, {});
+      await flush();
+    }
+    assert.equal(old.options.signal.aborted, true, `${action} must cancel host checks`);
+    await reply(old, 200, {hosts: [savedHost("host-one", true)]});
+    assert.equal(app.element("hosts-body").textContent, "", `${action}: late checks cannot restore private rows`);
+    assert.equal(app.element("host-address").value, "");
+  }
+  const app = await unlockedHosts([savedHost()]);
+  app.checkHosts();
+  const old = app.hostRequests.at(-1);
+  app.enterKey("new-key");
+  await reply(app.requests.at(-1), 200, snapshot());
+  await reply(app.hostRequests.at(-1), 200, {hosts: [savedHost("new-session", true)], limit: 16});
+  await reply(old, 401, {});
+  assert.equal(app.element("details").hidden, false);
+  assert.match(app.element("hosts-body").textContent, /Found/);
+  assert.doesNotMatch(app.element("auth-message").textContent, /rejected/);
+
+  const deferred = await unlockedHosts([savedHost()]);
+  deferred.checkHosts();
+  let resolveBody;
+  deferred.hostRequests.at(-1).resolve({status: 200, ok: true, json: () => new Promise(resolve => { resolveBody = resolve; })});
+  await flush();
+  deferred.lock();
+  resolveBody({hosts: [savedHost("host-one", true)]});
+  await flush();
+  assert.equal(deferred.element("hosts-body").textContent, "", "Late JSON body cannot restore private rows");
+}
+
+async function savedHostAuthRejectionAndTimeout() {
+  for (const status of [401, 403]) {
+    const app = await unlockedHosts([savedHost()]);
+    app.checkHosts();
+    const hostRequest = app.hostRequests.at(-1);
+    app.selfTest();
+    const selfTest = app.requests.at(-1);
+    app.tick();
+    const refresh = app.requests.at(-1);
+    await reply(hostRequest, status, {});
+    assert.equal(refresh.options.signal.aborted, true);
+    assert.equal(selfTest.options.signal.aborted, true);
+    assert.equal(app.element("details").hidden, true);
+    assert.equal(app.element("hosts-body").textContent, "");
+    assert.equal(app.element("key-form").hidden, false);
+    await reply(refresh, 200, snapshot());
+    await reply(selfTest, 200, selfTestResult());
+    assert.equal(app.element("details").hidden, true);
+  }
+  const timedOut = await unlockedHosts([savedHost()]);
+  timedOut.checkHosts();
+  const pending = timedOut.hostRequests.at(-1);
+  for (const callback of timedOut.timeouts.values()) callback();
+  assert.equal(pending.options.signal.aborted, true);
+  await reply(pending, 200, {hosts: [savedHost("host-one", true)]});
+  assert.match(timedOut.element("hosts-message").textContent, /timed out/);
+  assert.doesNotMatch(timedOut.element("hosts-body").textContent, /Found/, "Even a late successful reply after timeout must not look current");
+  assert.equal(timedOut.element("hosts-check-button").disabled, false);
+  timedOut.reloadHosts();
+  timedOut.hostRequests.at(-1).reject(new Error("offline"));
+  await flush();
+  assert.match(timedOut.element("hosts-message").textContent, /connection failed/);
+  assert.equal(timedOut.element("hosts-reload-button").disabled, false);
+}
+
 (async () => {
-  for (const test of [publicReadiness, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure]) {
+  for (const test of [publicReadiness, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout]) {
     await test();
     console.log(`PASS ${test.name}`);
   }

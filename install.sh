@@ -8,22 +8,39 @@ router_bin_dir=${LLM_ROUTER_BIN_DIR:-"${HOME}/.local/bin"}
 router_config_home=${XDG_CONFIG_HOME:-"${HOME}/.config"}
 router_service=0
 router_auto_update=0
+router_listen=""
 
 for router_arg in "$@"; do
     case "$router_arg" in
         --service) router_service=1 ;;
         --auto-update) router_auto_update=1 ;;
+        --lan|--localhost)
+            if [ -n "$router_listen" ] && [ "$router_listen" != "$router_arg" ]; then
+                printf '%s\n' '--lan and --localhost are mutually exclusive; choose one.' >&2
+                exit 2
+            fi
+            router_listen=$router_arg
+            ;;
         --help|-h)
-            printf '%s\n' 'Usage: sh install.sh [--service [--auto-update]]' \
+            printf '%s\n' 'Usage: sh install.sh [--service [--auto-update] [--lan | --localhost]]' \
                 'Installs/updates from main; set LLM_ROUTER_VERSION to pin a Git revision.' \
                 '--service: enable a systemd user service at boot and after logout.' \
                 '--auto-update: with --service, automatically install official-main updates daily.' \
+                '--lan: with --service, listen on 0.0.0.0 (all IPv4 interfaces) with API-key protection.' \
+                '--localhost: with --service, listen on 127.0.0.1 (this machine only).' \
+                'New service installs default to LAN (0.0.0.0); updates preserve the existing address unless a mode is chosen.' \
+                'LAN clients use the router machine IP, not 0.0.0.0. Restrict access with your firewall/VPN; use TLS on untrusted networks.' \
                 'Run as your normal user. sudo may be needed for prerequisites/lingering.'
             exit 0
             ;;
         *) printf 'Unknown argument: %s\n' "$router_arg" >&2; exit 2 ;;
     esac
 done
+
+if [ -n "$router_listen" ] && [ "$router_service" -ne 1 ]; then
+    printf '%s\n' '--lan/--localhost requires --service.' >&2
+    exit 2
+fi
 
 if [ "$router_auto_update" -eq 1 ]; then
     if [ "$router_service" -ne 1 ]; then
@@ -161,13 +178,14 @@ done
 printf '%s\n' "Installed source-agnostic-llm-router ${router_version}."
 printf '%s\n' "Commands are in ${router_bin_dir}; add it to PATH if needed."
 if [ "$router_service" -eq 1 ]; then
+    set -- --install-dir "$router_install_dir" --config-home "$router_config_home"
     if [ "$router_auto_update" -eq 1 ]; then
-        "$router_venv_python" -m llm_router.service \
-            --install-dir "$router_install_dir" --config-home "$router_config_home" --auto-update
-    else
-        "$router_venv_python" -m llm_router.service \
-            --install-dir "$router_install_dir" --config-home "$router_config_home"
+        set -- "$@" --auto-update
     fi
+    if [ -n "$router_listen" ]; then
+        set -- "$@" "$router_listen"
+    fi
+    "$router_venv_python" -m llm_router.service "$@"
 else
     printf '%s\n' "Run: ${router_bin_dir}/llm-router provision --dry-run"
     printf '%s\n' "Run: ${router_bin_dir}/llm-router serve --host 127.0.0.1 --port 8088"

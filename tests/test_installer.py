@@ -81,6 +81,7 @@ def test_package_install_defaults_to_main_without_service_changes(installer_envi
     assert not any(call[0] in {"systemctl", "loginctl"} for call in recorded)
     assert not any("llm_router.service" in call for call in recorded)
     assert (Path(installer_environment["LLM_ROUTER_BIN_DIR"]) / "llm-router").is_symlink()
+    assert "serve --host 127.0.0.1 --port 8088" in result.stdout
 
 
 def test_service_flag_delegates_to_installed_helper_with_exact_paths(installer_environment):
@@ -101,6 +102,62 @@ def test_auto_update_flag_is_forwarded_only_when_requested(installer_environment
     service_calls = [call for call in calls(installer_environment) if "llm_router.service" in call]
     assert len(service_calls) == 1
     assert service_calls[0][-1] == "--auto-update"
+
+
+@pytest.mark.parametrize("listen_flag", ["--lan", "--localhost"])
+@pytest.mark.parametrize("auto_update", [False, True])
+@pytest.mark.parametrize("listen_first", [False, True])
+def test_listen_choice_is_forwarded_to_service_helper(
+    installer_environment, listen_flag, auto_update, listen_first,
+):
+    arguments = [listen_flag, "--service"] if listen_first else ["--service", listen_flag]
+    if auto_update:
+        arguments.append("--auto-update")
+    result = run_installer(installer_environment, *arguments)
+    assert result.returncode == 0, result.stderr
+    service_calls = [call for call in calls(installer_environment) if "llm_router.service" in call]
+    assert len(service_calls) == 1
+    service_call = service_calls[0]
+    assert service_call[:7] == [
+        "python", "-m", "llm_router.service",
+        "--install-dir", installer_environment["LLM_ROUTER_INSTALL_DIR"],
+        "--config-home", installer_environment["XDG_CONFIG_HOME"],
+    ]
+    expected_flags = [listen_flag, "--auto-update"] if auto_update else [listen_flag]
+    assert sorted(service_call[7:]) == sorted(expected_flags)
+
+
+@pytest.mark.parametrize("listen_flag", ["--lan", "--localhost"])
+def test_listen_choice_requires_service_before_any_installation(installer_environment, listen_flag):
+    result = run_installer(installer_environment, listen_flag)
+    assert result.returncode == 2
+    assert "requires --service" in result.stderr
+    assert not calls(installer_environment)
+    assert not Path(installer_environment["LLM_ROUTER_INSTALL_DIR"]).exists()
+
+
+@pytest.mark.parametrize("listen_flags", [("--lan", "--localhost"), ("--localhost", "--lan")])
+@pytest.mark.parametrize("service_flags", [(), ("--service",), ("--service", "--auto-update")])
+def test_conflicting_listen_choices_fail_before_any_installation(
+    installer_environment, listen_flags, service_flags,
+):
+    result = run_installer(installer_environment, *service_flags, *listen_flags)
+    assert result.returncode == 2
+    assert "--lan" in result.stderr
+    assert "--localhost" in result.stderr
+    assert not calls(installer_environment)
+    assert not Path(installer_environment["LLM_ROUTER_INSTALL_DIR"]).exists()
+
+
+def test_help_explains_service_listen_default_and_explicit_choices(installer_environment):
+    result = run_installer(installer_environment, "--help")
+    assert result.returncode == 0, result.stderr
+    assert "--lan" in result.stdout
+    assert "--localhost" in result.stdout
+    assert "0.0.0.0" in result.stdout
+    assert "127.0.0.1" in result.stdout
+    assert "default" in result.stdout.lower()
+    assert not calls(installer_environment)
 
 
 def test_auto_update_requires_service_before_any_installation(installer_environment):
@@ -190,9 +247,12 @@ def test_help_and_invalid_options_do_not_install(installer_environment, argument
     [({"ROUTER_TEST_UID": "0"}, "normal user"),
      ({"ROUTER_TEST_SYSTEMCTL_EXIT": "1"}, "systemd user session")],
 )
-def test_service_preflight_fails_before_package_mutation(installer_environment, failure_env, message):
+@pytest.mark.parametrize("listen_flags", [(), ("--lan",), ("--localhost",)])
+def test_service_preflight_fails_before_package_mutation(
+    installer_environment, failure_env, message, listen_flags,
+):
     installer_environment.update(failure_env)
-    result = run_installer(installer_environment, "--service")
+    result = run_installer(installer_environment, "--service", *listen_flags)
     assert result.returncode == 2
     assert message in result.stderr
     assert not any(call[0] == "python" for call in calls(installer_environment))
