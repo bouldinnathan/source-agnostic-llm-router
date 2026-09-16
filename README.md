@@ -87,6 +87,62 @@ commands do not configure an already-running service; put settings in `router.en
 (without `export`). You can also put explicit overrides in the same directory's
 `router.toml`, or set `LLM_ROUTER_CONFIG` in `router.env` to an absolute config path.
 
+### Browser status page
+
+Open **`http://127.0.0.1:8088/status`** in a browser on the router machine, or
+**`http://ROUTER_IP:8088/status`** from your trusted LAN/VPN after enabling a reachable
+bind address as described above. Browsers visiting `/` also see the status page;
+ordinary API requests to `/` retain the existing plaintext liveness response.
+
+The page distinguishes the running gateway from available models. It refreshes
+every 10 seconds and shows API reachability for each backend, available models,
+machine-preference/HA aliases, and process uptime. "Unchecked" means no API probe
+has confirmed that backend; an online API does not by itself prove model inference
+will succeed. Losing contact with the router marks the display stale instead of
+leaving a green success indicator behind.
+
+Enter the **router's** `LLM_ROUTER_GATEWAY_API_KEY` from `router.env` to unlock fleet
+details. This is not an LM Studio/provider token. The key is kept only in the
+page's memory, never placed in the URL or browser storage, and is cleared when you
+lock details or reload/close the page. The public locked view shows only the same
+basic readiness/version information as `/healthz`. If gateway authentication is
+disabled, details follow that same unauthenticated-access policy.
+
+Quick links expose the router's health, readiness, diagnostics and compatible API
+catalog endpoints on the same port. The page also shows your current router
+address/port and links to each configured backend's sanitized HTTP(S) address.
+Backend links open from your browser (so its LAN/VPN access matters) and never
+include or forward your router key. These are API servers, not necessarily web
+UIs; opening an API root can return 404. Protected router links can return 401
+when opened in a new tab because the page does not put credentials in links.
+
+Click **Run self-test (no models)** after unlocking details to check the router's
+HTTP routes, authentication, cached model-list APIs, and configured backend
+metadata APIs. Ollama is checked with `GET /api/version`; supported OpenAI-style
+backends use their model-list endpoint, which lists metadata without loading or
+running a model. Results show pass/fail/skipped, HTTP status, and elapsed time.
+Backend checks run from the router, not the browser; they do not scan unknown
+addresses or ports. Unknown adapters and excess targets are explicitly skipped.
+Checks are bounded to 16 backends, four at a time, with a three-second timeout
+per backend and a five-second cooldown between test runs. Redirects and arbitrary
+custom health paths are never followed by this test.
+
+The self-test sends **no prompts**, performs **no inference, model loads or
+downloads**, and does not trigger discovery, change routing health, restart
+services, or install updates. Catalog checks are skipped if no cached fleet
+exists, avoiding discovery as a side effect. A passing test confirms API
+connectivity, not inference or HA failover performance. Automatic 10-second
+refresh remains a cached read and never starts the self-test. The page reports
+the gateway process, not the systemd service/timer state. The update timer can
+still be checked with the commands below. No external fonts, scripts or analytics
+are used.
+
+The default localhost binding remains unchanged. You can use an SSH tunnel instead
+of exposing port 8088, or bind it to a trusted network interface. Do not expose the
+dashboard or send your API key over an untrusted plaintext HTTP connection; use
+TLS or a trusted VPN. Backend credentials and URL paths/query strings are excluded
+from the dashboard data.
+
 ### Automatic software updates
 
 `sh install.sh --service --auto-update` opts into installing future commits from
@@ -127,6 +183,26 @@ journalctl --user -u llm-router-update.service -n 50 --no-pager
 systemctl --user disable --now llm-router-update.timer
 systemctl --user stop llm-router-update.service
 ```
+
+If the service was installed under the dedicated `llmrouter` account, run this
+from your **root shell on the router host** to check/install now and show the logs:
+
+```bash
+runuser --login llmrouter --command '
+  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+  systemctl --user start llm-router-update.service
+  router_update_result=$?
+  journalctl --user -u llm-router-update.service -n 50 --no-pager
+  exit "$router_update_result"
+'
+```
+
+This forces an immediate **update check**, not a reinstall of an unchanged commit.
+It downloads only changes already published to official `main`; unpublished local
+edits are not installed. No `cd`, `git pull`, root installer run, or update to your
+chat client is needed. A new router version briefly restarts the running gateway;
+LM Studio/Ollama and model files are not updated by this command.
 
 Rerunning the installer without `--auto-update` does not disable an existing timer;
 use the commands above. Local, editable, fork, wheel and explicitly pinned installs

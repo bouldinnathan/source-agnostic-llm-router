@@ -15,10 +15,12 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Mapping, Sequence
+from urllib.parse import urlsplit
 
+import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from .bootstrap import BootstrapResult, bootstrap_router
@@ -29,6 +31,8 @@ from .health import probe_endpoints
 from .provisioning import OllamaProvisioner, ProvisioningReport, ProvisioningSettings
 from .router import LLMRouter
 from .schema import QueryRequest, RoutedCompletion, RouterConfig
+from .self_test import run_backend_checks
+from .status_page import STATUS_CSS, STATUS_JS, render_status_html
 
 VERSION = "0.3.0"
 VIRTUAL_MODELS: dict[str, str] = {
@@ -80,6 +84,7 @@ class RouterGateway:
         self._provisioning: ProvisioningReport | None = None
         self._last_error: str | None = None
         self._last_refresh: float | None = None
+        self._started_at = time.monotonic()
 
     async def start(self) -> None:
         await self.refresh()
@@ -197,6 +202,97 @@ class RouterGateway:
             payload["provisioning"] = self._provisioning.to_dict()
         return payload
 
+    def dashboard_status(self) -> dict[str, Any]:
+        """Read cached fleet state without discovery, inference or secret fields.
+
+        Reachability is explicitly tri-state. An unprobed endpoint is not shown
+        as online, even though the routing policy permits trying it.
+        """
+        status = self.status()
+        router = self._router
+        endpoints: list[dict[str, Any]] = []
+        models: list[dict[str, Any]] = []
+        aliases: list[dict[str, Any]] = []
+        if router is not None:
+            snapshot = router.runtime.snapshot(router.config.models)
+            endpoint_states = snapshot["endpoints"]
+            for model in router.config.models:
+                endpoint = router.config.endpoints[model.endpoint]
+                state = router.runtime.state(model.id)
+                if not model.enabled:
+                    model_state = "disabled"
+                elif not router.runtime.endpoint_available(model.endpoint):
+                    model_state = "offline"
+                elif not router.runtime.is_available(model.id):
+                    model_state = "cooldown"
+                else:
+                    model_state = "available"
+                models.append({
+                    "name": model.upstream_model,
+                    "deployment": model.id,
+                    "machine": endpoint.machine_id or endpoint.name,
+                    "state": model_state,
+                    "active_requests": state.active_requests,
+                    "successes": state.successes,
+                    "failures": state.failures,
+                })
+            for endpoint in router.config.endpoints.values():
+                health_state = endpoint_states.get(endpoint.name, {})
+                reachable = health_state.get("reachable")
+                endpoint_models = [model for model in router.config.models if model.endpoint == endpoint.name]
+                enabled_models = [model for model in endpoint_models if model.enabled]
+                endpoints.append({
+                    "name": endpoint.name,
+                    "machine": endpoint.machine_id or endpoint.name,
+                    "adapter": endpoint.adapter,
+                    "address": _dashboard_address(endpoint.base_url),
+                    "state": "online" if reachable is True else "offline" if reachable is False else "unchecked",
+                    "last_checked": health_state.get("last_checked_at"),
+                    "model_count": len(enabled_models),
+                    "available_models": sum(
+                        router.runtime.endpoint_available(model.endpoint)
+                        and router.runtime.is_available(model.id)
+                        for model in enabled_models
+                    ),
+                })
+            available = {model["deployment"] for model in models if model["state"] == "available"}
+            for name, alias in build_aliases(router.config).items():
+                aliases.append({
+                    "name": name,
+                    "kind": alias.kind,
+                    "available": bool(available.intersection(alias.deployment_ids)),
+                    "deployments": len(alias.deployment_ids),
+                })
+        if status["ready"]:
+            notice = (
+                "Models are available; the last discovery refresh failed, so the last known fleet is retained."
+                if status["status"] == "degraded" else
+                "The router is running and has eligible models. API reachability does not prove inference will succeed."
+            )
+        elif models or endpoints:
+            notice = "The router is running, but no enabled model is currently available. Check backend servers and their model lists."
+        else:
+            notice = "The router is running, but no fleet is available yet. Add reachable backend URLs in router.env and ensure a chat model is available."
+        return {
+            "status": status["status"],
+            "ready": status["ready"],
+            "version": VERSION,
+            "uptime_seconds": round(max(0.0, time.monotonic() - self._started_at), 1),
+            "checked_at": _timestamp(),
+            "last_discovery": status["last_refresh"],
+            "notice": notice,
+            "counts": {
+                "endpoints": len(endpoints),
+                "online": sum(endpoint["state"] == "online" for endpoint in endpoints),
+                "models": sum(model["state"] != "disabled" for model in models),
+                "available_models": sum(model["state"] == "available" for model in models),
+                "aliases": len(aliases),
+            },
+            "endpoints": sorted(endpoints, key=lambda endpoint: (endpoint["machine"], endpoint["name"])),
+            "models": sorted(models, key=lambda model: (model["name"], model["machine"], model["deployment"])),
+            "aliases": aliases,
+        }
+
     async def _refresh_loop(self) -> None:
         while True:
             await asyncio.sleep(self.settings.refresh_seconds)
@@ -312,6 +408,20 @@ def _probe_endpoint_name(probe: ProbeResult, endpoints: Mapping[str, Any]) -> st
     return re.sub(r"[^a-z0-9]+", "-", "auto-" + probe.source.lower()).strip("-")
 
 
+def _dashboard_address(value: str) -> str:
+    """Show only protocol, hostname and port; omit credentials, paths and queries."""
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        if parsed.scheme not in {"http", "https"} or not host:
+            return "Custom endpoint"
+        if ":" in host:
+            host = f"[{host}]"
+        return f"{parsed.scheme}://{host}" + (f":{parsed.port}" if parsed.port is not None else "")
+    except ValueError:
+        return "Custom endpoint"
+
+
 def create_app(
     *,
     config_path: str | None = None,
@@ -337,8 +447,89 @@ def create_app(
         finally:
             await service.stop()
 
+    page_headers = {
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": (
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+            "frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+        ),
+    }
+    self_test_lock = asyncio.Lock()
+    self_test_next_allowed = 0.0
+
+    async def status_page(request: Request) -> Response:
+        return HTMLResponse(
+            render_status_html(api_key_required=bool(os.environ.get("LLM_ROUTER_GATEWAY_API_KEY"))),
+            headers=page_headers,
+        )
+
+    async def status_css(request: Request) -> Response:
+        return Response(STATUS_CSS, media_type="text/css", headers=page_headers)
+
+    async def status_js(request: Request) -> Response:
+        return Response(STATUS_JS, media_type="text/javascript", headers=page_headers)
+
+    async def status_data(request: Request) -> Response:
+        denied = _authorize(request, openai=True)
+        response = denied or JSONResponse(service.dashboard_status())
+        response.headers.update(page_headers)
+        return response
+
+    async def status_self_test(request: Request) -> Response:
+        """Explicit, bounded API checks; never discover, provision or infer."""
+        nonlocal self_test_next_allowed
+
+        def reply(payload: Mapping[str, Any], code: int = 200) -> Response:
+            return JSONResponse(payload, status_code=code, headers=page_headers)
+
+        denied = _authorize(request, openai=True)
+        if denied is not None:
+            denied.headers.update(page_headers)
+            return denied
+        # This header cannot be set by cross-origin HTML forms. No permissive
+        # CORS handler exists here, including when gateway auth is disabled.
+        origin = request.headers.get("origin")
+        if (
+            request.headers.get("x-llm-router-self-test") != "1"
+            or origin is not None and origin != str(request.base_url).rstrip("/")
+        ):
+            return reply({"error": "Use the self-test button on this router's status page."}, 403)
+        if request.url.query:
+            return reply({"error": "Self-test only checks configured targets; parameters are not accepted."}, 400)
+        if self_test_lock.locked() or time.monotonic() < self_test_next_allowed:
+            response = reply({"error": "A self-test is running or just finished; retry in a few seconds."}, 429)
+            response.headers["Retry-After"] = "5"
+            return response
+        async with self_test_lock:
+            try:
+                checks = await _gateway_self_test_checks(app, service, request)
+                cached = service._router
+                checks.extend(await run_backend_checks(cached.config if cached is not None else None))
+                statuses = {check["status"] for check in checks}
+                result = "fail" if "fail" in statuses else "partial" if "skip" in statuses else "pass"
+                return reply({
+                    "status": result,
+                    "checked_at": _timestamp(),
+                    "checks": checks,
+                    "notice": (
+                        "API and connectivity checks only. No prompts, inference, model loading, "
+                        "downloads, discovery or routing-health changes are performed. "
+                        "Backend requests originate from the router, not your browser."
+                    ),
+                })
+            except Exception:
+                return reply({"error": "Self-test could not be completed; try again."}, 500)
+            finally:
+                self_test_next_allowed = time.monotonic() + 5.0
+
     async def root(request: Request) -> Response:
-        return PlainTextResponse("LLM Router is running")
+        if "text/html" in request.headers.get("accept", "").lower():
+            response = await status_page(request)
+            response.headers["Vary"] = "Accept"
+            return response
+        return PlainTextResponse("LLM Router is running", headers={"Vary": "Accept"})
 
     async def health(request: Request) -> Response:
         status = service.status()
@@ -557,6 +748,11 @@ def create_app(
 
     routes = [
         Route("/", root, methods=["GET"]),
+        Route("/status", status_page, methods=["GET"]),
+        Route("/status/data", status_data, methods=["GET"]),
+        Route("/status/self-test", status_self_test, methods=["POST"]),
+        Route("/status/assets/style.css", status_css, methods=["GET"]),
+        Route("/status/assets/app.js", status_js, methods=["GET"]),
         Route("/healthz", health, methods=["GET"]),
         Route("/readyz", health, methods=["GET"]),
         Route("/router/status", router_status, methods=["GET"]),
@@ -574,6 +770,88 @@ def create_app(
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.router_gateway = service
     return app
+
+
+async def _gateway_self_test_checks(
+    app: Starlette, service: RouterGateway, request: Request,
+) -> list[dict[str, Any]]:
+    """Exercise actual read-only routes in-process, never an arbitrary host/port."""
+    checks: list[dict[str, Any]] = []
+    headers = {"Accept": "application/json"}
+    if request.headers.get("authorization"):
+        headers["Authorization"] = request.headers["authorization"]
+    paths = [
+        ("Gateway HTTP", "/", "text"),
+        ("Public health API", "/healthz", "health"),
+        ("Readiness API", "/readyz", "health"),
+        ("Dashboard API", "/status/data", "dashboard"),
+        ("Ollama-compatible version API", "/api/version", "version"),
+        ("OpenAI-compatible catalog", "/v1/models", "data"),
+        ("Ollama-compatible catalog", "/api/tags", "models"),
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://self-test.invalid", follow_redirects=False, trust_env=False,
+    ) as client:
+        for name, path, kind in paths:
+            row: dict[str, Any] = {
+                "name": name, "target": path, "status": "fail", "detail": "",
+                "elapsed_ms": 0.0, "http_status": None,
+            }
+            if kind in {"data", "models"} and service._router is None:
+                row.update(status="skip", detail="No cached fleet; skipped to avoid triggering discovery.")
+                checks.append(row)
+                continue
+            started = time.monotonic()
+            try:
+                response = await asyncio.wait_for(client.get(path, headers=headers), timeout=2.0)
+                row["http_status"] = response.status_code
+                if kind == "text":
+                    valid = response.status_code == 200 and response.text == "LLM Router is running"
+                else:
+                    payload = response.json()
+                    valid = isinstance(payload, dict)
+                    if kind == "health":
+                        valid = valid and response.status_code in {200, 503} and payload.get("status") in {
+                            "ready", "degraded", "unavailable",
+                        }
+                    elif kind == "dashboard":
+                        valid = valid and response.status_code == 200 and isinstance(payload.get("ready"), bool)
+                    elif kind == "version":
+                        valid = valid and response.status_code == 200 and isinstance(payload.get("version"), str)
+                    else:
+                        valid = valid and response.status_code == 200 and isinstance(payload.get(kind), list)
+                if valid and kind == "health" and response.status_code == 503:
+                    row.update(status="skip", detail="API responds correctly; cached fleet is not ready (HTTP 503). No model was tested.")
+                elif valid:
+                    row.update(status="pass", detail="Expected HTTP response received; metadata only.")
+                else:
+                    row["detail"] = "Unexpected HTTP status or response format."
+            except Exception:
+                # Do not echo response bodies, URLs or exception text.
+                row["detail"] = "API check failed or timed out."
+            row["elapsed_ms"] = round((time.monotonic() - started) * 1000, 1)
+            checks.append(row)
+
+        row = {
+            "name": "Gateway authentication", "target": "/status/data",
+            "status": "skip", "detail": "Gateway API-key authentication is disabled.",
+            "elapsed_ms": 0.0, "http_status": None,
+        }
+        if os.environ.get("LLM_ROUTER_GATEWAY_API_KEY"):
+            started = time.monotonic()
+            try:
+                response = await asyncio.wait_for(client.get("/status/data"), timeout=2.0)
+                row.update(
+                    status="pass" if response.status_code == 401 else "fail",
+                    http_status=response.status_code,
+                    detail="Request without a key rejected." if response.status_code == 401 else "Unauthenticated request was not rejected as expected.",
+                )
+            except Exception:
+                row.update(status="fail", detail="Authentication check failed or timed out.")
+            row["elapsed_ms"] = round((time.monotonic() - started) * 1000, 1)
+        checks.append(row)
+    return checks
 
 
 def _query_request(

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, replace
+from typing import Literal
 
 from .schema import ModelConfig, QueryRequest, RouterConfig
 
@@ -21,6 +22,7 @@ class ModelAlias:
     deployment_ids: tuple[str, ...]
     preferred_endpoints: tuple[str, ...]
     models: tuple[ModelConfig, ...]
+    kind: Literal["ha", "preferred", "pinned"] = "ha"
 
     def apply(self, query: QueryRequest) -> QueryRequest:
         """Restrict a request to this alias without weakening caller filters."""
@@ -69,6 +71,8 @@ def _catalog(config: RouterConfig) -> tuple[dict[str, ModelAlias], tuple[str, ..
         name: str,
         models: tuple[ModelConfig, ...],
         preferred_endpoints: tuple[str, ...] = (),
+        *,
+        kind: Literal["ha", "preferred", "pinned"] = "ha",
     ) -> None:
         # Keep gateway presets reserved without importing the HTTP gateway.
         if name == "auto" or name.startswith("auto:") or name in aliases:
@@ -81,6 +85,7 @@ def _catalog(config: RouterConfig) -> tuple[dict[str, ModelAlias], tuple[str, ..
                 deployment_ids=tuple(model.id for model in models),
                 preferred_endpoints=preferred_endpoints,
                 models=models,
+                kind=kind,
             )
 
     for group, members in sorted(groups.items()):
@@ -97,8 +102,8 @@ def _catalog(config: RouterConfig) -> tuple[dict[str, ModelAlias], tuple[str, ..
             name = f"{group_name}-{_slug(machine, fallback='machine')}"
             machine_models = tuple(machine_members)
             preferred_endpoints = tuple(sorted({model.endpoint for model in machine_models}))
-            add(name, models, preferred_endpoints)
-            add(f"{name}-nofailover", machine_models, preferred_endpoints)
+            add(name, models, preferred_endpoints, kind="preferred")
+            add(f"{name}-nofailover", machine_models, preferred_endpoints, kind="pinned")
 
     return dict(sorted(aliases.items())), tuple(sorted(conflicts))
 

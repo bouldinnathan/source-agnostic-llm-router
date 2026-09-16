@@ -1,4 +1,5 @@
 include install.sh
+include tests/status_page_client.cjs
 include config/router.example.toml
 include config/router.ha.example.toml
 include config/router.env.example
