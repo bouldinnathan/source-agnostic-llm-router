@@ -1,9 +1,40 @@
 from __future__ import annotations
 
 from typing import Any
+import selectors
+
+import pytest
 
 from llm_router.config import config_from_mapping
 from llm_router.schema import RouterConfig
+
+
+def pytest_addoption(parser):  # type: ignore[no-untyped-def]
+    parser.addoption(
+        "--poll-thread-wakeups", action="store_true", default=False,
+        help="Test-only polling for restricted environments that block event-loop thread wakeups",
+    )
+
+
+@pytest.fixture(autouse=True)
+def restricted_environment_thread_wakeups(request, monkeypatch):  # type: ignore[no-untyped-def]
+    if request.config.getoption("--poll-thread-wakeups"):
+        # Keep actual asyncio executors/SQLite threads. Some network-restricted
+        # sandboxes suppress the loop's local self-pipe notification. Periodic
+        # polling lets completed callbacks run without replacing or faking I/O.
+        # Normal test/CI runs do not install this workaround.
+        select = selectors.DefaultSelector.select
+
+        def bounded_select(self, timeout=None):
+            return select(self, min(timeout, 0.01) if timeout is not None else 0.01)
+
+        monkeypatch.setattr(selectors.DefaultSelector, "select", bounded_select)
+
+
+@pytest.fixture(autouse=True)
+def isolated_passive_metrics(monkeypatch, tmp_path):  # type: ignore[no-untyped-def]
+    """Tests must never read or append to an operator's real metrics database."""
+    monkeypatch.setenv("LLM_ROUTER_METRICS_FILE", str(tmp_path / "performance" / "metrics.sqlite3"))
 
 
 def make_config(

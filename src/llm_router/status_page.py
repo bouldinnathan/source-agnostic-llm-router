@@ -70,6 +70,7 @@ _STATUS_HTML = """<!doctype html>
         <a href="/readyz" target="_blank" rel="noopener noreferrer">Readiness</a>
         <a href="/status/data" target="_blank" rel="noopener noreferrer">Status JSON</a>
         <a href="/router/status" target="_blank" rel="noopener noreferrer">Router diagnostics</a>
+        <a href="/router/metrics" target="_blank" rel="noopener noreferrer">Performance JSON</a>
         <a href="/api/version" target="_blank" rel="noopener noreferrer">Ollama API version</a>
         <a href="/api/tags" target="_blank" rel="noopener noreferrer">Ollama model list</a>
         <a href="/v1/models" target="_blank" rel="noopener noreferrer">OpenAI model list</a>
@@ -161,6 +162,17 @@ _STATUS_HTML = """<!doctype html>
           <tbody id="aliases-body"></tbody>
         </table></div>
       </section>
+      <section class="card" aria-labelledby="performance-title">
+        <div class="card-heading"><div><h2 id="performance-title">Observed model performance</h2>
+          <p class="muted">Measured passively from real requests through this router and saved across restarts and updates. Refresh never runs a benchmark or model. Smoothed averages use EWMA, which gives recent samples more weight. Request time covers the whole upstream call; token rates and load/setup time require backend-reported timings, which some backends do not provide.</p>
+        </div></div>
+        <p id="performance-message" class="performance-message muted" role="status">Waiting for saved performance observations.</p>
+        <div class="table-scroll"><table><caption class="sr-only">Saved request performance by model and server</caption>
+          <thead><tr><th scope="col">Model / server</th><th scope="col">Input tok/s</th><th scope="col">Output tok/s</th><th scope="col">Reported load / setup</th><th scope="col">Request time (wall clock)</th><th scope="col">Requests</th><th scope="col">Last observed</th></tr></thead>
+          <tbody id="performance-body"></tbody>
+        </table></div>
+        <p class="performance-note muted">Load/setup times are backend-reported. Slow reported loads may be cold starts, but do not prove disk I/O. Missing timings are not estimated from request latency. Historical rows preserve observations for deployments no longer in the current routing configuration.</p>
+      </section>
       <p class="muted snapshot-note">Last discovery: <span id="last-discovery">—</span>. Refresh reads the current snapshot; it does not scan your network or run a model.</p>
     </section>
     <noscript><p class="help-box">Enable JavaScript to view live status. The JSON readiness endpoint is <a href="/healthz">/healthz</a>.</p></noscript>
@@ -185,6 +197,7 @@ main{max-width:1208px;margin:auto;padding:38px 24px 24px}.heading,.section-headi
 .host-form{padding:0 22px 16px}.host-form label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}.host-form p{margin-top:7px}.hosts-toolbar{padding:0 22px 19px;display:flex;align-items:center;justify-content:space-between;gap:16px}.hosts-actions{display:flex;flex-wrap:wrap;gap:8px}.hosts-actions button{padding:6px 10px;font-size:12px}.host-check+.host-check{margin-top:12px}.host-check .badge{margin-left:6px}.host-check .secondary{overflow-wrap:anywhere}#hosts-message.result-fail{color:var(--red)}#hosts-message.result-pass{color:var(--green)}
 .host-check{padding:14px;border:1px solid var(--line);border-radius:8px;background:#fafcfe}.host-check-heading{display:flex;align-items:center;flex-wrap:wrap;gap:5px}.host-check p{margin-top:7px}.host-check .host-api-address{display:block;font-size:12px;overflow-wrap:anywhere}.host-catalog{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}.host-catalog h3{font-size:13px;margin-bottom:5px}.host-catalog .catalog-warning{color:var(--amber)}.host-model-table{margin-top:10px;table-layout:fixed}.host-model-table th,.host-model-table td{padding:8px 10px;max-width:none;overflow-wrap:anywhere}.host-model-table th{white-space:normal}.host-model-table td{background:var(--surface)}.host-model-table th:first-child{width:43%}#hosts-results>table>thead>tr>th:nth-child(2){width:55%}#hosts-results>table>tbody>tr>td:nth-child(2){min-width:330px;max-width:none}
 .public-summary-counts{display:grid;grid-template-columns:1fr 1fr 1.6fr;gap:18px;padding:0 22px 16px}.public-summary-counts strong{display:block;font-size:20px;line-height:1.5;overflow-wrap:anywhere}.public-summary-counts>div:last-child strong{font-size:15px}.public-summary>p{padding:0 22px 19px}
+.performance-message{padding:0 22px 19px}.performance-message.result-warning{color:var(--amber)}.performance-note{padding:16px 22px;border-top:1px solid var(--line)}.metric-value{display:block;font-weight:650;white-space:nowrap}.metric-detail{display:block;min-width:130px;color:var(--muted);font-size:11px;margin-top:4px}.performance-identity{min-width:180px}.performance-identity .badge{margin-top:7px}.performance-identity code{display:block;margin-top:5px}.slow-load-count{margin-top:9px;font-size:12px}
 @media(max-width:800px){.self-test-heading{align-items:flex-start;flex-direction:column}}
 @media(max-width:600px){.hosts-toolbar{align-items:flex-start;flex-direction:column}.host-form .key-controls{flex-direction:column}}
 @media(max-width:600px){.public-summary-counts{grid-template-columns:1fr 1fr}.public-summary-counts>div:last-child{grid-column:1/-1}}
@@ -296,6 +309,7 @@ STATUS_JS = r"""
   function clearDetails() {
     clearSelfTest();
     clearHosts();
+    clearPerformance();
     el("details").hidden = true;
     for (const id of ["endpoints-body", "models-body", "aliases-body"]) el(id).replaceChildren();
     for (const id of ["count-endpoints", "count-online", "count-models", "count-aliases", "uptime", "last-discovery"]) text(id, "—");
@@ -623,8 +637,107 @@ STATUS_JS = r"""
     text("uptime", uptime(data.uptime_seconds));
     text("version", data.version ? `Version ${data.version}` : "");
   }
+  function clearPerformance() {
+    el("performance-body").replaceChildren();
+    text("performance-message", "");
+    el("performance-message").className = "performance-message muted";
+  }
+  function validObservation(metric) {
+    return metric && Number.isFinite(metric.latest) && metric.latest >= 0 &&
+      Number.isFinite(metric.ewma) && metric.ewma >= 0 && Number.isSafeInteger(metric.samples) && metric.samples > 0;
+  }
+  function metricNumber(value, unit) {
+    const number = value > 0 && value < 0.01 ? "<0.01" : value.toLocaleString(undefined, {maximumFractionDigits: 2});
+    return `${number} ${unit}`;
+  }
+  function observation(metric, unit) {
+    const result = document.createElement("div");
+    const value = document.createElement("strong");
+    value.className = "metric-value";
+    result.append(value);
+    if (!validObservation(metric)) {
+      value.textContent = "Not reported";
+      return result;
+    }
+    value.textContent = metricNumber(metric.ewma, unit);
+    for (const detail of [
+      "Smoothed (EWMA)",
+      `Latest: ${metricNumber(metric.latest, unit)} · ${metric.samples} sample${metric.samples === 1 ? "" : "s"}`,
+      `Updated: ${metric.updated_at ? date(metric.updated_at) : "Not recorded"}`,
+    ]) {
+      const line = document.createElement("span");
+      line.className = "metric-detail";
+      line.textContent = detail;
+      result.append(line);
+    }
+    return result;
+  }
+  function renderPerformance(performance) {
+    clearPerformance();
+    if (!performance || typeof performance !== "object") {
+      text("performance-message", "This snapshot does not include performance metrics. Older router versions may not report them.");
+      rows("performance-body", [], 7, "No performance data received.", () => {});
+      return;
+    }
+    const validRows = Array.isArray(performance.deployments) && performance.deployments.every(item => item && typeof item === "object" &&
+      typeof item.id === "string" && typeof item.model === "string" && typeof item.machine === "string" && typeof item.endpoint === "string");
+    if (performance.available !== true || !validRows) {
+      el("performance-message").className = "performance-message muted result-warning";
+      text("performance-message", "Saved performance history is unavailable. Check the service account’s metrics-storage access and the router’s service logs. No current metrics are being shown.");
+      rows("performance-body", [], 7, "Performance history is unavailable.", () => {});
+      return;
+    }
+    const updated = performance.updated_at ? date(performance.updated_at) : "Not yet recorded";
+    text("performance-message", `Saved observations updated: ${updated}. This table reads saved observations only; it does not generate traffic to models.`);
+    if (performance.error) {
+      el("performance-message").className = "performance-message muted result-warning";
+      text("performance-message", `Performance storage reported a problem; saved observations may be incomplete. Last saved update: ${updated}. Check service permissions and logs.`);
+    }
+    rows("performance-body", performance.deployments, 7, "No routed requests yet. Performance will appear after real requests pass through this router.", (row, item) => {
+      const identity = document.createElement("div");
+      identity.className = "performance-identity";
+      const model = document.createElement("strong");
+      model.textContent = item.model;
+      const machine = document.createElement("span");
+      machine.className = "secondary";
+      machine.textContent = `Server: ${item.machine} · ${item.endpoint}`;
+      const adapter = document.createElement("span");
+      adapter.className = "secondary";
+      adapter.textContent = `API: ${typeof item.adapter === "string" ? item.adapter : "Not reported"}`;
+      const address = document.createElement("code");
+      address.textContent = safeOrigin(item.address) || "API address unavailable";
+      identity.append(model, machine, adapter, address, badge(item.current === true ? "Current deployment" : item.current === false ? "Historical" : "Configuration unknown", "neutral"));
+      cell(row, identity);
+      const metrics = item.metrics && typeof item.metrics === "object" ? item.metrics : {};
+      cell(row, observation(metrics.input_tokens_per_second, "tok/s"));
+      cell(row, observation(metrics.output_tokens_per_second, "tok/s"));
+      const load = observation(metrics.load_duration_ms, "ms");
+      const slow = document.createElement("p");
+      slow.className = "slow-load-count muted";
+      const threshold = Number.isFinite(item.slow_load_threshold_ms) && item.slow_load_threshold_ms > 0 ? item.slow_load_threshold_ms : 1000;
+      const slowCount = validObservation(metrics.load_duration_ms) && Number.isSafeInteger(item.slow_load_count) && item.slow_load_count >= 0 ? item.slow_load_count : "Not reported";
+      slow.textContent = `Slow reported loads (≥${metricNumber(threshold / 1000, "s")}): ${slowCount}`;
+      load.append(slow);
+      cell(row, load);
+      cell(row, observation(metrics.request_duration_ms, "ms"));
+      const requests = document.createElement("div");
+      for (const label of [
+        `${count(item.successes)} succeeded / ${count(item.failures)} failed`,
+        `Reported input tokens: ${count(item.input_tokens_total)}`,
+        `Reported output tokens: ${count(item.output_tokens_total)}`,
+      ]) {
+        const line = document.createElement("span");
+        line.className = "secondary";
+        line.textContent = label;
+        requests.append(line);
+      }
+      cell(row, requests);
+      cell(row, item.last_seen_at ? date(item.last_seen_at) : "Not recorded");
+    });
+  }
   function renderDetails(data) {
     renderHealth(data, true);
+    renderPerformance(data.performance);
     const totals = data.counts || {};
     text("count-endpoints", count(totals.endpoints));
     text("count-online", count(totals.online));

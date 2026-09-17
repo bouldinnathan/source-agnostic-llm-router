@@ -317,7 +317,7 @@ async function timeoutAndPageRestore() {
 }
 
 async function safeRouterAndBackendLinks() {
-  const expectedLinks = ["/healthz", "/readyz", "/status/data", "/router/status", "/api/version", "/api/tags", "/v1/models"];
+  const expectedLinks = ["/healthz", "/readyz", "/status/data", "/router/status", "/router/metrics", "/api/version", "/api/tags", "/v1/models"];
   for (const target of expectedLinks) {
     const tag = Array.from(markup.matchAll(/<a\b[^>]*>/g)).find(match => match[0].includes(`href="${target}"`) && match[0].includes('target="_blank"'));
     assert.ok(tag, `Missing quick link ${target}`);
@@ -1072,8 +1072,207 @@ async function liveFragmentKeyCancelsOldSession() {
   assert.doesNotMatch(app.element("auth-message").textContent, /rejected/);
 }
 
+function performanceObservation(latest, ewma = latest, samples = 3) {
+  return {latest, ewma, samples, updated_at: "2026-09-17T12:00:00Z"};
+}
+
+function performanceSnapshot() {
+  return {
+    available: true, error: null, updated_at: "2026-09-17T12:00:00Z",
+    deployments: [{
+      id: "qwen-golemframe", machine: "golemframe", endpoint: "golemframe-ollama", model: "qwen3:8b",
+      address: "http://golemframe:11434", adapter: "ollama", successes: 7, failures: 2,
+      input_tokens_total: 1000, output_tokens_total: 500, last_seen_at: "2026-09-17T12:00:00Z", current: true,
+      metrics: {
+        input_tokens_per_second: performanceObservation(100, 80, 10),
+        output_tokens_per_second: performanceObservation(30, 25, 7),
+        load_duration_ms: performanceObservation(2000, 800, 4),
+        request_duration_ms: performanceObservation(1500, 1200, 9),
+      }, slow_load_count: 2, slow_load_threshold_ms: 1000,
+    }],
+  };
+}
+
+async function unlockedPerformance(performance = performanceSnapshot()) {
+  const app = harness();
+  app.enterKey("secret-key");
+  await reply(app.requests.at(-1), 200, {...snapshot(), performance});
+  return app;
+}
+
+async function performanceIsPassiveAndPerDeployment() {
+  assert.ok(markup.indexOf('id="performance-title"') > markup.indexOf('id="details"'), "Performance table belongs inside locked details");
+  assert.match(markup, /saved across restarts and updates/);
+  assert.match(markup, /Refresh never runs a benchmark or model/);
+  assert.match(markup, /do not prove disk I\/O/);
+  assert.match(markup, /Missing timings are not estimated from request latency/);
+  assert.match(markup, /Reported load \/ setup/);
+  assert.match(markup, /Request time \(wall clock\)/);
+  assert.match(markup, /Request time covers the whole upstream call/);
+  assert.match(markup, /href="\/router\/metrics"[^>]*>Performance JSON/);
+  const locked = harness();
+  await reply(locked.requests[0], 200, {status: "ready", performance: performanceSnapshot()});
+  assert.equal(locked.element("performance-body").textContent, "", "A public readiness payload must never render detailed metrics");
+  const performance = performanceSnapshot();
+  performance.deployments.push({...performance.deployments[0], id: "qwen-pantheon", machine: "pantheon", endpoint: "old-lmstudio", address: "http://pantheon:1234", current: false});
+  const app = await unlockedPerformance(performance);
+  const rows = app.element("performance-body").children;
+  assert.equal(rows.length, 2);
+  assert.match(rows[0].children[0].textContent, /qwen3:8bServer: golemframe/);
+  assert.match(rows[0].children[0].textContent, /http:\/\/golemframe:11434/);
+  assert.match(rows[0].children[0].textContent, /Current deployment/);
+  assert.match(rows[0].children[0].textContent, /API: ollama/);
+  assert.equal(rows[0].children[0].textContent.includes(performance.deployments[0].id), false, "Opaque persisted deployment IDs belong in JSON, not the human-facing table");
+  assert.match(rows[1].children[0].textContent, /Server: pantheon/);
+  assert.match(rows[1].children[0].textContent, /Historical/);
+  assert.doesNotMatch(rows[1].children[0].textContent, /Online|Available/, "A historical row does not claim current reachability");
+  assert.equal(rows[0].children[1].children[0].children[0].textContent, "80 tok/s");
+  assert.match(rows[0].children[1].textContent, /Smoothed \(EWMA\)/);
+  assert.match(rows[0].children[1].textContent, /Latest: 100 tok\/s · 10 samples/);
+  assert.match(rows[0].children[1].textContent, /Updated:/);
+  assert.equal(rows[0].children[2].children[0].children[0].textContent, "25 tok/s");
+  assert.equal(rows[0].children[3].children[0].children[0].textContent, "800 ms");
+  assert.match(rows[0].children[3].textContent, /Slow reported loads \(≥1 s\): 2/);
+  assert.equal(rows[0].children[4].children[0].children[0].textContent, "1,200 ms");
+  assert.match(rows[0].children[5].textContent, /7 succeeded \/ 2 failed/);
+  assert.match(rows[0].children[5].textContent, /Reported input tokens: 1000Reported output tokens: 500/);
+  assert.notEqual(rows[0].children[6].textContent, "Not recorded");
+  assert.match(app.element("performance-message").textContent, /does not generate traffic to models/);
+  assert.ok(app.allRequests.every(request => request.options.method === "GET"));
+  assert.equal(app.allRequests.some(request => request.url === "/router/metrics"), false, "Metrics arrive in the existing status snapshot, not another fetch");
+  const oldRequests = app.allRequests.length;
+  const oldHosts = app.hostRequests.length;
+  app.tick();
+  performance.deployments[0].metrics.input_tokens_per_second = performanceObservation(90, 85, 11);
+  await reply(app.requests.at(-1), 200, {...snapshot(), performance});
+  assert.equal(app.allRequests.length, oldRequests + 1);
+  assert.equal(app.hostRequests.length, oldHosts);
+  assert.match(app.element("performance-body").children[0].children[1].textContent, /^85 tok\/s/);
+}
+
+async function performanceUnknownZeroAndMissingTimings() {
+  const performance = performanceSnapshot();
+  const row = performance.deployments[0];
+  row.metrics.input_tokens_per_second = performanceObservation(0, 0, 1);
+  row.metrics.output_tokens_per_second = null;
+  row.metrics.load_duration_ms = null;
+  row.slow_load_count = 0;
+  row.successes = 0;
+  row.failures = 0;
+  row.last_seen_at = null;
+  const app = await unlockedPerformance(performance);
+  let cells = app.element("performance-body").children[0].children;
+  assert.match(cells[1].textContent, /^0 tok\/s/);
+  assert.match(cells[1].textContent, /Latest: 0 tok\/s · 1 sample/);
+  assert.equal(cells[2].textContent, "Not reported");
+  assert.match(cells[3].textContent, /^Not reported/);
+  assert.match(cells[3].textContent, /Slow reported loads \(≥1 s\): Not reported/);
+  assert.match(cells[4].textContent, /^1,200 ms/);
+  assert.match(cells[5].textContent, /0 succeeded \/ 0 failed/);
+  assert.equal(cells[6].textContent, "Not recorded");
+  row.metrics.load_duration_ms = performanceObservation(0, 0, 1);
+  row.metrics.output_tokens_per_second = performanceObservation(0.001, 0.002, 1);
+  app.tick();
+  await reply(app.requests.at(-1), 200, {...snapshot(), performance});
+  cells = app.element("performance-body").children[0].children;
+  assert.match(cells[2].textContent, /^<0\.01 tok\/s/, "Small positive rates should not be rounded to measured zero");
+  assert.match(cells[3].textContent, /^0 ms/);
+  assert.match(cells[3].textContent, /Slow reported loads \(≥1 s\): 0/);
+  for (const invalid of [undefined, {}, performanceObservation(-1), performanceObservation(Infinity), {...performanceObservation(1), ewma: "3"}, performanceObservation(1, 1, 0)]) {
+    row.metrics.input_tokens_per_second = invalid;
+    app.tick();
+    await reply(app.requests.at(-1), 200, {...snapshot(), performance});
+    assert.equal(app.element("performance-body").children[0].children[1].textContent, "Not reported");
+  }
+}
+
+async function performanceEmptyOlderAndUnavailableStorage() {
+  const older = await unlocked();
+  assert.match(older.element("performance-message").textContent, /does not include performance metrics/);
+  assert.match(older.element("performance-body").textContent, /No performance data received/);
+  const empty = await unlockedPerformance({...performanceSnapshot(), deployments: [], updated_at: null});
+  assert.match(empty.element("performance-body").textContent, /No routed requests yet/);
+  assert.match(empty.element("performance-message").textContent, /Not yet recorded/);
+  const app = await unlockedPerformance();
+  for (const performance of [
+    {...performanceSnapshot(), available: false, error: "private-file-path secret-key"},
+    {...performanceSnapshot(), deployments: null},
+    {...performanceSnapshot(), deployments: [null]},
+    {...performanceSnapshot(), deployments: [{}]},
+  ]) {
+    app.tick();
+    await reply(app.requests.at(-1), 200, {...snapshot(), performance});
+    assert.match(app.element("performance-message").textContent, /history is unavailable/);
+    assert.doesNotMatch(app.element("performance-message").textContent, /private-file-path|secret-key/);
+    assert.doesNotMatch(app.element("performance-body").textContent, /qwen3:8b/);
+    assert.equal(app.element("details").hidden, false, "Performance failure must not hide otherwise-valid router status");
+  }
+  app.tick();
+  await reply(app.requests.at(-1), 200, {...snapshot(), performance: {...performanceSnapshot(), error: "private-internal-error"}});
+  assert.match(app.element("performance-message").textContent, /storage reported a problem/);
+  assert.doesNotMatch(app.element("performance-message").textContent, /private-internal-error/);
+  assert.match(app.element("performance-body").textContent, /qwen3:8b/, "Available cached data may remain visible with an incomplete-storage warning");
+}
+
+async function performanceEscapingAndPrivateStateClearing() {
+  const performance = performanceSnapshot();
+  const item = performance.deployments[0];
+  item.model = '<img src=x onerror="alert(1)">';
+  item.machine = '<script>alert("machine")</script>';
+  item.endpoint = '<script>alert("endpoint")</script>';
+  item.id = '<script>alert("id")</script>';
+  item.adapter = '<script>alert("adapter")</script>';
+  item.address = "http://user:secret@backend:11434";
+  const app = await unlockedPerformance(performance);
+  const identity = app.element("performance-body").children[0].children[0].children[0];
+  assert.equal(identity.children[0]._text, item.model);
+  assert.equal(identity.children[0].children.length, 0);
+  assert.ok(identity.children[1]._text.includes(item.machine));
+  assert.ok(identity.children[1]._text.includes(item.endpoint));
+  assert.equal(identity.textContent.includes(item.id), false);
+  assert.ok(identity.children[2]._text.includes(item.adapter));
+  assert.equal(identity.children[3].textContent, "API address unavailable", "Credential-bearing API addresses must not be exposed");
+  assert.equal(identity.children[3].tagName, "code", "Performance addresses are inert text, never links");
+  assert.doesNotMatch(app.element("performance-body").textContent, /user:secret/);
+  for (const action of ["lock", "key", "pagehide", "refresh-fail", "refresh-auth"]) {
+    const current = await unlockedPerformance();
+    current.tick();
+    const pending = current.requests.at(-1);
+    if (action === "lock") current.lock();
+    if (action === "key") current.enterKey("new-key");
+    if (action === "pagehide") current.event("pagehide");
+    if (action === "refresh-fail") { pending.reject(new Error("offline")); await flush(); }
+    if (action === "refresh-auth") await reply(pending, 401, {});
+    assert.equal(current.element("performance-body").textContent, "", `${action} clears stored model performance from the DOM`);
+    assert.equal(current.element("performance-message").textContent, "");
+    await reply(pending, 200, {...snapshot(), performance: performanceSnapshot()});
+    assert.equal(current.element("performance-body").textContent, "", `${action}: late response must not restore metrics`);
+  }
+}
+
+async function performanceLateBodyAndNewSessionGuards() {
+  const app = await unlockedPerformance();
+  app.tick();
+  const old = app.requests.at(-1);
+  app.enterKey("new-key");
+  const newer = performanceSnapshot();
+  newer.deployments[0].model = "new-session-model";
+  await reply(app.requests.at(-1), 200, {...snapshot(), performance: newer});
+  await reply(old, 401, {});
+  assert.match(app.element("performance-body").textContent, /new-session-model/);
+  assert.equal(app.element("details").hidden, false);
+  app.tick();
+  let resolveBody;
+  app.requests.at(-1).resolve({status: 200, ok: true, json: () => new Promise(resolve => { resolveBody = resolve; })});
+  await flush();
+  app.lock();
+  resolveBody({...snapshot(), performance: performanceSnapshot()});
+  await flush();
+  assert.equal(app.element("performance-body").textContent, "", "Delayed JSON parsing must not expose old authenticated metrics");
+}
+
 (async () => {
-  for (const test of [publicReadiness, topbarVersionTracksCurrentSnapshot, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession]) {
+  for (const test of [publicReadiness, topbarVersionTracksCurrentSnapshot, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession, performanceIsPassiveAndPerDeployment, performanceUnknownZeroAndMissingTimings, performanceEmptyOlderAndUnavailableStorage, performanceEscapingAndPrivateStateClearing, performanceLateBodyAndNewSessionGuards]) {
     await test();
     console.log(`PASS ${test.name}`);
   }

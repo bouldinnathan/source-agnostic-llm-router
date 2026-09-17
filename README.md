@@ -214,6 +214,86 @@ HTTP connection; use TLS or a trusted VPN. Backend credentials and private URL
 query strings are never included in dashboard data; saved checks display only
 validated addresses and fixed metadata API paths.
 
+### Passive model performance history
+
+Unlock `/status` and open **Observed model performance** to see input and output tokens
+per second, reported model load/setup time, successful/failed request counts,
+and when each model/server was last observed. **No benchmarks or extra inference
+requests are sent.** Only real requests routed through this process contribute;
+requests sent directly to Ollama/LM Studio bypass the router and are not visible.
+The existing buffered streaming path records one observation after the upstream
+answer completes, not a live token counter while the answer is being generated.
+
+Each measurement keeps its latest value, sample count, last-observed timestamp,
+and an exponentially weighted moving average (`ewma`, alpha `0.2`) that adjusts
+as new requests finish. A missing measurement is **Not reported**, not zero;
+previous valid measurements retain their own timestamps rather than pretending
+to have been measured again. Models no longer in the routing fleet retain their
+history, marked historical. Aliases are resolved before recording, so a failover
+is attributed to the actual server/model that handled each attempt.
+
+Timing support depends on the backend's ordinary response:
+
+- [Ollama](https://docs.ollama.com/api/chat) reports prompt-evaluation, generation,
+  and model-load durations. Cached prompt tokens are excluded from input-speed
+  calculation when their count is reported.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+  can include prompt/generation `timings` in its compatible response.
+- Other OpenAI-compatible servers, including LM Studio, may omit phase/load
+  timing on `/v1/chat/completions`. Supported timing/statistics fields are used
+  only when already present; the router does not switch APIs or probe/load a
+  model to obtain them. Token usage alone cannot establish input or output speed.
+
+Load/setup time is recorded independently from the whole upstream request
+duration. **Slow reported loads** count reported loads of at least **1,000 ms**;
+this suggests a possible cold load but does **not** prove a storage read. Warm
+setup overhead can also be reported. Missing load telemetry, a slow response,
+or a long time to first token is not classified as a cold load.
+
+The read-only JSON API is **`GET /router/metrics`**. It uses the same Bearer key
+policy as detailed status; URL-key unlocking is only a browser-page feature.
+
+```bash
+curl -fsS \
+  -H 'Authorization: Bearer YOUR_ROUTER_API_KEY' \
+  http://YOUR_ROUTER_IP:8088/router/metrics | python3 -m json.tool
+```
+
+The response includes `schema_version`, `available`, `updated_at`, and a
+`deployments` list. Each row identifies `machine`, `endpoint`, `model`, sanitized
+`address`, and whether it is `current`. The `metrics` object contains
+`input_tokens_per_second`, `output_tokens_per_second`, `load_duration_ms`, and
+`request_duration_ms`; each is `null` or an object with `latest`, `ewma`,
+`samples`, and `updated_at`. Rows also include reported-token totals, `successes`,
+`failures`, `slow_load_count`, and `slow_load_threshold_ms`. Failures contribute
+attempt counts and elapsed time, not fabricated token rates. Attempts cancelled
+before upstream completion are not counted. Detailed `/status/data` includes the same payload under
+`performance`; public health summaries do not expose it. Reads never run a
+model or create a new database. `/router/metrics` returns HTTP 503 with a generic
+error if storage is unavailable or the latest write failed; successful recording
+clears that warning. The dashboard itself remains accessible.
+
+History is stored in a private SQLite database outside the managed virtual
+environment: `~/.local/state/llm-router/metrics.sqlite3`, or
+`$XDG_STATE_HOME/llm-router/metrics.sqlite3` when set. For the dedicated service
+account, that is normally
+`/home/llmrouter/.local/state/llm-router/metrics.sqlite3`. Set
+`LLM_ROUTER_METRICS_FILE` in `router.env` only if you need another private,
+service-user-owned location. **Software updates, runtime rollback, discovery
+refreshes, and process restarts do not reset it.** Keep it outside the venv and
+release directories. History follows `(machine identity, endpoint name, upstream
+model ID)`; stable configured identities preserve it across address changes.
+Different services/endpoints stay separate even on the same machine. Changing
+those identity labels starts a separate history.
+
+No prompts, generated text, tool arguments, credentials, or raw responses are
+persisted. Storage is bounded to 4,096 model/server histories; existing rows can
+continue updating at the limit, but adding further identities requires operator
+attention. Storage failures never trigger repeat inference or discard a valid
+answer. Unsafe/corrupt or unsupported database schemas are reported, never
+silently reset. Back up the database while the router is stopped, or use a
+SQLite-aware backup method.
+
 ### Save and quickly check backend addresses
 
 On `/status`, unlock details with your router API key, then use **Saved backend

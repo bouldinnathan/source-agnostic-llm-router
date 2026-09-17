@@ -29,6 +29,7 @@ from .aliases import ModelAlias, alias_conflicts, build_aliases
 from .discovery import DiscoveryReport, DiscoverySettings, ProbeResult
 from .errors import AllModelsFailed, NoEligibleModel, RequestError, RouterError
 from .health import probe_endpoints
+from .metrics import MetricsStore
 from .provisioning import OllamaProvisioner, ProvisioningReport, ProvisioningSettings
 from .public_status import public_summary
 from .router import LLMRouter
@@ -96,6 +97,7 @@ class RouterGateway:
         settings: DiscoverySettings | None = None,
         provisioning_settings: ProvisioningSettings | None = None,
         provisioner: OllamaProvisioner | None = None,
+        metrics_store: MetricsStore | None = None,
     ) -> None:
         self.config_path = config_path
         self.discovery_enabled = discovery
@@ -115,6 +117,7 @@ class RouterGateway:
         self._last_error: str | None = None
         self._last_refresh: float | None = None
         self._started_at = time.monotonic()
+        self.metrics = metrics_store if metrics_store is not None else MetricsStore()
 
     async def start(self) -> None:
         await self.refresh()
@@ -165,6 +168,7 @@ class RouterGateway:
                 self._last_error = _safe_exception(exc)
                 self._last_refresh = time.time()
                 return False
+            result.router.metrics = self.metrics
             self._router = result.router
             self._discovery = result.discovery
             self._last_error = None
@@ -321,6 +325,37 @@ class RouterGateway:
             "endpoints": sorted(endpoints, key=lambda endpoint: (endpoint["machine"], endpoint["name"])),
             "models": sorted(models, key=lambda model: (model["name"], model["machine"], model["deployment"])),
             "aliases": aliases,
+        }
+
+    def metrics_status(self) -> dict[str, Any]:
+        """Read persisted observations only; never discover or invoke a model."""
+        try:
+            snapshot = self.metrics.snapshot()
+        except Exception:
+            snapshot = {
+                "available": False, "error": "Performance history could not be read.",
+                "updated_at": None, "deployments": [],
+            }
+        current = set()
+        router = self._router
+        if router is not None:
+            for model in router.config.models:
+                endpoint = router.config.endpoints[model.endpoint]
+                current.add((endpoint.machine_id or endpoint.name, endpoint.name, model.upstream_model))
+        return {
+            **snapshot,
+            "schema_version": 1,
+            "collection": "passive",
+            "notice": (
+                "Real routed requests only; no benchmarks. Input/output rates and load/setup time "
+                "require backend-reported timings. Missing measurements are not zero. "
+                "Slow reported loads (at least 1000 ms) suggest, but do not prove, a cold/storage load. "
+                "EWMA uses alpha 0.2; each metric retains its own last-observed timestamp."
+            ),
+            "deployments": [
+                {**row, "current": (row["machine"], row["endpoint"], row["model"]) in current}
+                for row in snapshot["deployments"]
+            ],
         }
 
     async def _refresh_loop(self) -> None:
@@ -633,11 +668,23 @@ def create_app(
 
     async def status_data(request: Request) -> Response:
         denied = _authorize(request, openai=True)
-        response = denied or JSONResponse({
-            **service.dashboard_status(), "summary": public_summary(service, host_results),
-        })
+        if denied is not None:
+            response = denied
+        else:
+            response = JSONResponse({
+                **service.dashboard_status(), "summary": public_summary(service, host_results),
+                "performance": await asyncio.to_thread(service.metrics_status),
+            })
         response.headers.update(page_headers)
         return response
+
+    async def performance_metrics(request: Request) -> Response:
+        denied = _authorize(request, openai=True)
+        if denied is not None:
+            denied.headers.update(page_headers)
+            return denied
+        payload = await asyncio.to_thread(service.metrics_status)
+        return JSONResponse(payload, status_code=200 if payload["available"] else 503, headers=page_headers)
 
     async def status_self_test(request: Request) -> Response:
         """Explicit, bounded API checks; never discover, provision or infer."""
@@ -925,6 +972,7 @@ def create_app(
         Route("/healthz", health, methods=["GET"]),
         Route("/readyz", health, methods=["GET"]),
         Route("/router/status", router_status, methods=["GET"]),
+        Route("/router/metrics", performance_metrics, methods=["GET"]),
         Route("/router/discover", refresh, methods=["POST"]),
         Route("/router/provision", provision, methods=["POST"]),
         Route("/api/version", ollama_version, methods=["GET"]),

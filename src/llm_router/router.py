@@ -10,9 +10,11 @@ from typing import Any
 
 from .adapters import AdapterRegistry
 from .errors import AllModelsFailed, UpstreamError, UpstreamFailure
+from .metrics import MetricsStore
 from .ranking import Ranker
 from .runtime import RuntimeRegistry
-from .schema import QueryRequest, RoutedCompletion, RouterConfig, RoutingDecision
+from .schema import EndpointConfig, ModelConfig, QueryRequest, RoutedCompletion, RouterConfig, RoutingDecision, UpstreamResult
+from .telemetry import extract_observation
 
 _ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -26,10 +28,12 @@ class LLMRouter:
         *,
         adapters: AdapterRegistry | None = None,
         runtime: RuntimeRegistry | None = None,
+        metrics: MetricsStore | None = None,
     ) -> None:
         self.config = config
         self.adapters = adapters or AdapterRegistry()
         self.runtime = runtime or RuntimeRegistry(config.policy)
+        self.metrics = metrics if metrics is not None else MetricsStore()
         self.ranker = Ranker(config, self.runtime)
 
     def route(self, request: QueryRequest) -> RoutingDecision:
@@ -74,6 +78,7 @@ class LLMRouter:
                         "success": False,
                     }
                 )
+                await self._record_metrics(endpoint, model, latency_ms, success=False)
                 continue
             except Exception as exc:  # Custom adapters must not crash the MCP process.
                 latency_ms = (time.perf_counter() - started) * 1_000
@@ -93,10 +98,12 @@ class LLMRouter:
                         "success": False,
                     }
                 )
+                await self._record_metrics(endpoint, model, latency_ms, success=False)
                 continue
 
             latency_ms = (time.perf_counter() - started) * 1_000
             self.runtime.record_success(model.id, latency_ms)
+            await self._record_metrics(endpoint, model, latency_ms, success=True, result=result)
             attempts.append(
                 {
                     "deployment": model.id,
@@ -119,6 +126,31 @@ class LLMRouter:
             )
 
         raise AllModelsFailed(failures)
+
+    async def _record_metrics(
+        self, endpoint: EndpointConfig, model: ModelConfig, latency_ms: float,
+        *, success: bool, result: UpstreamResult | None = None,
+    ) -> None:
+        """Observe only completed real attempts; telemetry must never cause a retry.
+
+        The upstream timer has already stopped. SQLite work runs off the event
+        loop and persists no prompts, responses, tool arguments, or credentials.
+        """
+        observation = {"request_duration_ms": latency_ms}
+        if result is not None:
+            try:
+                observation = extract_observation(endpoint.adapter, result, latency_ms)
+            except Exception:
+                # Optional provider statistics cannot erase the attempt itself.
+                pass
+        try:
+            await asyncio.to_thread(
+                self.metrics.record, endpoint, model, observation, success=success,
+            )
+        except Exception:
+            # A full disk, locked database, or malformed optional statistics
+            # must not discard a valid answer or repeat inference on a fallback.
+            pass
 
     def list_models(self, *, include_disabled: bool = False) -> list[dict[str, Any]]:
         models: list[dict[str, Any]] = []

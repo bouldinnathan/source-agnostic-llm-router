@@ -44,3 +44,8 @@ def test_status_page_client_flows() -> None:
     assert "PASS liveFragmentKeyUnlockAndNavigation" in result.stdout
     assert "PASS liveFragmentKeyInvalidAndCleanupFailure" in result.stdout
     assert "PASS liveFragmentKeyCancelsOldSession" in result.stdout
+    assert "PASS performanceIsPassiveAndPerDeployment" in result.stdout
+    assert "PASS performanceUnknownZeroAndMissingTimings" in result.stdout
+    assert "PASS performanceEmptyOlderAndUnavailableStorage" in result.stdout
+    assert "PASS performanceEscapingAndPrivateStateClearing" in result.stdout
+    assert "PASS performanceLateBodyAndNewSessionGuards" in result.stdout
