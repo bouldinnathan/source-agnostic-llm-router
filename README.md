@@ -126,8 +126,10 @@ Open **`http://127.0.0.1:8088/status`** in a browser on the router machine, or
 bind address as described above. Browsers visiting `/` also see the status page;
 ordinary API requests to `/` retain the existing plaintext liveness response.
 
-The page distinguishes the running gateway from available models. It refreshes
-every 10 seconds and shows API reachability for each backend, available models,
+The top header shows the installed router version, including while backend
+details are locked and on small screens. The page distinguishes the running
+gateway from available models. It refreshes every 10 seconds and shows API
+reachability for each backend, available models,
 machine-preference/HA aliases, and process uptime. "Unchecked" means no API probe
 has confirmed that backend; an online API does not by itself prove model inference
 will succeed. Losing contact with the router marks the display stale instead of

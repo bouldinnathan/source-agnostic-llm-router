@@ -187,6 +187,33 @@ async function publicReadiness() {
   assert.equal(app.element("health-panel").className, "health-panel tone-error");
 }
 
+async function topbarVersionTracksCurrentSnapshot() {
+  const header = markup.match(/<header\b[^>]*class="topbar"[^>]*>([\s\S]*?)<\/header>/);
+  assert.ok(header && /\bid="version"/.test(header[1]), "Version belongs at the top of the page, before locked details");
+  assert.equal(Array.from(markup.matchAll(/\bid="version"/g)).length, 1);
+  const app = harness();
+  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.1"});
+  assert.equal(app.element("details").hidden, true);
+  assert.equal(app.element("version").hidden, false);
+  assert.equal(app.element("version").textContent, "Version 0.3.1", "Even an unavailable public gateway identifies its version");
+  app.enterKey("secret-key");
+  await reply(app.requests.at(-1), 200, {...snapshot(), version: "0.4.0"});
+  assert.equal(app.element("version").textContent, "Version 0.4.0");
+  app.tick();
+  app.requests.at(-1).reject(new Error("offline"));
+  await flush();
+  assert.equal(app.element("version").textContent, "", "Connection failure must not leave a stale header version");
+  app.tick();
+  await reply(app.requests.at(-1), 200, {...snapshot(), version: '<img src=x onerror="alert(1)">'});
+  assert.equal(app.element("version")._text, 'Version <img src=x onerror="alert(1)">');
+  assert.equal(app.element("version").children.length, 0, "Version strings must remain inert text");
+  app.tick();
+  await reply(app.requests.at(-1), 200, {...snapshot(), version: undefined});
+  assert.equal(app.element("version").textContent, "", "Missing version must clear the prior value");
+  app.event("pagehide");
+  assert.equal(app.element("version").textContent, "");
+}
+
 async function nonoverlapAndNetworkFailure() {
   const app = harness();
   app.tick();
@@ -1046,7 +1073,7 @@ async function liveFragmentKeyCancelsOldSession() {
 }
 
 (async () => {
-  for (const test of [publicReadiness, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession]) {
+  for (const test of [publicReadiness, topbarVersionTracksCurrentSnapshot, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession]) {
     await test();
     console.log(`PASS ${test.name}`);
   }

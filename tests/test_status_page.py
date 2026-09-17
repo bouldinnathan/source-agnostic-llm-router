@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from html.parser import HTMLParser
 import json
+import re
 import time
 from dataclasses import replace
 
@@ -113,6 +115,49 @@ def test_status_html_has_strict_same_origin_content_security_policy() -> None:
     assert "/status/assets/app.js" in response.text
     assert "/status/assets/style.css" in response.text
     assert 'type="password"' in response.text
+
+
+@pytest.mark.parametrize("api_key_required", [False, True])
+def test_status_version_is_unique_and_visible_in_public_topbar(api_key_required: bool) -> None:
+    from llm_router.status_page import STATUS_CSS, render_status_html
+
+    class VersionLocator(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stack: list[tuple[str, dict[str, str | None]]] = []
+            self.locations: list[list[tuple[str, dict[str, str | None]]]] = []
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            attributes = dict(attrs)
+            current = (tag, attributes)
+            if attributes.get("id") == "version":
+                self.locations.append([*self.stack, current])
+            if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}:
+                self.stack.append(current)
+
+        def handle_endtag(self, tag: str) -> None:
+            for index in range(len(self.stack) - 1, -1, -1):
+                if self.stack[index][0] == tag:
+                    del self.stack[index:]
+                    break
+
+    locator = VersionLocator()
+    locator.feed(render_status_html(api_key_required=api_key_required))
+    assert len(locator.locations) == 1, "Keep exactly one live version element"
+    location = locator.locations[0]
+    assert any(tag == "header" and "topbar" in (attrs.get("class") or "").split() for tag, attrs in location)
+    assert "version-badge" in (location[-1][1].get("class") or "").split()
+    assert all(tag != "footer" and attrs.get("id") != "details" and "hidden" not in attrs for tag, attrs in location)
+    classes = {name for _, attrs in location for name in (attrs.get("class") or "").split()}
+    assert "readonly" not in classes, "The mobile-hidden tagline must not hide the version badge"
+    for selectors, declarations in re.findall(r"([^{}]+)\{([^{}]*)\}", STATUS_CSS):
+        if not re.search(r"(?:^|;)\s*display\s*:\s*none\b", declarations):
+            continue
+        for selector in selectors.split(","):
+            if ":empty" in selector:
+                continue  # Hiding an empty placeholder does not hide a known version.
+            assert not any(re.search(rf"\.{re.escape(name)}(?![\w-])", selector) for name in classes), selector
+            assert not re.search(r"#version(?![\w-])", selector), selector
 
 
 def test_browser_root_serves_status_but_updater_plain_text_probe_is_unchanged() -> None:

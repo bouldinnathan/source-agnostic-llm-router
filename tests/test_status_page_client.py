@@ -21,6 +21,7 @@ def test_status_page_client_flows() -> None:
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PASS publicReadiness" in result.stdout
+    assert "PASS topbarVersionTracksCurrentSnapshot" in result.stdout
     assert "PASS lockLateResponsesAndRejectedKeys" in result.stdout
     assert "PASS safeRouterAndBackendLinks" in result.stdout
     assert "PASS selfTestIsExplicitAndIndependent" in result.stdout
