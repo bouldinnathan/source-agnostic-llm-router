@@ -24,9 +24,9 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .bootstrap import BootstrapResult, bootstrap_router
+from .bootstrap import BootstrapResult, bootstrap_router, load_optional_config
 from .aliases import ModelAlias, alias_conflicts, build_aliases
-from .discovery import DiscoveryReport, DiscoverySettings, ProbeResult
+from .discovery import DiscoveryReport, DiscoverySettings, ProbeResult, merge_router_configs
 from .errors import AllModelsFailed, NoEligibleModel, RequestError, RouterError
 from .health import probe_endpoints
 from .metrics import MetricsStore
@@ -35,10 +35,13 @@ from .public_status import public_summary
 from .router import LLMRouter
 from .schema import QueryRequest, RoutedCompletion, RouterConfig
 from .saved_hosts import SavedHostStore, check_saved_host
+from .saved_discovery import is_saved_endpoint, merge_saved_discovery, saved_hosts_report
 from .self_test import run_backend_checks
 from .status_page import STATUS_CSS, STATUS_JS, render_status_html
 
 VERSION = "0.3.0"
+SAVED_HOST_REFRESH_SECONDS = 30.0
+SAVED_HOST_CHECK_COOLDOWN_SECONDS = 3.0
 VIRTUAL_MODELS: dict[str, str] = {
     "auto": "quality",
     "auto:quality": "quality",
@@ -108,6 +111,11 @@ class RouterGateway:
         self._provisioner = provisioner or OllamaProvisioner(self.provisioning_settings)
         self._router: LLMRouter | None = None
         self._discovery: DiscoveryReport | None = None
+        self._base_discovery = DiscoveryReport(RouterConfig(endpoints={}, models=()), ())
+        self._saved_discovery = DiscoveryReport(RouterConfig(endpoints={}, models=()), ())
+        self._saved_results: Mapping[str, dict[str, Any]] = {}
+        self._configured: RouterConfig | None = None
+        self._configuration_loaded = False
         self._refresh_lock = asyncio.Lock()
         self._refresh_task: asyncio.Task[None] | None = None
         self._health_task: asyncio.Task[None] | None = None
@@ -153,6 +161,7 @@ class RouterGateway:
                     discovery=self.discovery_enabled,
                     settings=self.settings,
                     previous=previous,
+                    saved_discovery=self._saved_discovery,
                 )
                 result = self._retain_failed_sources(result, previous)
                 for probe in result.discovery.probes:
@@ -161,7 +170,11 @@ class RouterGateway:
                         name in result.router.config.endpoints
                         and result.router.config.endpoints[name].health_path is None
                     ):
-                        result.router.runtime.record_endpoint_probe(name, probe.reachable, probe.error)
+                        endpoint = result.router.config.endpoints[name]
+                        if not is_saved_endpoint(endpoint):
+                            result.router.runtime.record_endpoint_probe(name, probe.reachable, probe.error)
+                        elif previous is None or result.router.runtime is not previous.runtime:
+                            self._record_saved_probe(result.router, probe, self._saved_results)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -171,9 +184,87 @@ class RouterGateway:
             result.router.metrics = self.metrics
             self._router = result.router
             self._discovery = result.discovery
+            self._base_discovery = result.base_discovery or result.discovery
+            self._configured = result.configured
+            self._configuration_loaded = True
             self._last_error = None
             self._last_refresh = time.time()
             return True
+
+    async def apply_saved_hosts(self, results: Mapping[str, dict[str, Any]]) -> None:
+        """Atomically publish metadata-only catalogs without probing other sources."""
+        async with self._refresh_lock:
+            saved = saved_hosts_report(results, self._saved_discovery)
+            if not self._configuration_loaded:
+                self._configured = load_optional_config(self.config_path)
+                self._configuration_loaded = True
+            report = merge_saved_discovery(self._base_discovery, saved, self._configured)
+            merged = merge_router_configs(self._configured, report.config)
+            previous = self._router
+            runtime = previous.runtime if previous and previous.config.policy == merged.policy else None
+            router = LLMRouter(merged, runtime=runtime, metrics=self.metrics)
+            result = self._retain_failed_sources(BootstrapResult(router, report, self._configured), previous)
+            router = result.router
+            router.metrics = self.metrics
+            # Cached ordinary discovery must not reset newer health failures.
+            for probe in report.probes:
+                name = _probe_endpoint_name(probe, router.config.endpoints)
+                endpoint = router.config.endpoints.get(name)
+                if endpoint is not None and is_saved_endpoint(endpoint):
+                    self._record_saved_probe(router, probe, results)
+            self._saved_discovery = saved
+            self._saved_results = dict(results)
+            self._router = router
+            self._discovery = report
+            self._last_error = None
+
+    @staticmethod
+    def _record_saved_probe(router: LLMRouter, probe: ProbeResult, results: Mapping[str, dict[str, Any]]) -> None:
+        """Reusing a cached catalog must not pretend another network check ran."""
+        endpoint = router.config.endpoints[probe.endpoint]
+        timestamps = []
+        for identifier in endpoint.options.get("saved_host_ids", ()):
+            checked_at = results.get(identifier, {}).get("checked_at")
+            if isinstance(checked_at, str):
+                try:
+                    value = datetime.fromisoformat(checked_at)
+                    if value.tzinfo is not None:
+                        timestamps.append(value.timestamp())
+                except (ValueError, OverflowError):
+                    pass
+        router.runtime.record_endpoint_probe(
+            endpoint.name, probe.reachable, probe.error,
+            checked_at=max(timestamps) if timestamps else None,
+        )
+
+    def saved_host_routing(self, entry: Mapping[str, Any]) -> dict[str, Any]:
+        """Describe actual enrollment, not merely a successful version response."""
+        router = self._router
+        checks = entry.get("checks", [])
+        addresses = {_dashboard_address(check.get("base_url", "")) for check in checks}
+        owned = {
+            name for name, endpoint in (router.config.endpoints.items() if router else ())
+            if entry["id"] in endpoint.options.get("saved_host_ids", ())
+        }
+        managed = {
+            name for name, endpoint in (router.config.endpoints.items() if router else ())
+            if not is_saved_endpoint(endpoint) and _dashboard_address(endpoint.base_url) in addresses
+        }
+        models = [model for model in router.config.models if model.enabled and model.endpoint in owned | managed] if router else []
+        active = [model for model in models if router.runtime.endpoint_available(model.endpoint)]
+        if managed:
+            state, detail = "managed", "This address is managed by existing configuration/discovery; saved checks do not override it."
+        elif active:
+            state, detail = "active", "Chat models enrolled in routing; available through this router's model APIs."
+        elif models:
+            state, detail = "offline", "Last known chat models retained for recovery; this server is currently unavailable."
+        elif any(check.get("catalog_status") == "ok" for check in checks):
+            state, detail = "empty", "No supported chat models found to enroll. Non-chat models are listed but not routed."
+        elif entry.get("checked_at"):
+            state, detail = "offline", "No usable model catalog yet; saved address will be checked again automatically."
+        else:
+            state, detail = "pending", "Saved; automatic metadata check and routing enrollment pending."
+        return {"status": state, "model_count": len(models), "detail": detail}
 
     async def router(self) -> LLMRouter:
         if self._router is None:
@@ -373,7 +464,12 @@ class RouterGateway:
                     name for name in router.config.endpoints
                     if not router.runtime.endpoint_available(name)
                 }
-                results = await probe_endpoints(router.config, router.runtime)
+                # Saved targets have their own bounded catalog checks, including
+                # proxy-recursion rejection; do not reactivate them with a less
+                # strict generic health response between those checks.
+                ordinary = {name: endpoint for name, endpoint in router.config.endpoints.items() if not is_saved_endpoint(endpoint)}
+                health_config = replace(router.config, endpoints=ordinary, models=tuple(model for model in router.config.models if model.endpoint in ordinary))
+                results = await probe_endpoints(health_config, router.runtime)
                 recovered = any(results.get(name) is True for name in previously_offline)
                 # An endpoint-only config can start while every server is asleep.
                 # Enroll models promptly once one of those servers becomes usable.
@@ -435,6 +531,10 @@ class RouterGateway:
         for probe in failed_probes:
             name = _probe_endpoint_name(probe, known_endpoints)
             if name not in previous.config.endpoints:
+                continue
+            if is_saved_endpoint(previous.config.endpoints[name]):
+                # Saved-source retention and revocation are handled by the
+                # saved catalog registry, never by ordinary discovery fallback.
                 continue
             if name not in endpoints:
                 endpoint = previous.config.endpoints[name]
@@ -507,10 +607,20 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
-        await service.start()
+        saved_task = None
         try:
+            await service.start()
+            # Existing saved addresses from older installs are enrolled at startup.
+            await automatic_host_check()
+            saved_task = asyncio.create_task(saved_host_loop(), name="llm-router-saved-hosts")
             yield
         finally:
+            if saved_task is not None:
+                saved_task.cancel()
+                try:
+                    await saved_task
+                except asyncio.CancelledError:
+                    pass
             await service.stop()
 
     page_headers = {
@@ -529,6 +639,69 @@ def create_app(
     host_check_lock = asyncio.Lock()
     host_check_next_allowed = 0.0
     host_results: dict[str, dict[str, Any]] = {}
+    host_generations: dict[str, int] = {}
+    host_scan_requested = asyncio.Event()
+    host_enrollment_error: str | None = None
+    host_publication_pending = False
+
+    async def publish_hosts() -> None:
+        nonlocal host_enrollment_error, host_publication_pending
+        host_publication_pending = True
+        try:
+            await service.apply_saved_hosts(host_results)
+        except Exception:
+            host_enrollment_error = "Saved, but routing enrollment failed. Check router configuration and retry."
+            raise RuntimeError(host_enrollment_error) from None
+        host_enrollment_error = None
+        host_publication_pending = False
+
+    async def scan_hosts(entries: Sequence[dict[str, str]]) -> list[dict[str, Any]]:
+        """Caller serializes scans; store lock serializes route publication/removal."""
+        nonlocal host_check_next_allowed
+        generations = {entry["id"]: host_generations.get(entry["id"], 0) for entry in entries}
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*(check_saved_host(entry) for entry in entries)), timeout=12.0,
+            )
+            async with host_store_lock:
+                current = {entry["id"]: entry for entry in host_store.list()}
+                # Also reject a response from before DELETE + re-add of the same
+                # address (its stable ID alone cannot distinguish that race).
+                results = [row for row in results if current.get(row["id"], {}).get("address") == row["address"] and generations[row["id"]] == host_generations.get(row["id"], 0)]
+                for identifier in list(host_results):
+                    if identifier not in current:
+                        host_results.pop(identifier)
+                host_results.update({row["id"]: row for row in results})
+                await publish_hosts()
+                return [host_snapshot(row) for row in results]
+        finally:
+            host_check_next_allowed = time.monotonic() + SAVED_HOST_CHECK_COOLDOWN_SECONDS
+
+    async def automatic_host_check() -> None:
+        try:
+            async with host_check_lock:
+                delay = host_check_next_allowed - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                async with host_store_lock:
+                    entries = host_store.list()
+                if entries or host_results or host_publication_pending:
+                    await scan_hosts(entries)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Bad storage/unreachable targets must not stop the gateway or
+            # terminate all future automatic retries.
+            return
+
+    async def saved_host_loop() -> None:
+        while True:
+            try:
+                await asyncio.wait_for(host_scan_requested.wait(), timeout=SAVED_HOST_REFRESH_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+            host_scan_requested.clear()
+            await automatic_host_check()
 
     def hosts_reply(payload: Mapping[str, Any], code: int = 200) -> Response:
         return JSONResponse(payload, status_code=code, headers=page_headers)
@@ -576,8 +749,14 @@ def create_app(
     def host_snapshot(entry: Mapping[str, Any]) -> dict[str, Any]:
         cached = host_results.get(entry["id"])
         if cached is not None and cached["address"] == entry["address"]:
-            return dict(cached)
-        return {**entry, "checked_at": None, "checks": []}
+            row = dict(cached)
+        else:
+            row = {**entry, "checked_at": None, "checks": []}
+        row["routing"] = (
+            {"status": "error", "model_count": 0, "detail": host_enrollment_error}
+            if host_enrollment_error else service.saved_host_routing(row)
+        )
+        return row
 
     async def saved_hosts(request: Request) -> Response:
         denied = hosts_authorize(request)
@@ -589,10 +768,26 @@ def create_app(
                 if body is not None:
                     if not isinstance(body.get("address"), str):
                         raise ValueError("Enter a single IP address, hostname, or HTTP(S) URL.")
+                    previous_ids = {row["id"] for row in host_store.list()}
                     entry = host_store.add(body["address"])
-                    return hosts_reply({"host": host_snapshot(entry)}, 201)
-                entries = host_store.list()
-                return hosts_reply({"hosts": [host_snapshot(entry) for entry in entries], "limit": 16})
+                    if entry["id"] not in previous_ids:
+                        host_generations[entry["id"]] = host_generations.get(entry["id"], 0) + 1
+                else:
+                    entries = host_store.list()
+                    return hosts_reply({"hosts": [host_snapshot(entry) for entry in entries], "limit": 16})
+            if host_check_lock.locked() or time.monotonic() < host_check_next_allowed:
+                host_scan_requested.set()
+            else:
+                async with host_check_lock:
+                    try:
+                        await scan_hosts([entry])
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # Persistence succeeded; report pending/error and retry
+                        # rather than suggesting the address was not saved.
+                        host_scan_requested.set()
+            return hosts_reply({"host": host_snapshot(entry)}, 201)
         except ValueError as exc:
             return hosts_reply({"error": str(exc)}, 400)
         except (OSError, RuntimeError):
@@ -608,6 +803,8 @@ def create_app(
                 if not host_store.remove(identifier):
                     return hosts_reply({"error": "Saved address not found."}, 404)
                 host_results.pop(identifier, None)
+                host_generations[identifier] = host_generations.get(identifier, 0) + 1
+                await publish_hosts()
                 return hosts_reply({"removed": True})
         except ValueError:
             return hosts_reply({"error": "Invalid saved-address identifier."}, 400)
@@ -615,7 +812,6 @@ def create_app(
             return hosts_reply({"error": "Saved address could not be removed. Check the router's saved-address file."}, 503)
 
     async def check_saved_hosts(request: Request) -> Response:
-        nonlocal host_check_next_allowed
         denied = hosts_authorize(request)
         if denied is not None:
             return denied
@@ -634,19 +830,8 @@ def create_app(
                 response.headers["Retry-After"] = "3"
                 return response
             async with host_check_lock:
-                try:
-                    results = await asyncio.wait_for(
-                        asyncio.gather(*(check_saved_host(entry) for entry in entries)), timeout=12.0,
-                    )
-                    async with host_store_lock:
-                        current = {entry["id"]: entry for entry in host_store.list()}
-                        # Removing an address while a probe is in flight must
-                        # not resurrect it in cached status or in the browser.
-                        results = [row for row in results if current.get(row["id"], {}).get("address") == row["address"]]
-                        host_results.update({row["id"]: row for row in results})
-                    return hosts_reply({"hosts": results})
-                finally:
-                    host_check_next_allowed = time.monotonic() + 3.0
+                results = await scan_hosts(entries)
+                return hosts_reply({"hosts": results})
         except ValueError as exc:
             return hosts_reply({"error": str(exc)}, 400)
         except asyncio.TimeoutError:

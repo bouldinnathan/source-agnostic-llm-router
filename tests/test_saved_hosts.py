@@ -648,3 +648,94 @@ def test_catalog_results_are_not_saved_to_address_file(tmp_path):
     assert all(check["models"] for check in result["checks"])
     assert path.read_bytes() == original
     assert "qwen" not in path.read_text()
+
+
+@pytest.mark.parametrize("marker", ["version", "ownership", "both"])
+@pytest.mark.parametrize("address", ["router:8088", "http://router:8088/v1", "https://router"])
+def test_recognizable_router_is_blocked_through_both_apis_at_same_origin(marker, address):
+    calls = []
+
+    def backend(request):
+        calls.append(request)
+        assert request.method == "GET"
+        assert request.content == b""
+        assert "authorization" not in request.headers
+        assert "cookie" not in request.headers
+        payload = {
+            "/api/version": {"version": "llm-router-private-version" if marker in {"version", "both"} else "1"},
+            "/api/tags": {"models": [{"name": "private-router-model"}]},
+            "/v1/models": {"data": [{
+                "id": "private-router-model",
+                "owned_by": "llm-router" if marker in {"ownership", "both"} else "private-owner",
+            }]},
+        }[request.url.path]
+        return httpx.Response(200, json=payload)
+
+    result = asyncio.run(check_saved_host({"id": "router", "address": address}, transport=httpx.MockTransport(backend)))
+    assert len(calls) == 3
+    assert {request.url.path for request in calls} == {"/api/version", "/api/tags", "/v1/models"}
+    for check in result["checks"]:
+        assert check["status"] == "fail"
+        assert check["enrollment_blocked"] is True
+        assert check["catalog_status"] == "error"
+        assert check["model_count"] is None
+        assert check["models"] == []
+        assert check["models_truncated"] is False
+        assert "routing loops" in check["detail"]
+        assert check["catalog_detail"] == check["detail"]
+    assert "private-" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("marker", ["version", "ownership"])
+def test_router_marker_on_one_default_port_does_not_block_other_model_server(marker):
+    def backend(request):
+        if request.url.path == "/api/version":
+            return httpx.Response(200, json={"version": " LLM-ROUTER-0.3.0 " if marker == "version" else "0.12.0"})
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "qwen:latest"}]})
+        return httpx.Response(200, json={"data": [{"id": "qwen", "owned_by": " LLM-ROUTER " if marker == "ownership" else "lmstudio"}]})
+
+    ollama, openai = asyncio.run(check_saved_host({"id": "worker", "address": "worker"}, transport=httpx.MockTransport(backend)))["checks"]
+    blocked, allowed = (ollama, openai) if marker == "version" else (openai, ollama)
+    assert blocked["enrollment_blocked"] is True
+    assert blocked["models"] == []
+    assert allowed["status"] == "pass"
+    assert allowed["catalog_status"] == "ok"
+    assert allowed["models"]
+    assert "enrollment_blocked" not in allowed
+
+
+def test_router_ownership_after_display_limit_blocks_entire_catalog():
+    items = [{"id": f"model-{index}", "owned_by": "other"} for index in range(201)]
+    items.append({"id": "router-last", "owned_by": "llm-router"})
+    check = catalog_check(openai_models=items)["checks"][1]
+    assert check["enrollment_blocked"] is True
+    assert check["models"] == []
+    assert check["model_count"] is None
+    assert check["models_truncated"] is False
+
+
+@pytest.mark.parametrize("ownership", [None, True, 1, [], {}, "", "llm-router-other", "other-llm-router"])
+def test_router_looking_model_name_or_nonmatching_owner_does_not_block_real_server(ownership):
+    check = catalog_check(openai_models=[{"id": "llm-router-model", "owned_by": ownership}])["checks"][1]
+    assert check["status"] == "pass"
+    assert check["catalog_status"] == "ok"
+    assert check["models"][0]["id"] == "llm-router-model"
+    assert "enrollment_blocked" not in check
+
+
+@pytest.mark.parametrize("version_status", [401, 403, 404, 503])
+def test_error_body_router_marker_is_not_treated_as_successful_identification(version_status):
+    def backend(request):
+        if request.url.path == "/api/version":
+            return httpx.Response(version_status, json={"version": "llm-router-private-error"})
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "qwen"}]})
+        return httpx.Response(version_status, json={"data": [{"id": "auto", "owned_by": "llm-router"}]})
+
+    ollama, openai = asyncio.run(check_saved_host({"id": "a", "address": "worker:8088"}, transport=httpx.MockTransport(backend)))["checks"]
+    assert ollama["status"] == "pass"
+    assert ollama["models"][0]["id"] == "qwen"
+    assert openai["status"] == "fail"
+    assert "enrollment_blocked" not in ollama
+    assert "enrollment_blocked" not in openai

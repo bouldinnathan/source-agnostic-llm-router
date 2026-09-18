@@ -294,7 +294,7 @@ answer. Unsafe/corrupt or unsupported database schemas are reported, never
 silently reset. Back up the database while the router is stopped, or use a
 SQLite-aware backup method.
 
-### Save and quickly check backend addresses
+### Save, check, and automatically enroll backend addresses
 
 On `/status`, unlock details with your router API key, then use **Saved backend
 addresses** to enter an IP address or hostname and click **Save & check**. For
@@ -304,8 +304,18 @@ OpenAI-compatible API on port `1234`. To check a custom port, enter
 for machines whose IP addresses change; an IP address alone cannot identify a
 machine after it moves.
 
+**Saving now adds reachable chat models to routing automatically.** No extra
+`router.env` entry or service restart is needed. The router reads the model
+catalog, enrolls supported chat models, and exposes their HA/preferred-machine
+aliases through `/api/tags` and `/v1/models`. For example, saving
+`192.168.42.43` enrolls its available Ollama models; Home Assistant continues
+using the router URL (`http://192.168.37.37:8088`) and the router API key.
+It does not need the backend address or a different key.
+
 Use **Check** beside an address or **Check all saved** to run another check, and
-**Remove** to forget one. Up to 16 individual addresses can be saved; this is not
+**Remove** to forget one and withdraw routes owned only by that saved address.
+Explicit configuration and other owners of the same server are preserved.
+Up to 16 individual addresses can be saved; this is not
 a subnet or port-range scanner. Checks run concurrently with short timeouts and
 report elapsed time, HTTP status, and the latest check time. A bare address checks
 only the two standard ports; an explicit port checks only that port.
@@ -319,6 +329,9 @@ OpenAI-compatible servers use
 These are metadata requests only: no prompts, inference, model loading or
 downloads. A listed model is not necessarily loaded, and listing it does not
 verify that generation would succeed. Embedding models can also appear.
+Non-chat models are displayed but are not enrolled as chat deployments. When
+Ollama exposes both APIs at one address, routing prefers its native API and
+does not create duplicate copies of the models.
 
 For example, enter `192.168.42.43:11434` to look for both Ollama and
 OpenAI-compatible APIs on **that IP and that port only**. Each displayed model
@@ -335,17 +348,27 @@ checks bounded; Ollama's version and catalog requests run in parallel.
 
 An OpenAI-compatible response does not uniquely identify LM Studio.
 Authentication-required backends report their HTTP rejection; the router
-API key is **never** forwarded to them. Redirects are not followed. Page refreshes
-do not run these checks, and saving an address does not by itself add models to
-the routing fleet or change routing health.
+API key is **never** forwarded to them. Configure separate backend credentials
+in TOML for a server requiring authentication. Existing configured endpoints
+take precedence: saved checks cannot override their credentials or re-enable
+disabled models. Recognizable router-proxy catalogs are rejected to avoid
+recursive routing. Redirects are not followed. Page refreshes only read cached
+results; the router performs the checks in the background independently.
 
 Addresses are saved on the **router**, not just in browser storage, in
 `~/.config/llm-router/saved-hosts.json` under the account running the service
 (`/home/llmrouter/.config/llm-router/saved-hosts.json` for the dedicated account).
 `XDG_CONFIG_HOME` changes the config root; `LLM_ROUTER_SAVED_HOSTS_FILE` can select
 a different file. The private file survives service restarts and software updates.
-Check results are cached in memory and reset after a restart; saved addresses
-remain available to check again. The controls require a configured router API key,
+Saved addresses are rechecked and enrolled at startup, then every 30 seconds
+(plus check time), even when general automatic discovery is disabled. Save
+normally checks immediately; if a scan is already running or cooling down, it
+queues a check and shows pending status. Offline addresses stay saved and are
+retried. Last known deployments remain unavailable until a successful catalog
+check; a successfully empty catalog removes its old chat models. Neither
+enrollment nor these checks invoke, load, or download models. Existing saved
+addresses from older versions are enrolled automatically after the update.
+The controls require a configured router API key,
 even if other gateway APIs intentionally allow keyless access.
 
 ### Automatic software updates
@@ -466,8 +489,8 @@ pytest
 |---|---|
 | Find and enroll servers on your LAN/VPN | Opt in with `LLM_ROUTER_SCAN_CIDRS`, or list known servers in `LLM_ROUTER_DISCOVERY_URLS`. A LAN/VPN range is never guessed from an entered IP. |
 | Keep the routing model list current | Discovery repeats every 30 seconds in a new service installation, or every 300 seconds by default when launched manually. Existing settings are preserved; change `LLM_ROUTER_DISCOVERY_REFRESH` to choose another interval. |
-| Status-page saved IP addresses | **Check-only:** saved for later manual checks, with model names and addresses. They are not automatically rechecked or added to routing. To route to one, also configure its discovery URL. |
-| Detect known backends going offline/online | Metadata health checks run every 15 seconds by default. Eligible replicas can serve fallback requests; this is not a guarantee of uninterrupted service. |
+| Status-page saved IP addresses | Saved addresses automatically enroll supported chat models, are restored at startup, and are rechecked every 30 seconds. No separate discovery URL is needed. |
+| Detect known backends going offline/online | Ordinary endpoints have metadata health checks every 15 seconds by default; saved endpoints use their 30-second catalog checks. Eligible replicas can serve fallback requests; this is not a guarantee of uninterrupted service. |
 | HA, preferred-machine and no-failover aliases | Generated for enrolled models. Replica groups use exact upstream model IDs unless `replica_group` explicitly joins different IDs. Use a stable `machine_id` and DNS/VPN hostname for a roaming machine. |
 | Install router software updates | Daily, with up to one hour of jitter, **only after** installing with `--service --auto-update`. Updates preserve settings and restart an active service; a single router can briefly be unavailable during restart. |
 | Status page and self-test | Public summaries and page refreshes read cached data. Saved checks and the self-test fetch metadata only; they never run inference, load models, or download models. |

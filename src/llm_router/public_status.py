@@ -81,6 +81,8 @@ def public_summary(gateway, saved_results: Mapping[str, Mapping]) -> dict:
     router = getattr(gateway, "_router", None)
     config = getattr(router, "config", None)
     endpoints = getattr(config, "endpoints", {})
+    if not isinstance(endpoints, Mapping):
+        endpoints = {}
     origins = {}
     if isinstance(endpoints, Mapping):
         for name, endpoint in endpoints.items():
@@ -141,7 +143,9 @@ def public_summary(gateway, saved_results: Mapping[str, Mapping]) -> dict:
     # A completed refresh can contain only failed probes (or none at all when
     # discovery is disabled). It must not claim to have verified a server.
     reachable = isinstance(probes, (tuple, list)) and any(
-        getattr(probe, "reachable", None) is True for probe in probes
+        getattr(probe, "reachable", None) is True
+        and not getattr(endpoints.get(getattr(probe, "endpoint", None)), "options", {}).get("saved_host_source")
+        for probe in probes
     )
     if discovery is not None and getattr(gateway, "_last_error", None) is None and reachable:
         timestamp = _verified_time(getattr(gateway, "_last_refresh", None), now=now, epoch=True)

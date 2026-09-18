@@ -11,6 +11,7 @@ from .discovery import DiscoveryReport, DiscoverySettings, ModelDiscovery, merge
 from .errors import ConfigError
 from .router import LLMRouter
 from .schema import RouterConfig
+from .saved_discovery import merge_saved_discovery
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +19,7 @@ class BootstrapResult:
     router: LLMRouter
     discovery: DiscoveryReport
     configured: RouterConfig | None
+    base_discovery: DiscoveryReport | None = None
 
 
 async def bootstrap_router(
@@ -27,6 +29,7 @@ async def bootstrap_router(
     settings: DiscoverySettings | None = None,
     model_discovery: ModelDiscovery | None = None,
     previous: LLMRouter | None = None,
+    saved_discovery: DiscoveryReport | None = None,
 ) -> BootstrapResult:
     """Create a ready router while preserving explicit-config precedence."""
 
@@ -35,7 +38,11 @@ async def bootstrap_router(
     if not discovery:
         effective_settings = replace(effective_settings, enabled=False)
     discoverer = model_discovery or ModelDiscovery(effective_settings, configured=configured)
-    report = await discoverer.discover()
+    base_report = await discoverer.discover()
+    report = (
+        merge_saved_discovery(base_report, saved_discovery, configured)
+        if saved_discovery is not None else base_report
+    )
     merged = merge_router_configs(configured, report.config)
     if not merged.models and not any(endpoint.discover for endpoint in merged.endpoints.values()):
         raise ConfigError(
@@ -49,7 +56,7 @@ async def bootstrap_router(
         else None
     )
     router = LLMRouter(merged, runtime=runtime)
-    return BootstrapResult(router=router, discovery=report, configured=configured)
+    return BootstrapResult(router=router, discovery=report, configured=configured, base_discovery=base_report)
 
 
 def load_optional_config(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,15 +34,35 @@ async def request(app, method="GET", path="/status/hosts", **kwargs):  # type: i
 
 
 def checked(entry):  # type: ignore[no-untyped-def]
+    origin = entry["address"] if "://" in entry["address"] else f"http://{entry['address']}:11434"
     return {
         **entry,
         "checked_at": "2026-09-16T12:00:00+00:00",
         "checks": [{
-            "provider": "Ollama", "base_url": "http://backend.invalid:11434",
+            "provider": "Ollama", "base_url": origin,
             "status": "pass", "detail": "Metadata only.",
             "http_status": 200, "elapsed_ms": 1.0,
+            "catalog_status": "ok", "catalog_detail": "Metadata only.",
+            "catalog_url": origin + "/api/tags",
+            "models": [{"id": "qwen3:8b", "address": origin}],
+            "model_count": 1, "models_truncated": False,
         }],
     }
+
+
+def assert_checked_row(row, entry):  # type: ignore[no-untyped-def]
+    assert row == {**checked(entry), "routing": row["routing"]}
+    assert set(row["routing"]) == {"status", "model_count", "detail"}
+    assert row["routing"]["status"] == "active"
+    assert row["routing"]["model_count"] == 1
+    assert isinstance(row["routing"]["detail"], str) and row["routing"]["detail"]
+
+
+def assert_pending_row(row, entry):  # type: ignore[no-untyped-def]
+    assert row == {**entry, "checked_at": None, "checks": [], "routing": row["routing"]}
+    assert set(row["routing"]) == {"status", "model_count", "detail"}
+    assert row["routing"]["status"] == "pending"
+    assert row["routing"]["model_count"] == 0
 
 
 @pytest.fixture(autouse=True)
@@ -162,7 +183,7 @@ def test_list_empty_hosts_does_not_create_storage_or_probe(setup_hosts):  # type
 
 
 @pytest.mark.parametrize("origin", [None, "http://router.test"])
-def test_crud_persists_normalized_addresses_but_never_probes(setup_hosts, origin):  # type: ignore[no-untyped-def]
+def test_save_checks_and_enrolls_but_reads_deletion_and_duplicate_cooldown_do_not_probe(setup_hosts, origin):  # type: ignore[no-untyped-def]
     app, store, calls = setup_hosts
     headers = dict(MUTATE)
     if origin:
@@ -172,14 +193,23 @@ def test_crud_persists_normalized_addresses_but_never_probes(setup_hosts, origin
         saved = await request(app, "POST", headers=headers, json={"address": "http://BACKEND.invalid:1234/v1"})
         assert saved.status_code == 201
         row = saved.json()["host"]
-        assert row == {"id": row["id"], "address": "http://backend.invalid:1234", "checked_at": None, "checks": []}
+        entry = {"id": row["id"], "address": "http://backend.invalid:1234"}
+        assert_checked_row(row, entry)
+        assert calls == [entry]
+        router = app.state.router_gateway._router
+        assert router is not None
+        assert [model.upstream_model for model in router.config.models] == ["qwen3:8b"]
         duplicate = await request(app, "POST", headers=headers, json={"address": "http://backend.invalid:1234"})
+        assert duplicate.status_code == 201
         assert duplicate.json()["host"] == row
         listed = await request(app, headers=AUTH)
         assert listed.json() == {"hosts": [row], "limit": 16}
         fresh = create_app(gateway=RouterGateway(discovery=False), saved_host_store=SavedHostStore(store.path))
-        assert (await request(fresh, headers=AUTH)).json()["hosts"] == [row]
-        assert json.loads(store.path.read_text())["hosts"] == [{"id": row["id"], "address": row["address"]}]
+        restored = (await request(fresh, headers=AUTH)).json()["hosts"]
+        assert len(restored) == 1
+        assert_pending_row(restored[0], entry)
+        assert fresh.state.router_gateway._router is None, "GET does not start enrollment; lifespan startup does"
+        assert json.loads(store.path.read_text())["hosts"] == [entry]
         deleted = await request(fresh, "DELETE", f"/status/hosts/{row['id']}", headers=headers)
         assert deleted.status_code == 200
         assert deleted.json() == {"removed": True}
@@ -187,7 +217,7 @@ def test_crud_persists_normalized_addresses_but_never_probes(setup_hosts, origin
         assert (await request(app, "DELETE", f"/status/hosts/{row['id']}", headers=headers)).status_code == 404
 
     asyncio.run(exercise())
-    assert calls == []
+    assert len(calls) == 1
     assert "router-test-key" not in store.path.read_text()
 
 
@@ -289,25 +319,33 @@ def test_checks_use_stored_targets_only_and_cache_results_without_persisting_the
     second = store.add("second.invalid:1234")
     disk_before = store.path.read_bytes()
     clock = [100.0]
-    monkeypatch.setattr(gateway_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(gateway_module, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
 
     async def exercise():
         response = await request(app, "POST", "/status/hosts/check", headers=MUTATE, json={"id": first["id"]})
         assert response.status_code == 200
-        assert response.json() == {"hosts": [checked(first)]}
+        assert set(response.json()) == {"hosts"}
+        assert len(response.json()["hosts"]) == 1
+        assert_checked_row(response.json()["hosts"][0], first)
         assert calls == [first]
         assert set(calls[0]) == {"id", "address"}
         listed = (await request(app, headers=AUTH)).json()["hosts"]
-        assert listed == [checked(first), {**second, "checked_at": None, "checks": []}]
+        assert len(listed) == 2
+        assert_checked_row(listed[0], first)
+        assert_pending_row(listed[1], second)
         assert calls == [first]
         assert store.path.read_bytes() == disk_before
         fresh = create_app(gateway=RouterGateway(discovery=False), saved_host_store=SavedHostStore(store.path))
         restarted = (await request(fresh, headers=AUTH)).json()["hosts"]
-        assert all(row["checked_at"] is None and row["checks"] == [] for row in restarted)
+        assert len(restarted) == 2
+        for row, entry in zip(restarted, (first, second), strict=True):
+            assert_pending_row(row, entry)
         clock[0] += 4.0
         response = await request(app, "POST", "/status/hosts/check", headers=MUTATE, json={})
         assert response.status_code == 200
-        assert response.json()["hosts"] == [checked(first), checked(second)]
+        assert len(response.json()["hosts"]) == 2
+        for row, entry in zip(response.json()["hosts"], (first, second), strict=True):
+            assert_checked_row(row, entry)
         assert calls == [first, first, second]
         assert store.path.read_bytes() == disk_before
 
@@ -319,7 +357,7 @@ def test_completed_checks_have_three_second_global_cooldown(setup_hosts, monkeyp
     first = store.add("first.invalid")
     second = store.add("second.invalid")
     clock = [100.0]
-    monkeypatch.setattr(gateway_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(gateway_module, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
 
     async def exercise():
         first_reply = await request(app, "POST", "/status/hosts/check", headers=MUTATE, json={"id": first["id"]})

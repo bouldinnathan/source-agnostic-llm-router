@@ -163,7 +163,7 @@ def saved_result(entry):  # type: ignore[no-untyped-def]
     }
 
 
-def test_saved_check_summary_is_cached_private_and_removed_with_address(public_app, monkeypatch):  # type: ignore[no-untyped-def]
+def test_saved_enrollment_summary_is_cached_private_and_removed_with_address(public_app, monkeypatch):  # type: ignore[no-untyped-def]
     app, store, _ = public_app
     calls = []
 
@@ -177,13 +177,13 @@ def test_saved_check_summary_is_cached_private_and_removed_with_address(public_a
         saved = await request(app, "/status/hosts", method="POST", headers=MUTATE, json={"address": "private-machine.invalid:1234"})
         assert saved.status_code == 201
         identifier = saved.json()["host"]["id"]
-        assert (await request(app)).json()["summary"] == EMPTY_SUMMARY
-        checked = await request(app, "/status/hosts/check", method="POST", headers=MUTATE, json={"id": identifier})
-        assert checked.status_code == 200
+        assert saved.json()["host"]["routing"]["status"] == "active"
+        assert saved.json()["host"]["routing"]["model_count"] == 2
+        assert len(calls) == 1, "Saving performs one bounded metadata check and immediately enrolls chat models"
         original = store.path.read_bytes()
         for path in ("/healthz", "/readyz"):
             response = await request(app, path)
-            assert response.status_code == 503, "Finding saved backends does not enroll them in routing"
+            assert response.status_code == 200, "Successful saved catalogs now enroll usable routes"
             summary = response.json()["summary"]
             assert summary["servers"] == 1, "The two compatible APIs share one normalized server origin"
             assert summary["models"] == 2
@@ -198,7 +198,10 @@ def test_saved_check_summary_is_cached_private_and_removed_with_address(public_a
         fresh = create_app(gateway=RouterGateway(discovery=False), saved_host_store=SavedHostStore(store.path))
         assert (await request(fresh)).json()["summary"] == EMPTY_SUMMARY
         assert (await request(app, f"/status/hosts/{identifier}", method="DELETE", headers=MUTATE)).status_code == 200
-        assert (await request(app)).json()["summary"] == EMPTY_SUMMARY
+        removed = await request(app)
+        assert removed.status_code == 503
+        assert removed.json()["summary"] == EMPTY_SUMMARY
+        assert len(calls) == 1, "Status reads and removal must not trigger probes"
 
     asyncio.run(exercise())
 

@@ -101,12 +101,13 @@ _STATUS_HTML = """<!doctype html>
       <div class="section-heading"><h2>Backend details</h2></div>
       <section class="card" aria-labelledby="hosts-title">
         <div class="card-heading"><div><h2 id="hosts-title">Saved backend addresses</h2>
-          <p class="muted">Save an IP address or hostname on this router for quick future checks. See each server’s model names and API addresses using metadata only: no prompts, model loading, or downloads. Listed models may not be loaded; inference is not tested. Saving an address does not add its models to routing.</p>
+          <p class="muted">Save an IP address or hostname to automatically enroll its discovered models for client routing. The router checks saved addresses at startup and every 30 seconds using metadata only: no prompts, model loading, or downloads. Listed models may not be loaded; inference is not tested. Only the addresses you save are checked, not whole subnets.</p>
+          <p class="muted">Remove stops checks for that address and removes routes owned only by it. Explicitly configured routes are preserved.</p>
         </div></div>
         <form id="host-form" class="host-form" autocomplete="off">
           <label for="host-address">IP address, hostname, or backend URL</label>
           <div class="key-controls"><input id="host-address" name="backend-address" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="256" placeholder="192.168.194.0" required aria-describedby="host-help hosts-message">
-            <button id="host-save-button" type="submit" class="primary">Save &amp; check</button></div>
+            <button id="host-save-button" type="submit" class="primary">Save &amp; enable routing</button></div>
           <p id="host-help" class="muted">A bare IP address or hostname checks Ollama on 11434 and LM Studio on 1234. A URL checks only its own port, for example http://192.168.194.0:1234/v1. Do not include passwords or API keys.</p>
         </form>
         <div class="hosts-toolbar"><p id="hosts-message" class="muted" role="status">Unlock details to manage saved addresses.</p>
@@ -134,8 +135,8 @@ _STATUS_HTML = """<!doctype html>
       </div>
       <div id="setup-help" class="help-box" hidden>
         <h3>No usable model yet</h3>
-        <p>Start Ollama or LM Studio, download or load a chat model, and add its address to
-        <code>LLM_ROUTER_DISCOVERY_URLS</code> in <code>router.env</code>. Restart the router after changing settings.
+        <p>Start Ollama or LM Studio, make a chat model available, and save its IP address above to enroll discovered models automatically.
+        You can also explicitly configure backends using <code>LLM_ROUTER_DISCOVERY_URLS</code> in <code>router.env</code> and restart the router.
         If a backend is offline, check its address, firewall, and VPN connection.</p>
       </div>
 
@@ -177,7 +178,7 @@ _STATUS_HTML = """<!doctype html>
     </section>
     <noscript><p class="help-box">Enable JavaScript to view live status. The JSON readiness endpoint is <a href="/healthz">/healthz</a>.</p></noscript>
   </main>
-  <footer><p>Status refreshes every 10 seconds · metadata checks run only when requested · metadata checks do not prove inference works</p></footer>
+  <footer><p>Status refreshes every 10 seconds · saved backends are rechecked every 30 seconds · self-tests run only on click · metadata checks do not prove inference works</p></footer>
 </body>
 </html>
 """
@@ -198,6 +199,7 @@ main{max-width:1208px;margin:auto;padding:38px 24px 24px}.heading,.section-headi
 .host-check{padding:14px;border:1px solid var(--line);border-radius:8px;background:#fafcfe}.host-check-heading{display:flex;align-items:center;flex-wrap:wrap;gap:5px}.host-check p{margin-top:7px}.host-check .host-api-address{display:block;font-size:12px;overflow-wrap:anywhere}.host-catalog{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}.host-catalog h3{font-size:13px;margin-bottom:5px}.host-catalog .catalog-warning{color:var(--amber)}.host-model-table{margin-top:10px;table-layout:fixed}.host-model-table th,.host-model-table td{padding:8px 10px;max-width:none;overflow-wrap:anywhere}.host-model-table th{white-space:normal}.host-model-table td{background:var(--surface)}.host-model-table th:first-child{width:43%}#hosts-results>table>thead>tr>th:nth-child(2){width:55%}#hosts-results>table>tbody>tr>td:nth-child(2){min-width:330px;max-width:none}
 .public-summary-counts{display:grid;grid-template-columns:1fr 1fr 1.6fr;gap:18px;padding:0 22px 16px}.public-summary-counts strong{display:block;font-size:20px;line-height:1.5;overflow-wrap:anywhere}.public-summary-counts>div:last-child strong{font-size:15px}.public-summary>p{padding:0 22px 19px}
 .performance-message{padding:0 22px 19px}.performance-message.result-warning{color:var(--amber)}.performance-note{padding:16px 22px;border-top:1px solid var(--line)}.metric-value{display:block;font-weight:650;white-space:nowrap}.metric-detail{display:block;min-width:130px;color:var(--muted);font-size:11px;margin-top:4px}.performance-identity{min-width:180px}.performance-identity .badge{margin-top:7px}.performance-identity code{display:block;margin-top:5px}.slow-load-count{margin-top:9px;font-size:12px}
+.host-routing{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:12px;margin-top:10px}.host-routing .secondary{margin-top:6px}
 @media(max-width:800px){.self-test-heading{align-items:flex-start;flex-direction:column}}
 @media(max-width:600px){.hosts-toolbar{align-items:flex-start;flex-direction:column}.host-form .key-controls{flex-direction:column}}
 @media(max-width:600px){.public-summary-counts{grid-template-columns:1fr 1fr}.public-summary-counts>div:last-child{grid-column:1/-1}}
@@ -396,10 +398,32 @@ STATUS_JS = r"""
   function validHost(item) {
     return item && typeof item.id === "string" && item.id.length > 0 && item.id.length <= 64 &&
       typeof item.address === "string" && item.address.length > 0 && item.address.length <= 256 &&
-      (item.checked_at === null || typeof item.checked_at === "string") &&
+      (item.checked_at === null || typeof item.checked_at === "string") && validRouting(item.routing) &&
       Array.isArray(item.checks) && item.checks.length <= 8 && item.checks.every(check => check &&
         ["pass", "fail"].includes(check.status) && typeof check.provider === "string" &&
         typeof check.base_url === "string" && typeof check.detail === "string" && validCatalog(check));
+  }
+  function validRouting(routing) {
+    return routing === undefined || (routing && ["active", "offline", "empty", "pending", "error", "managed"].includes(routing.status) &&
+      Number.isSafeInteger(routing.model_count) && routing.model_count >= 0 && typeof routing.detail === "string");
+  }
+  function hostRouting(routing) {
+    const result = document.createElement("div");
+    result.className = "host-routing";
+    const states = {active: ["Routing enabled", "ready"], offline: ["Backend offline", "warning"], empty: ["No models enrolled", "warning"], pending: ["Enrollment pending", "neutral"], error: ["Enrollment needs attention", "error"], managed: ["Explicitly configured", "neutral"]};
+    if (!routing) {
+      result.append(badge("Routing status unavailable", "neutral"));
+      return result;
+    }
+    const state = states[routing.status];
+    result.append(badge(state[0], state[1]));
+    for (const value of [`Known routing models: ${routing.model_count}`, routing.detail]) {
+      const detail = document.createElement("span");
+      detail.className = "secondary";
+      detail.textContent = value;
+      result.append(detail);
+    }
+    return result;
   }
   function validCatalog(check) {
     // Cached checks from an older router version do not include a catalog.
@@ -496,6 +520,7 @@ STATUS_JS = r"""
   function renderHosts() {
     rows("hosts-body", savedHosts, 4, "No saved addresses. Add a machine above to check its backend ports.", (row, item) => {
       cell(row, item.address, null, "address");
+      row.children[0].append(hostRouting(item.routing));
       const results = document.createElement("div");
       if (!item.checks.length) results.textContent = "Not checked in this router session";
       for (const check of item.checks) {
@@ -541,10 +566,10 @@ STATUS_JS = r"""
     const controller = new AbortController();
     activeHosts = controller;
     hostsLoaded = true;
-    let addressSaved = false;
-    if (action === "check") savedHosts = savedHosts.map(item => !id || item.id === id ? {...item, checked_at: null, checks: []} : item);
+    let refreshRouting = false;
+    if (action === "check") savedHosts = savedHosts.map(item => !id || item.id === id ? {...item, checked_at: null, checks: [], routing: {status: "pending", model_count: item.routing ? item.routing.model_count : 0, detail: "Checking metadata and refreshing routing enrollment."}} : item);
     renderHosts();
-    hostMessage(action === "load" ? "Loading saved addresses…" : action === "remove" ? "Removing saved address…" : action === "save" ? "Saving address, then checking metadata…" : "Checking saved addresses… No models are being used.");
+    hostMessage(action === "load" ? "Loading saved addresses…" : action === "remove" ? "Removing saved address and its automatically managed routes…" : action === "save" ? "Saving address, checking metadata, and enabling discovered routes…" : "Checking saved addresses and updating routing… No models are being used.");
     const timeout = setTimeout(() => controller.abort(), 15000);
     const request = async (path, method = "GET", body) => {
       const headers = {Accept: "application/json", Authorization: `Bearer ${apiKey}`};
@@ -570,32 +595,37 @@ STATUS_JS = r"""
         const data = await request("/status/hosts");
         savedHosts = validatedHosts(data);
         if (Number.isInteger(data.limit) && data.limit > 0 && data.limit <= 16) hostsLimit = data.limit;
-        hostMessage(`${savedHosts.length} / ${hostsLimit} addresses saved on this router. Checks run only when requested; results reset when the router restarts.`);
+        hostMessage(`${savedHosts.length} / ${hostsLimit} addresses saved on this router. Metadata and routing are rechecked at startup and every 30 seconds. This list shows the latest cached results.`);
       } else if (action === "remove") {
         const data = await request(`/status/hosts/${encodeURIComponent(id)}`, "DELETE");
         if (!data || data.removed !== true) throw new Error("invalid-hosts-response");
         savedHosts = savedHosts.filter(item => item.id !== id);
-        hostMessage("Address removed from future saved checks. Backend and router settings are unchanged.");
+        hostMessage("Address removed from future saved checks and its automatically managed routes. Explicitly configured routes are preserved.");
+        refreshRouting = true;
       } else {
+        let checked;
         if (action === "save") {
           const data = await request("/status/hosts", "POST", {address});
           if (!data || !validHost(data.host)) throw new Error("invalid-hosts-response");
           const existing = savedHosts.findIndex(item => item.id === data.host.id);
           if (existing >= 0) savedHosts[existing] = data.host;
           else savedHosts.push(data.host);
-          addressSaved = true;
-          id = data.host.id;
           el("host-address").value = "";
-          renderHosts();
-        }
-        const checked = validatedHosts(await request("/status/hosts/check", "POST", id ? {id} : {}));
-        if (!id) savedHosts = checked;
-        else {
-          if (checked.length !== 1 || checked[0].id !== id) throw new Error("invalid-hosts-response");
-          savedHosts = savedHosts.map(item => item.id === id ? checked[0] : item);
+          checked = [data.host];
+        } else {
+          checked = validatedHosts(await request("/status/hosts/check", "POST", id ? {id} : {}));
+          if (!id) savedHosts = checked;
+          else {
+            if (checked.length !== 1 || checked[0].id !== id) throw new Error("invalid-hosts-response");
+            savedHosts = savedHosts.map(item => item.id === id ? checked[0] : item);
+          }
         }
         const found = checked.reduce((total, item) => total + item.checks.filter(check => check.status === "pass").length, 0);
-        hostMessage(`${addressSaved ? "Address saved. " : ""}Check complete: ${found} backend API${found === 1 ? "" : "s"} found. Metadata only; no models were used.`, found ? "pass" : "");
+        const active = checked.some(item => item.routing && item.routing.status === "active");
+        const pending = checked.some(item => item.routing && item.routing.status === "pending");
+        const error = checked.some(item => item.routing && item.routing.status === "error");
+        hostMessage(`${action === "save" ? "Address saved. " : "Check complete. "}${found} backend API${found === 1 ? "" : "s"} found. ${pending ? "Enrollment is pending; an automatic check is queued. " : ""}See each address’s routing status below. Metadata only; no models were used.`, error ? "fail" : active ? "pass" : "");
+        refreshRouting = true;
       }
     } catch (error) {
       if (currentGeneration !== hostsGeneration) return;
@@ -614,12 +644,16 @@ STATUS_JS = r"""
         429: "Checks are busy or were requested too recently. Wait a moment, then try again.",
         503: "Saved-address storage or checks are unavailable. Check that the service account can access its saved-address file and configuration directory, then retry.",
       };
-      hostMessage(`${addressSaved ? "Address saved, but its check did not complete. " : ""}${messages[error.httpStatus] || "The request timed out, the connection failed, or the response was invalid. Reload saved addresses to confirm any changes before retrying."}`, "fail");
+      hostMessage(messages[error.httpStatus] || "The request timed out, the connection failed, or the response was invalid. Reload saved addresses to confirm any changes before retrying.", "fail");
     } finally {
       clearTimeout(timeout);
       if (currentGeneration === hostsGeneration) {
         activeHosts = null;
         renderHosts();
+        if (refreshRouting) {
+          cancelRefresh();
+          refresh();
+        }
       }
     }
   }
@@ -926,6 +960,8 @@ STATUS_JS = r"""
   authControls(apiKey ? "Checking your URL key…" : undefined);
   refresh();
   let timer = setInterval(refresh, 10000);
+  const reloadSavedSnapshot = () => { if (!el("host-address").value.trim()) hostOperation("load"); };
+  let hostsTimer = setInterval(reloadSavedSnapshot, 30000);
   window.addEventListener("hashchange", () => {
     // Same-page fragment navigation does not rerun this script. Scrub a newly
     // supplied key before deciding whether to unlock; ordinary anchors are inert.
@@ -942,12 +978,14 @@ STATUS_JS = r"""
     text("checked-at", "No current snapshot");
     health("pending", "Checking router…", "Waiting for a fresh status snapshot.", "Checking…", "Checking…");
     clearInterval(timer);
+    clearInterval(hostsTimer);
   });
   window.addEventListener("pageshow", (event) => {
     pageActive = true;
     if (!event.persisted) return;
     refresh();
     timer = setInterval(refresh, 10000);
+    hostsTimer = setInterval(reloadSavedSnapshot, 30000);
   });
 })();
 """

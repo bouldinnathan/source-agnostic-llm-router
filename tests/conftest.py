@@ -35,6 +35,9 @@ def restricted_environment_thread_wakeups(request, monkeypatch):  # type: ignore
 def isolated_passive_metrics(monkeypatch, tmp_path):  # type: ignore[no-untyped-def]
     """Tests must never read or append to an operator's real metrics database."""
     monkeypatch.setenv("LLM_ROUTER_METRICS_FILE", str(tmp_path / "performance" / "metrics.sqlite3"))
+    monkeypatch.setenv("LLM_ROUTER_SAVED_HOSTS_FILE", str(tmp_path / "saved-hosts" / "saved-hosts.json"))
+    monkeypatch.delenv("LLM_ROUTER_CONFIG", raising=False)
+    monkeypatch.setattr("llm_router.bootstrap.DEFAULT_CONFIG_LOCATIONS", ())
 
 
 def make_config(

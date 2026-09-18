@@ -48,11 +48,12 @@ class RuntimeRegistry:
         return state is None or state.reachable is not False
 
     def record_endpoint_probe(
-        self, endpoint: str, reachable: bool | None, error: str | None = None
+        self, endpoint: str, reachable: bool | None, error: str | None = None,
+        *, checked_at: float | None = None,
     ) -> None:
         state = self._endpoint_states.setdefault(endpoint, EndpointState())
         state.reachable = reachable
-        state.last_checked_at = time.time() if reachable is not None else None
+        state.last_checked_at = (time.time() if checked_at is None else checked_at) if reachable is not None else None
         state.last_error = error
 
     def begin(self, deployment: str) -> None:

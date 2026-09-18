@@ -40,7 +40,7 @@ def test_saved_lm_studio_address_is_fast_model_free_and_survives_restart(tmp_pat
         raise AssertionError("Saved address checks must not refresh, provision, or use a model")
 
     monkeypatch.setattr(gateway_module, "check_saved_host", checked)
-    for method in ("refresh", "router", "provision", "check_health"):
+    for method in ("provision", "check_health"):
         monkeypatch.setattr(RouterGateway, method, forbidden)
     headers = {"Authorization": "Bearer router-private-test-key", "X-LLM-Router-Hosts": "1"}
 
@@ -50,16 +50,14 @@ def test_saved_lm_studio_address_is_fast_model_free_and_survives_restart(tmp_pat
             saved = await client.post("/status/hosts", json={"address": "192.168.194.0"})
             assert saved.status_code == 201
             identifier = saved.json()["host"]["id"]
-            assert observed == []
-            checked_response = await client.post("/status/hosts/check", json={"id": identifier})
-            assert checked_response.status_code == 200
-            result = checked_response.json()["hosts"][0]
+            result = saved.json()["host"]
             assert result["checked_at"]
             assert [probe["status"] for probe in result["checks"]] == ["fail", "pass"]
             assert result["checks"][1]["base_url"] == "http://192.168.194.0:1234/v1"
             assert result["checks"][1]["catalog_status"] == "ok"
             assert result["checks"][1]["model_count"] == 0
             assert result["checks"][1]["models"] == []
+            assert result["routing"]["status"] == "empty"
             assert len(observed) == 3
             cached = await client.get("/status/hosts")
             assert cached.json()["hosts"] == [result]
@@ -68,7 +66,10 @@ def test_saved_lm_studio_address_is_fast_model_free_and_survives_restart(tmp_pat
         restarted = create_app(gateway=RouterGateway(discovery=False), saved_host_store=SavedHostStore(path))
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=restarted), base_url="http://router.test", headers=headers) as client:
             restored = (await client.get("/status/hosts")).json()["hosts"]
-            assert restored == [{"id": identifier, "address": "192.168.194.0", "checked_at": None, "checks": []}]
+            assert restored[0]["id"] == identifier
+            assert restored[0]["address"] == "192.168.194.0"
+            assert restored[0]["checked_at"] is None
+            assert restored[0]["routing"]["status"] == "pending"
             assert len(observed) == 3
             removed = await client.delete(f"/status/hosts/{identifier}")
             assert removed.status_code == 200
@@ -112,7 +113,7 @@ def test_saved_ollama_ip_lists_model_ids_and_addresses_without_inference(tmp_pat
         raise AssertionError("Reading model catalogs must not use models, discovery or provisioning")
 
     monkeypatch.setattr(gateway_module, "check_saved_host", checked)
-    for method in ("refresh", "router", "provision", "check_health"):
+    for method in ("provision", "check_health"):
         monkeypatch.setattr(RouterGateway, method, forbidden)
     headers = {"Authorization": "Bearer catalog-private-test-key", "X-LLM-Router-Hosts": "1"}
 
@@ -124,10 +125,7 @@ def test_saved_ollama_ip_lists_model_ids_and_addresses_without_inference(tmp_pat
             saved = await client.post("/status/hosts", json={"address": "192.168.42.43:11434"})
             assert saved.status_code == 201
             identifier = saved.json()["host"]["id"]
-            assert observed == []
-            response = await client.post("/status/hosts/check", json={"id": identifier})
-            assert response.status_code == 200
-            row = response.json()["hosts"][0]["checks"][0]
+            row = saved.json()["host"]["checks"][0]
             assert row["status"] == "pass"
             assert row["catalog_status"] == "ok"
             assert row["model_count"] == 2
@@ -135,7 +133,12 @@ def test_saved_ollama_ip_lists_model_ids_and_addresses_without_inference(tmp_pat
             assert {item["id"] for item in row["models"]} == {"qwen3:8b", "nomic-embed-text:latest"}
             assert {item["address"] for item in row["models"]} == {"http://192.168.42.43:11434"}
             assert row["catalog_url"] == "http://192.168.42.43:11434/api/tags"
-            assert gateway._router is None  # A catalog check does not enroll models.
+            assert {model.upstream_model for model in gateway._router.config.models} == {"qwen3:8b"}
+            assert saved.json()["host"]["routing"]["status"] == "active"
+            tags = await client.get("/api/tags")
+            assert tags.status_code == 200
+            assert "qwen3-8b-ha" in {model["name"] for model in tags.json()["models"]}
+            assert "nomic-embed-text-latest-ha" not in {model["name"] for model in tags.json()["models"]}
             assert {request.url.path for request in observed} == {"/api/version", "/api/tags", "/v1/models"}
             assert len(observed) == 3
             cached = (await client.get("/status/hosts")).json()["hosts"][0]["checks"][0]
@@ -153,6 +156,9 @@ def test_saved_ollama_ip_lists_model_ids_and_addresses_without_inference(tmp_pat
             assert row["catalog_status"] == "error"
             assert row["model_count"] is None
             assert row["models"] == []
+            assert response.json()["hosts"][0]["routing"]["status"] == "offline"
+            assert len(gateway._router.config.models) == 1
+            assert not gateway._router.runtime.endpoint_available(gateway._router.config.models[0].endpoint)
             assert "private backend diagnostics" not in response.text
             assert "catalog-private-test-key" not in response.text
             assert len(observed) == 6

@@ -80,7 +80,7 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
     AbortController,
     setTimeout: callback => { const id = ++timerId; timeouts.set(id, callback); return id; },
     clearTimeout: id => timeouts.delete(id),
-    setInterval: callback => { const id = ++timerId; intervals.set(id, callback); return id; },
+    setInterval: (callback, delay) => { const id = ++timerId; intervals.set(id, {callback, delay}); return id; },
     clearInterval: id => intervals.delete(id),
     fetch: (url, options) => new Promise((resolve, reject) => {
       timeline.push("fetch");
@@ -110,7 +110,7 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
   vm.runInNewContext(script, context);
   return {
     element, requests, hostRequests, allRequests, timeouts, historyCalls, timeline, location,
-    tick: () => { for (const callback of Array.from(intervals.values())) callback(); },
+    tick: (delay = 10000) => { for (const timer of Array.from(intervals.values())) if (timer.delay === delay) timer.callback(); },
     enterKey: key => {
       element("api-key").value = key;
       element("key-form").events.submit({preventDefault() {}});
@@ -311,7 +311,7 @@ async function timeoutAndPageRestore() {
   assert.equal(locked.element("key-form").hidden, false);
   assert.equal(locked.intervalCount(), 0);
   locked.event("pageshow", {persisted: true});
-  assert.equal(locked.intervalCount(), 1);
+  assert.equal(locked.intervalCount(), 2);
   assert.equal(locked.requests[2].url, "/healthz");
   assert.equal(locked.requests[2].options.headers.Authorization, undefined);
 }
@@ -503,6 +503,7 @@ function savedHost(id = "host-one", checked = false) {
   return {
     id, address: "192.168.194.0", checked_at: checked ? "2026-09-16T12:00:00Z" : null,
     checks: checked ? [{provider: "LM Studio / OpenAI-compatible", base_url: "http://192.168.194.0:1234/v1", status: "pass", detail: "Models metadata is reachable", http_status: 200, elapsed_ms: 12.3}] : [],
+    routing: {status: checked ? "active" : "pending", model_count: checked ? 1 : 0, detail: checked ? "Models are enrolled for routing." : "Waiting for the next metadata check."},
   };
 }
 
@@ -533,17 +534,17 @@ async function savedHostLifecycle() {
   app.checkHosts();
   app.reloadHosts();
   assert.equal(app.hostRequests.length, pendingCount, "Only one host operation can be in flight");
-  await reply(save, 200, {host: savedHost()});
-  const check = app.hostRequests.at(-1);
-  assert.equal(check.url, "/status/hosts/check");
-  assert.deepEqual(JSON.parse(check.options.body), {id: "host-one"});
-  assert.equal(app.element("host-address").value, "");
   const found = savedHost("host-one", true);
   found.checks.push({provider: "Ollama", base_url: "http://192.168.194.0:11434", status: "fail", detail: "Connection unavailable", http_status: null, elapsed_ms: 1500});
-  await reply(check, 200, {hosts: [found]});
+  await reply(save, 201, {host: found});
+  assert.equal(app.hostRequests.length, pendingCount, "Save already checks/enrolls; the browser must not send a second check POST");
+  assert.equal(app.element("host-address").value, "");
+  assert.equal(app.requests.at(-1).url, "/status/data", "Enrollment must refresh the router's model catalog");
+  await reply(app.requests.at(-1), 200, snapshot());
   assert.equal(app.element("host-save-button").disabled, false);
   assert.equal(app.element("hosts-check-button").disabled, false);
   assert.match(app.element("hosts-message").textContent, /Address saved.*1 backend API found/);
+  assert.match(app.element("hosts-body").textContent, /Routing enabled/);
   assert.match(app.element("hosts-body").textContent, /LM Studio \/ OpenAI-compatible Found/);
   assert.match(app.element("hosts-body").textContent, /Ollama Not confirmed/);
   assert.match(app.element("hosts-body").textContent, /12 ms/);
@@ -562,9 +563,11 @@ async function savedHostLifecycle() {
   await reply(app.requests.at(-1), 200, snapshot());
   assert.equal(app.hostRequests.at(-1).options.signal.aborted, false, "Status refresh must not interrupt explicit checks");
   await reply(app.hostRequests.at(-1), 200, {hosts: [found]});
+  await reply(app.requests.at(-1), 200, snapshot());
   app.hostAction(0, 0);
   assert.deepEqual(JSON.parse(app.hostRequests.at(-1).options.body), {id: "host-one"});
   await reply(app.hostRequests.at(-1), 200, {hosts: [found]});
+  await reply(app.requests.at(-1), 200, snapshot());
   app.hostAction(0, 1);
   assert.equal(app.hostRequests.at(-1).url, "/status/hosts/host-one");
   assert.equal(app.hostRequests.at(-1).options.method, "DELETE");
@@ -572,6 +575,8 @@ async function savedHostLifecycle() {
   await reply(app.hostRequests.at(-1), 200, {removed: true});
   assert.match(app.element("hosts-body").textContent, /No saved addresses/);
   assert.match(app.element("hosts-message").textContent, /Address removed/);
+  assert.match(app.element("hosts-message").textContent, /Explicitly configured routes are preserved/);
+  assert.equal(app.requests.at(-1).url, "/status/data", "Removal must refresh the router's model catalog");
 }
 
 async function savedHostsRestoreAndRequireAuthentication() {
@@ -602,7 +607,9 @@ async function savedHostsRestoreAndRequireAuthentication() {
     assert.equal(app.element("host-save-button").disabled, true, "Save disabled at the server-provided limit");
     assert.match(app.element("hosts-message").textContent, /1 \/ 1 addresses/);
   }
-  assert.match(markup, /Saving an address does not add its models to routing/);
+  assert.match(markup, /automatically enroll its discovered models for client routing/);
+  assert.match(markup, /at startup and every 30 seconds/);
+  assert.match(markup, /not whole subnets/);
   assert.doesNotMatch(markup, /Read-only dashboard/);
   assert.match(markup, /no prompts, model loading, or downloads/);
 }
@@ -617,13 +624,12 @@ async function savedHostFailuresAndSafeRendering() {
     assert.equal(app.element("host-save-button").disabled, false);
     assert.equal(app.element("host-address").value, "invalid-address");
   }
-  const failedCheck = await unlockedHosts();
-  failedCheck.saveHost("192.168.194.0");
-  await reply(failedCheck.hostRequests.at(-1), 200, {host: savedHost()});
-  await reply(failedCheck.hostRequests.at(-1), 429, {});
-  assert.match(failedCheck.element("hosts-message").textContent, /Address saved, but its check did not complete/);
-  assert.match(failedCheck.element("hosts-body").textContent, /192\.168\.194\.0/);
-  assert.equal(failedCheck.element("hosts-check-button").disabled, false);
+  const pendingCheck = await unlockedHosts();
+  pendingCheck.saveHost("192.168.194.0");
+  await reply(pendingCheck.hostRequests.at(-1), 201, {host: savedHost()});
+  assert.match(pendingCheck.element("hosts-message").textContent, /Address saved.*Enrollment is pending/);
+  assert.match(pendingCheck.element("hosts-body").textContent, /192\.168\.194\.0/);
+  assert.equal(pendingCheck.element("hosts-check-button").disabled, false);
 
   const app = await unlockedHosts();
   const unsafe = savedHost("unsafe/id?redirect=other", true);
@@ -1271,8 +1277,136 @@ async function performanceLateBodyAndNewSessionGuards() {
   assert.equal(app.element("performance-body").textContent, "", "Delayed JSON parsing must not expose old authenticated metrics");
 }
 
+async function savedHostRoutingStatesAndSafeDetails() {
+  const labels = {active: "Routing enabled", offline: "Backend offline", empty: "No models enrolled", pending: "Enrollment pending", error: "Enrollment needs attention", managed: "Explicitly configured"};
+  for (const [status, label] of Object.entries(labels)) {
+    const host = savedHost("host-one", true);
+    host.routing = {status, model_count: status === "empty" ? 0 : 2, detail: '<img src=x onerror="alert(1)">'};
+    const app = await unlockedHosts([host]);
+    const routing = descendants(app.element("hosts-body"), "host-routing")[0];
+    assert.equal(routing.children[0].textContent, label);
+    assert.equal(routing.children[1].textContent, `Known routing models: ${host.routing.model_count}`);
+    assert.equal(routing.children[2]._text, host.routing.detail);
+    assert.equal(routing.children[2].children.length, 0, "Routing details must remain escaped text");
+    if (status !== "active") assert.doesNotMatch(routing.children[0].className, /badge-ready/, "Only active enrollment may use a ready badge");
+  }
+  const legacy = savedHost("legacy-host", true);
+  delete legacy.routing;
+  const app = await unlockedHosts([legacy]);
+  assert.match(app.element("hosts-body").textContent, /Routing status unavailable/);
+  assert.doesNotMatch(app.element("hosts-body").textContent, /Routing enabled/);
+  for (const routing of [null, {status: "constructor", model_count: 1, detail: "no"}, {status: "active", model_count: -1, detail: "no"}, {status: "active", model_count: 1, detail: {unsafe: true}}]) {
+    app.reloadHosts();
+    await reply(app.hostRequests.at(-1), 200, {hosts: [{...savedHost(), routing}], limit: 16});
+    assert.match(app.element("hosts-message").textContent, /response was invalid/);
+    assert.doesNotMatch(app.element("hosts-body").textContent, /Routing enabled/);
+  }
+}
+
+async function savedHostSaveEnrollmentAndRouterRefresh() {
+  for (const status of ["active", "pending", "offline", "empty", "error", "managed"]) {
+    const app = await unlockedHosts();
+    app.tick();
+    const stale = app.requests.at(-1);
+    app.saveHost("192.168.194.0");
+    const saved = savedHost("host-one", status !== "pending");
+    saved.routing = {status, model_count: status === "empty" ? 0 : 1, detail: "Saved routing metadata."};
+    const previousHostRequests = app.hostRequests.length;
+    await reply(app.hostRequests.at(-1), 201, {host: saved});
+    assert.equal(app.hostRequests.length, previousHostRequests, "Single save response replaces the former save-plus-check sequence");
+    assert.equal(app.hostRequests.some(request => request.url === "/status/hosts/check"), false);
+    assert.equal(stale.options.signal.aborted, true, "Enrollment must invalidate a pre-save router snapshot");
+    assert.equal(app.requests.at(-1).url, "/status/data");
+    assert.equal(app.requests.at(-1).options.headers.Authorization, "Bearer secret-key");
+    assert.equal(app.element("host-address").value, "");
+    assert.match(app.element("hosts-message").textContent, /Address saved/);
+    if (status === "pending") assert.match(app.element("hosts-message").textContent, /Enrollment is pending; an automatic check is queued/);
+    if (status === "error") assert.equal(app.element("hosts-message").className, "muted result-fail");
+    const fresh = snapshot();
+    fresh.counts.endpoints = 4;
+    fresh.models[0].name = "newly-enrolled-model";
+    await reply(app.requests.at(-1), 200, fresh);
+    await reply(stale, 200, snapshot());
+    assert.equal(app.element("count-endpoints").textContent, "4");
+    assert.match(app.element("models-body").textContent, /newly-enrolled-model/);
+    assert.equal(app.hostRequests.length, previousHostRequests, "Router refresh must not duplicate save probes");
+  }
+}
+
+async function savedHostSnapshotPollingIsAuthenticatedAndReadOnly() {
+  const locked = harness();
+  locked.tick(30000);
+  assert.equal(locked.hostRequests.length, 0);
+  const noKey = await unlocked(false);
+  noKey.tick(30000);
+  assert.equal(noKey.hostRequests.length, 0);
+  const app = await unlockedHosts([savedHost("host-one", true)]);
+  const oldHostCount = app.hostRequests.length;
+  const oldRouterCount = app.requests.length;
+  app.tick(30000);
+  assert.equal(app.hostRequests.length, oldHostCount + 1);
+  const refresh = app.hostRequests.at(-1);
+  assert.equal(refresh.url, "/status/hosts");
+  assert.equal(refresh.options.method, "GET");
+  assert.equal(refresh.options.body, undefined);
+  assert.equal(refresh.options.headers.Authorization, "Bearer secret-key");
+  app.tick(30000);
+  assert.equal(app.hostRequests.length, oldHostCount + 1, "Saved-list polling cannot overlap itself");
+  const offline = savedHost("host-one", true);
+  offline.routing = {status: "offline", model_count: 1, detail: "The most recent automatic probe failed."};
+  await reply(refresh, 200, {hosts: [offline], limit: 16});
+  assert.match(app.element("hosts-body").textContent, /Backend offline/);
+  assert.equal(app.requests.length, oldRouterCount, "Reading saved routing snapshots must not trigger another detailed refresh");
+  assert.ok(app.allRequests.every(request => request.options.method === "GET"), "Timer callbacks read cached results; they never start backend scans");
+  app.element("host-address").value = "partial-address";
+  app.tick(30000);
+  assert.equal(app.hostRequests.length, oldHostCount + 1, "Background reload must not interrupt address entry");
+  app.element("host-address").value = "";
+  app.tick(30000);
+  const pending = app.hostRequests.at(-1);
+  app.lock();
+  assert.equal(pending.options.signal.aborted, true);
+  await reply(pending, 200, {hosts: [savedHost("host-one", true)], limit: 16});
+  assert.equal(app.element("hosts-body").textContent, "");
+  const lockedCount = app.hostRequests.length;
+  app.tick(30000);
+  assert.equal(app.hostRequests.length, lockedCount);
+  app.event("pagehide");
+  assert.equal(app.intervalCount(), 0);
+  app.event("pageshow", {persisted: true});
+  assert.equal(app.intervalCount(), 2);
+  app.tick(30000);
+  assert.equal(app.hostRequests.length, lockedCount, "BFCache restores a locked session without reading saved hosts");
+}
+
+async function savedHostEnrollmentMutationRaceGuards() {
+  for (const action of ["save", "remove"]) {
+    const app = await unlockedHosts([savedHost("host-one", true)]);
+    if (action === "save") app.saveHost("second-backend");
+    else app.hostAction(0, 1);
+    const mutation = app.hostRequests.at(-1);
+    app.lock();
+    const publicRequest = app.requests.at(-1);
+    await reply(mutation, 200, action === "save" ? {host: savedHost("host-two", true)} : {removed: true});
+    assert.equal(app.requests.at(-1), publicRequest, "Late enrollment/removal must not start a new authenticated refresh");
+    assert.equal(app.element("hosts-body").textContent, "");
+    assert.equal(app.element("details").hidden, true);
+  }
+  const deferred = await unlockedHosts();
+  deferred.saveHost("new-backend");
+  let resolveBody;
+  deferred.hostRequests.at(-1).resolve({status: 201, ok: true, json: () => new Promise(resolve => { resolveBody = resolve; })});
+  await flush();
+  deferred.enterKey("new-key");
+  const newKeyRequest = deferred.requests.at(-1);
+  resolveBody({host: savedHost("host-one", true)});
+  await flush();
+  assert.equal(deferred.requests.at(-1), newKeyRequest);
+  assert.equal(deferred.element("hosts-body").textContent, "", "Late save JSON may not expose enrollment under a different key");
+}
+
 (async () => {
-  for (const test of [publicReadiness, topbarVersionTracksCurrentSnapshot, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession, performanceIsPassiveAndPerDeployment, performanceUnknownZeroAndMissingTimings, performanceEmptyOlderAndUnavailableStorage, performanceEscapingAndPrivateStateClearing, performanceLateBodyAndNewSessionGuards]) {
+  for (const test of [publicReadiness, topbarVersionTracksCurrentSnapshot, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession, performanceIsPassiveAndPerDeployment, performanceUnknownZeroAndMissingTimings, performanceEmptyOlderAndUnavailableStorage, performanceEscapingAndPrivateStateClearing, performanceLateBodyAndNewSessionGuards, savedHostRoutingStatesAndSafeDetails, savedHostSaveEnrollmentAndRouterRefresh, savedHostSnapshotPollingIsAuthenticatedAndReadOnly, savedHostEnrollmentMutationRaceGuards]) {
     await test();
     console.log(`PASS ${test.name}`);
   }

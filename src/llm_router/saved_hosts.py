@@ -1,7 +1,9 @@
 """Private saved addresses and short, metadata-only server checks.
 
 An address is an explicit administrator-supplied destination, not a subnet or
-scan range. These checks never enroll a backend or invoke/load a model.
+scan range. These checks never enroll a backend or invoke/load a model themselves;
+their caller may enroll the returned, validated catalogs. Recognizable router
+proxies are blocked to prevent recursive routing through saved addresses.
 """
 
 from __future__ import annotations
@@ -388,6 +390,37 @@ def _catalog_result(response: dict, *, ollama: bool, base_url: str, catalog_url:
     return result
 
 
+def _block_router_check(check: dict) -> dict:
+    detail = (
+        "This address exposes an LLM Router proxy, not a model server; "
+        "automatic enrollment is blocked to prevent routing loops."
+    )
+    return {
+        **check,
+        "status": "fail",
+        "detail": detail,
+        "enrollment_blocked": True,
+        "catalog_status": "error",
+        "catalog_detail": detail,
+        "models": [],
+        "model_count": None,
+        "models_truncated": False,
+    }
+
+
+def _router_owned_catalog(payload: object) -> bool:
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return False
+    # Inspect the entire bounded response, including entries past the display
+    # limit. Do not return ownership metadata or backend-supplied diagnostics.
+    return any(
+        isinstance(item, dict)
+        and isinstance(item.get("owned_by"), str)
+        and item["owned_by"].strip().lower() == "llm-router"
+        for item in payload["data"]
+    )
+
+
 async def _check_ollama(origin: str, *, transport: httpx.AsyncBaseTransport | None) -> dict:
     version_response, catalog_response = await asyncio.gather(
         _metadata_request(origin, "/api/version", transport=transport),
@@ -409,7 +442,7 @@ async def _check_ollama(origin: str, *, transport: httpx.AsyncBaseTransport | No
     else:
         detail = version_response["detail"]
     chosen_response = version_response if version_ok or not catalog_ok else catalog_response
-    return {
+    result = {
         "provider": "Ollama",
         "base_url": origin,
         "status": "pass" if version_ok or catalog_ok else "fail",
@@ -418,12 +451,15 @@ async def _check_ollama(origin: str, *, transport: httpx.AsyncBaseTransport | No
         "elapsed_ms": max(version_response["elapsed_ms"], catalog_response["elapsed_ms"]),
         **catalog,
     }
+    if version_ok and version.strip().lower().startswith("llm-router-"):
+        return _block_router_check(result)
+    return result
 
 
 async def _check_openai(origin: str, *, transport: httpx.AsyncBaseTransport | None) -> dict:
     response = await _metadata_request(origin, "/v1/models", transport=transport)
     catalog = _catalog_result(response, ollama=False, base_url=origin + "/v1", catalog_url=origin + "/v1/models")
-    return {
+    result = {
         "provider": "LM Studio / OpenAI-compatible",
         "base_url": origin + "/v1",
         "status": "pass" if catalog["catalog_status"] == "ok" else "fail",
@@ -435,6 +471,9 @@ async def _check_openai(origin: str, *, transport: httpx.AsyncBaseTransport | No
         "elapsed_ms": response["elapsed_ms"],
         **catalog,
     }
+    if response["status"] == "pass" and _router_owned_catalog(response["payload"]):
+        return _block_router_check(result)
+    return result
 
 
 async def check_saved_host(entry: Mapping, *, transport: httpx.AsyncBaseTransport | None = None) -> dict:
@@ -449,6 +488,12 @@ async def check_saved_host(entry: Mapping, *, transport: httpx.AsyncBaseTranspor
         _check_ollama(ollama_origin, transport=transport),
         _check_openai(openai_origin, transport=transport),
     )
+    if ollama_origin == openai_origin and any(check.get("enrollment_blocked") is True for check in checks):
+        # An explicit origin can expose both compatibility APIs. Recognizing a
+        # router through either one blocks both, even if the other omits its
+        # marker or returns an empty catalog. Different default ports remain
+        # independent services and must not be blocked just for sharing a host.
+        checks = [_block_router_check(check) for check in checks]
     return {
         "id": entry["id"],
         "address": address,

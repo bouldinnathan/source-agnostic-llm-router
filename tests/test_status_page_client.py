@@ -49,3 +49,7 @@ def test_status_page_client_flows() -> None:
     assert "PASS performanceEmptyOlderAndUnavailableStorage" in result.stdout
     assert "PASS performanceEscapingAndPrivateStateClearing" in result.stdout
     assert "PASS performanceLateBodyAndNewSessionGuards" in result.stdout
+    assert "PASS savedHostRoutingStatesAndSafeDetails" in result.stdout
+    assert "PASS savedHostSaveEnrollmentAndRouterRefresh" in result.stdout
+    assert "PASS savedHostSnapshotPollingIsAuthenticatedAndReadOnly" in result.stdout
+    assert "PASS savedHostEnrollmentMutationRaceGuards" in result.stdout
