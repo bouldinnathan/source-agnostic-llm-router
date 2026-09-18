@@ -66,7 +66,7 @@ class StaticGateway:
     def status(self):  # type: ignore[no-untyped-def]
         return {
             "status": "ready" if self._router else "unavailable",
-            "version": "0.3.0",
+            "version": "0.3.1",
         }
 
 

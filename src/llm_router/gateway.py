@@ -39,7 +39,7 @@ from .saved_discovery import is_saved_endpoint, merge_saved_discovery, saved_hos
 from .self_test import run_backend_checks
 from .status_page import STATUS_CSS, STATUS_JS, render_status_html
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 SAVED_HOST_REFRESH_SECONDS = 30.0
 SAVED_HOST_CHECK_COOLDOWN_SECONDS = 3.0
 VIRTUAL_MODELS: dict[str, str] = {

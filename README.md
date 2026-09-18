@@ -464,7 +464,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.3.0-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.3.1-py3-none-any.whl
 llm-router --json discover
 ```
 
