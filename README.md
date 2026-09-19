@@ -135,6 +135,12 @@ has confirmed that backend; an online API does not by itself prove model inferen
 will succeed. Losing contact with the router marks the display stale instead of
 leaving a green success indicator behind.
 
+Every panel heading is collapsible: click it to hide or show that panel, or use
+**Collapse all** / **Expand all** at the top of the page. Hidden panels keep
+refreshing, and starting a software update reopens the update panel so its
+progress is visible. This view state lives only in the open page; it is never
+written to browser storage or URLs, and a reload or lock shows every panel again.
+
 Enter the **router's** `LLM_ROUTER_GATEWAY_API_KEY` from `router.env` to unlock fleet
 details. This is not an LM Studio/provider token. A key entered in the password
 field is kept only in the page's memory, never added to URLs or browser storage,
@@ -332,6 +338,14 @@ verify that generation would succeed. Embedding models can also appear.
 Non-chat models are displayed but are not enrolled as chat deployments. When
 Ollama exposes both APIs at one address, routing prefers its native API and
 does not create duplicate copies of the models.
+
+One address's server checks (for example Ollama and the OpenAI-compatible API)
+sit side by side on wide screens and stack on narrow ones. Model IDs appear as a
+compact wrapped grid with the API address shown once per server, or beside each
+model if a catalog mixes addresses. **Hide results** shrinks an address to one
+line with its routing status, and each model list folds from its heading. These
+choices survive the 30-second saved-address refresh until the page is locked or
+reloaded.
 
 For example, enter `192.168.42.43:11434` to look for both Ollama and
 OpenAI-compatible APIs on **that IP and that port only**. Each displayed model

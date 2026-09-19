@@ -150,7 +150,7 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
     },
     checkHosts: () => element("hosts-check-button").events.click(),
     reloadHosts: () => element("hosts-reload-button").events.click(),
-    hostAction: (row, button) => element("hosts-body").children[row].children[3].children[0].children[button].events.click(),
+    hostAction: (row, button) => element("hosts-body").children[row].children[0].children[2].children[button].events.click(),
     event: (name, event = {}) => windowEvents[name](event),
     intervalCount: () => intervals.size,
   };
@@ -670,8 +670,8 @@ async function savedHostFailuresAndSafeRendering() {
   app.reloadHosts();
   await reply(app.hostRequests.at(-1), 200, {hosts: [unsafe], limit: 16});
   const row = app.element("hosts-body").children[0];
-  assert.equal(row.children[0]._text, unsafe.address);
-  const check = row.children[1].children[0].children[0];
+  assert.equal(row.children[0].children[0].children[0]._text, unsafe.address);
+  const check = row.children[1].children[0];
   assert.equal(check.children[0].children[0]._text, unsafe.checks[0].provider + " ");
   assert.equal(check.children[1]._text, "API base: " + unsafe.checks[0].base_url);
   assert.ok(check.children[2]._text.startsWith(unsafe.checks[0].detail));
@@ -797,16 +797,20 @@ async function savedHostModelCatalogs() {
   assert.match(body.textContent, /API base: http:\/\/192\.168\.194\.0:11434/);
   assert.match(body.textContent, /Model-list endpoint: http:\/\/192\.168\.194\.0:11434\/api\/tags/);
   assert.match(body.textContent, /Listed models may not be loaded; inference is not tested/);
-  const tables = descendants(body, "host-model-table");
-  assert.equal(tables.length, 2, "Each server needs its own labeled model table");
-  const first = tables[0].children[2].children;
+  const lists = descendants(body, "host-model-list");
+  assert.equal(lists.length, 2, "Each server needs its own labeled model list");
+  assert.equal(lists[0].attributes["aria-label"], "Model IDs reported by LM Studio / OpenAI-compatible");
+  const first = lists[0].children;
   assert.equal(first.length, 2);
-  assert.equal(first[0].children[0].children[0].textContent, "qwen3.5:9b");
-  assert.equal(first[0].children[1].children[0].textContent, "http://192.168.194.0:1234/v1");
-  assert.equal(first[1].children[0].children[0].textContent, "gemma3:12b");
-  assert.equal(tables[1].children[2].children[0].children[1].children[0].textContent, "http://192.168.194.0:11434", "A repeated model on another provider must show that provider's address");
-  assert.equal(tables[0].children[1].children[0].children[0].textContent, "Model ID");
-  assert.equal(tables[0].children[1].children[0].children[1].textContent, "API address");
+  assert.equal(first[0].children[0].tagName, "code");
+  assert.equal(first[0].children[0].textContent, "qwen3.5:9b");
+  assert.equal(first[1].children[0].textContent, "gemma3:12b");
+  assert.equal(first[0].children.length, 1, "A shared address is shown once per server, not repeated on every model");
+  const addresses = descendants(body, "host-models-address");
+  assert.equal(addresses.length, 2);
+  assert.equal(addresses[0]._text, "Models API address: http://192.168.194.0:1234/v1");
+  assert.equal(addresses[1]._text, "Models API address: http://192.168.194.0:11434", "A repeated model on another provider must show that provider's address");
+  assert.equal(descendants(body, "host-checks")[0].children.length, 2, "Both server checks share one results grid for the address");
   const headers = descendants(body, "host-check-heading");
   assert.equal(headers[0].children[0].textContent, "LM Studio / OpenAI-compatible ", "Provider and status need a text-space, not only CSS spacing");
   assert.equal(headers[1].children[1].textContent, "Found");
@@ -814,18 +818,25 @@ async function savedHostModelCatalogs() {
   app.reloadHosts();
   await reply(app.hostRequests.at(-1), 200, {hosts: [unicode], limit: 16});
   assert.ok(body.textContent.includes("😀".repeat(512)), "Model-ID limit must match backend Unicode code points, not UTF-16 units");
+  const mixed = hostWithCatalog({models: [{id: "alpha", address: "http://192.168.194.0:1234/v1"}, {id: "beta", address: "http://192.168.194.0:1235/v1"}]});
+  app.reloadHosts();
+  await reply(app.hostRequests.at(-1), 200, {hosts: [mixed], limit: 16});
+  const entries = descendants(body, "host-model-list")[0].children;
+  assert.equal(entries[0].children[1]._text, "http://192.168.194.0:1234/v1", "Differing addresses stay attached to each model");
+  assert.equal(entries[1].children[1]._text, "http://192.168.194.0:1235/v1");
+  assert.equal(descendants(body, "host-models-address").length, 0);
 }
 
 async function savedHostCatalogEmptyErrorTruncatedAndLegacy() {
   const empty = await unlockedHosts([hostWithCatalog({models: [], model_count: 0})]);
   assert.match(empty.element("hosts-body").textContent, /No models listed by this server/);
-  assert.equal(descendants(empty.element("hosts-body"), "host-model-table").length, 0);
+  assert.equal(descendants(empty.element("hosts-body"), "host-model-list").length, 0);
   assert.doesNotMatch(empty.element("hosts-body").textContent, /unavailable|unknown/);
   const unavailable = await unlockedHosts([hostWithCatalog({catalog_status: "error", catalog_detail: "Model catalog timed out", models: [], model_count: null})]);
   assert.match(unavailable.element("hosts-body").textContent, /OpenAI-compatible Found/);
   assert.match(unavailable.element("hosts-body").textContent, /Model list unavailable; model count is unknown. Model catalog timed out/);
   assert.doesNotMatch(unavailable.element("hosts-body").textContent, /No models listed|0 models/);
-  assert.equal(descendants(unavailable.element("hosts-body"), "host-model-table").length, 0);
+  assert.equal(descendants(unavailable.element("hosts-body"), "host-model-list").length, 0);
   const truncated = await unlockedHosts([hostWithCatalog({model_count: 251, models_truncated: true})]);
   assert.match(truncated.element("hosts-body").textContent, /251 models listed/);
   assert.match(truncated.element("hosts-body").textContent, /Showing 2 of 251 models. The list is truncated/);
@@ -841,10 +852,12 @@ async function savedHostCatalogEscapingAndValidation() {
   });
   const app = await unlockedHosts([hostile]);
   const body = app.element("hosts-body");
-  const row = descendants(body, "host-model-table")[0].children[2].children[0];
-  assert.equal(row.children[0].children[0].tagName, "code");
-  assert.equal(row.children[0].children[0]._text, hostile.checks[0].models[0].id);
-  assert.equal(row.children[1].children[0]._text, hostile.checks[0].models[0].address);
+  const entry = descendants(body, "host-model-list")[0].children[0];
+  assert.equal(entry.children[0].tagName, "code");
+  assert.equal(entry.children[0]._text, hostile.checks[0].models[0].id);
+  const modelsAddress = descendants(body, "host-models-address")[0];
+  assert.equal(modelsAddress._text, "Models API address: javascript:alert(2)");
+  assert.equal(modelsAddress.children.length, 0, "Model addresses must remain inert text, not payload links");
   const source = descendants(body, "host-api-address").at(-1);
   assert.equal(source.tagName, "p");
   assert.equal(source._text, "Model-list endpoint: javascript:alert(1)");
@@ -890,6 +903,79 @@ async function savedHostCatalogStaleAndPrivate() {
   const completed = await unlockedHosts([hostWithCatalog()]);
   completed.event("pagehide");
   assert.equal(completed.element("hosts-body").textContent, "", "Page navigation clears private cached model IDs and addresses");
+}
+
+async function collapsiblePanelsAndSavedHostResults() {
+  for (const id of ["update-panel", "summary-panel", "links-panel", "hosts-panel", "self-test-panel", "backends-panel", "models-panel", "aliases-panel", "performance-panel"]) {
+    const tag = markup.match(new RegExp(`<details\\b[^>]*\\bid="${id}"[^>]*>`));
+    assert.ok(tag && /\bopen\b/.test(tag[0]), `${id} must be a native details panel that starts expanded`);
+  }
+  for (const summary of markup.match(/<summary[\s\S]*?<\/summary>/g)) assert.doesNotMatch(summary, /<(button|a|input)\b/, "Interactive controls inside a summary would also toggle the panel");
+  const app = await unlocked();
+  app.element("collapse-all-button").events.click();
+  for (const id of ["hosts-panel", "update-panel", "performance-panel", "links-panel"]) assert.equal(app.element(id).open, false);
+  app.element("expand-all-button").events.click();
+  assert.equal(app.element("hosts-panel").open, true);
+  app.element("collapse-all-button").events.click();
+  assert.equal(app.element("update-button").disabled, false);
+  app.update();
+  assert.equal(app.element("update-panel").open, true, "Starting an update must reveal its progress panel");
+  assert.equal(app.element("hosts-panel").open, false, "Other collapsed panels stay collapsed");
+  assert.equal(app.allRequests.filter(request => request.options.method !== "GET").length, 1, "Collapsing or expanding panels sends no requests");
+
+  const host = hostWithCatalog();
+  host.checks.push({
+    provider: "Ollama", base_url: "http://192.168.194.0:11434", status: "pass", detail: "Ollama server reachable",
+    http_status: 200, elapsed_ms: 18, catalog_status: "ok", catalog_detail: "Model list is reachable",
+    catalog_url: "http://192.168.194.0:11434/api/tags", model_count: 1, models_truncated: false,
+    models: [{id: "qwen3.5:9b", address: "http://192.168.194.0:11434"}],
+  });
+  const saved = () => ({hosts: [host, savedHost("host-two", true)], limit: 16});
+  const hosts = await unlockedHosts(saved().hosts);
+  const body = hosts.element("hosts-body");
+  assert.equal(body.children.length, 2);
+  assert.equal(body.children[0].children[1].className, "host-checks");
+  assert.equal(body.children[0].children[1].children.length, 2, "Both server checks render in one results grid");
+  const toggle = body.children[0].children[0].children[2].children[2];
+  assert.equal(toggle.textContent, "Hide results");
+  assert.equal(toggle.attributes["aria-expanded"], "true");
+  assert.equal(toggle.attributes["aria-controls"], body.children[0].children[1].id);
+  assert.equal(toggle.disabled, false);
+  hosts.hostAction(0, 2);
+  assert.equal(body.children[0].children[1].hidden, true);
+  assert.equal(toggle.textContent, "Show results");
+  assert.equal(toggle.attributes["aria-expanded"], "false");
+  assert.equal(body.children[1].children[1].hidden, false, "Hiding one address leaves the others expanded");
+  const requestCount = hosts.allRequests.length;
+  hosts.reloadHosts();
+  await reply(hosts.hostRequests.at(-1), 200, saved());
+  assert.equal(body.children[0].children[1].hidden, true, "Hidden results stay hidden when the saved list re-renders");
+  assert.equal(body.children[1].children[1].hidden, false);
+  assert.match(body.children[0].children[0].textContent, /192\.168\.194\.0/, "A hidden address still shows its address and routing state");
+  assert.match(body.children[0].children[0].textContent, /Routing enabled/);
+  hosts.hostAction(0, 2);
+  assert.equal(body.children[0].children[1].hidden, false);
+  const catalogs = descendants(body, "host-catalog");
+  assert.equal(catalogs.length, 3);
+  assert.equal(catalogs[0].tagName, "details");
+  assert.equal(catalogs[0].open, true);
+  assert.equal(catalogs[0].children[0].tagName, "summary");
+  assert.match(catalogs[0].children[0].textContent, /2 models listed by this server/, "The fold heading keeps the model count visible");
+  catalogs[0].open = false;
+  catalogs[0].events.toggle();
+  hosts.reloadHosts();
+  await reply(hosts.hostRequests.at(-1), 200, saved());
+  const rerendered = descendants(body, "host-catalog");
+  assert.equal(rerendered[0].open, false, "A folded model list stays folded across re-renders");
+  assert.equal(rerendered[1].open, true, "Another provider's list on the same address is independent");
+  assert.ok(hosts.allRequests.slice(requestCount).every(request => request.options.method === "GET"), "Folding and unfolding never sends requests");
+  hosts.lock();
+  assert.equal(body.textContent, "");
+  hosts.enterKey("secret-key");
+  await reply(hosts.requests.at(-1), 200, snapshot());
+  await reply(hosts.hostRequests.at(-1), 200, saved());
+  assert.equal(body.children[0].children[1].hidden, false, "Locking forgets per-address view state");
+  assert.equal(descendants(body, "host-catalog")[0].open, true, "Locking forgets folded model lists");
 }
 
 async function publicCachedSummary() {
@@ -1699,7 +1785,7 @@ async function updateStatusValidationAndSafeRendering() {
 }
 
 (async () => {
-  for (const test of [publicReadiness, topbarVersionTracksCurrentSnapshot, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession, performanceIsPassiveAndPerDeployment, performanceUnknownZeroAndMissingTimings, performanceEmptyOlderAndUnavailableStorage, performanceEscapingAndPrivateStateClearing, performanceLateBodyAndNewSessionGuards, savedHostRoutingStatesAndSafeDetails, savedHostSaveEnrollmentAndRouterRefresh, savedHostSnapshotPollingIsAuthenticatedAndReadOnly, savedHostEnrollmentMutationRaceGuards]) {
+  for (const test of [publicReadiness, topbarVersionTracksCurrentSnapshot, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession, performanceIsPassiveAndPerDeployment, performanceUnknownZeroAndMissingTimings, performanceEmptyOlderAndUnavailableStorage, performanceEscapingAndPrivateStateClearing, performanceLateBodyAndNewSessionGuards, savedHostRoutingStatesAndSafeDetails, savedHostSaveEnrollmentAndRouterRefresh, savedHostSnapshotPollingIsAuthenticatedAndReadOnly, savedHostEnrollmentMutationRaceGuards, collapsiblePanelsAndSavedHostResults]) {
     await test();
     console.log(`PASS ${test.name}`);
   }

@@ -34,23 +34,29 @@ _STATUS_HTML = """<!doctype html>
     <section class="heading" aria-labelledby="page-title">
       <div><p class="eyebrow">Your models, one connection</p>
         <h1 id="page-title">Router overview</h1>
-        <p class="muted">A quick check that your gateway and model backends are available.</p>
+        <p class="muted">A quick check that your gateway and model backends are available. Click a panel heading to hide or show it; hidden panels keep refreshing.</p>
       </div>
-      <button id="refresh-button" type="button">Refresh status</button>
+      <div class="heading-actions">
+        <button id="collapse-all-button" type="button">Collapse all</button>
+        <button id="expand-all-button" type="button">Expand all</button>
+        <button id="refresh-button" type="button">Refresh status</button>
+      </div>
     </section>
 
-    <section id="update-panel" class="card update-panel" aria-labelledby="update-title">
-      <h2 id="update-title">Router software updates</h2>
-      <p id="update-warning" class="muted">Check for updates checks official main and automatically installs a newer commit. Installation briefly restarts the router and can interrupt requests. Your API key is required.</p>
-      <p id="update-message" class="muted" role="status">Unlock backend details to enable software updates.</p>
-      <div id="update-details" hidden>
-        <p class="update-stage">Stage: <strong id="update-stage"></strong></p>
-        <progress id="update-progress" aria-label="Router update in progress" hidden></progress>
-        <p id="update-observed" class="muted"></p>
-        <button id="update-refresh-button" type="button">Refresh update status</button>
-        <p class="muted">Status refresh reads the local update job only; it never starts another update.</p>
+    <details id="update-panel" class="card update-panel" open>
+      <summary class="card-summary"><h2 id="update-title">Router software updates</h2></summary>
+      <div class="card-body">
+        <p id="update-warning" class="muted">Check for updates checks official main and automatically installs a newer commit. Installation briefly restarts the router and can interrupt requests. Your API key is required.</p>
+        <p id="update-message" class="muted" role="status">Unlock backend details to enable software updates.</p>
+        <div id="update-details" hidden>
+          <p class="update-stage">Stage: <strong id="update-stage"></strong></p>
+          <progress id="update-progress" aria-label="Router update in progress" hidden></progress>
+          <p id="update-observed" class="muted"></p>
+          <button id="update-refresh-button" type="button">Refresh update status</button>
+          <p class="muted">Status refresh reads the local update job only; it never starts another update.</p>
+        </div>
       </div>
-    </section>
+    </details>
 
     <section id="health-panel" class="health-panel tone-pending" aria-labelledby="health-title" aria-live="polite" aria-atomic="true">
       <span class="health-dot" aria-hidden="true"></span>
@@ -66,18 +72,20 @@ _STATUS_HTML = """<!doctype html>
       <div class="overview-item"><span class="label">Last checked</span><strong id="checked-at">—</strong></div>
     </section>
 
-    <section class="card public-summary" aria-labelledby="public-summary-title">
-      <div class="card-heading"><div><h2 id="public-summary-title">Network summary</h2><p class="muted">Cached counts only; this summary does not include addresses or model names. No network scan or inference runs when this page refreshes.</p></div></div>
+    <details id="summary-panel" class="card public-summary" open>
+      <summary class="card-summary"><h2 id="public-summary-title">Network summary</h2></summary>
+      <div class="card-intro"><p class="muted">Cached counts only; this summary does not include addresses or model names. No network scan or inference runs when this page refreshes.</p></div>
       <div class="public-summary-counts">
         <div><span class="label">Known servers</span><strong id="public-count-servers">Unknown</strong></div>
         <div><span class="label">Listed model copies</span><strong id="public-count-models">Unknown</strong></div>
         <div><span class="label">Last successful metadata check</span><strong id="public-last-verified">Unknown</strong></div>
       </div>
       <p id="public-summary-note" class="muted">Waiting for a current summary. Counts do not prove models are loaded or inference works.</p>
-    </section>
+    </details>
 
-    <section class="card quick-links" aria-labelledby="links-title">
-      <h2 id="links-title">Router links</h2>
+    <details id="links-panel" class="card quick-links" open>
+      <summary class="card-summary"><h2 id="links-title">Router links</h2></summary>
+      <div class="card-body">
       <p class="muted">This router: <code id="router-origin">Current server</code>. Links open in a new tab.</p>
       <nav aria-label="Router API and diagnostic links">
         <a href="/healthz" target="_blank" rel="noopener noreferrer">Health</a>
@@ -90,7 +98,8 @@ _STATUS_HTML = """<!doctype html>
         <a href="/v1/models" target="_blank" rel="noopener noreferrer">OpenAI model list</a>
       </nav>
       <p class="muted">These are API responses, not separate apps. Protected links may show 401 because new tabs do not receive this page’s API key. Model-list links list metadata; they do not run models.</p>
-    </section>
+      </div>
+    </details>
 
     <p id="url-key-message" class="help-box" role="status" hidden></p>
     <section id="auth-section" class="card auth-card" aria-labelledby="auth-title" hidden>
@@ -113,11 +122,12 @@ _STATUS_HTML = """<!doctype html>
 
     <section id="details" aria-label="Backend details" hidden>
       <div class="section-heading"><h2>Backend details</h2></div>
-      <section class="card" aria-labelledby="hosts-title">
-        <div class="card-heading"><div><h2 id="hosts-title">Saved backend addresses</h2>
+      <details id="hosts-panel" class="card" open>
+        <summary class="card-summary"><h2 id="hosts-title">Saved backend addresses</h2></summary>
+        <div class="card-intro">
           <p class="muted">Save an IP address or hostname to automatically enroll its discovered models for client routing. The router checks saved addresses at startup and every 30 seconds using metadata only: no prompts, model loading, or downloads. Listed models may not be loaded; inference is not tested. Only the addresses you save are checked, not whole subnets.</p>
-          <p class="muted">Remove stops checks for that address and removes routes owned only by it. Explicitly configured routes are preserved.</p>
-        </div></div>
+          <p class="muted">Remove stops checks for that address and removes routes owned only by it. Explicitly configured routes are preserved. Server checks for one address sit side by side; Hide results shrinks an address to one line, and each model list folds from its heading.</p>
+        </div>
         <form id="host-form" class="host-form" autocomplete="off">
           <label for="host-address">IP address, hostname, or backend URL</label>
           <div class="key-controls"><input id="host-address" name="backend-address" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="256" placeholder="192.168.194.0" required aria-describedby="host-help hosts-message">
@@ -126,21 +136,18 @@ _STATUS_HTML = """<!doctype html>
         </form>
         <div class="hosts-toolbar"><p id="hosts-message" class="muted" role="status">Unlock details to manage saved addresses.</p>
           <div class="hosts-actions"><button id="hosts-reload-button" type="button">Reload saved</button><button id="hosts-check-button" type="button">Check all saved</button></div></div>
-        <div id="hosts-results" class="table-scroll"><table><caption class="sr-only">Saved addresses and metadata checks</caption>
-          <thead><tr><th scope="col">Saved address</th><th scope="col">Servers and model lists</th><th scope="col">Last checked</th><th scope="col">Actions</th></tr></thead>
-          <tbody id="hosts-body"></tbody>
-        </table></div>
-      </section>
-      <section class="card" aria-labelledby="self-test-title">
-        <div class="card-heading self-test-heading"><div><h2 id="self-test-title">Connection self-test</h2>
-          <p class="muted">Checks router APIs and backend metadata only. Never sends prompts, runs inference, loads models, or downloads anything.</p>
-        </div><button id="self-test-button" type="button">Run self-test (no models)</button></div>
+        <div id="hosts-results" class="host-list"><ul id="hosts-body" class="host-entries" aria-label="Saved addresses and metadata checks"></ul></div>
+      </details>
+      <details id="self-test-panel" class="card" open>
+        <summary class="card-summary"><h2 id="self-test-title">Connection self-test</h2></summary>
+        <div class="card-intro self-test-intro"><p class="muted">Checks router APIs and backend metadata only. Never sends prompts, runs inference, loads models, or downloads anything.</p>
+          <button id="self-test-button" type="button">Run self-test (no models)</button></div>
         <p id="self-test-message" class="self-test-message muted" role="status">Runs only when you click. No self-test has been run in this page.</p>
         <div id="self-test-results" class="table-scroll" hidden><table><caption class="sr-only">Connection self-test results</caption>
           <thead><tr><th scope="col">Check / target</th><th scope="col">Result</th><th scope="col">Detail</th><th scope="col">Time</th></tr></thead>
           <tbody id="self-test-body"></tbody>
         </table></div>
-      </section>
+      </details>
       <div class="stats" aria-label="Backend counts">
         <div class="stat"><span class="label">Known backends</span><strong id="count-endpoints">—</strong></div>
         <div class="stat"><span class="label">Backends online</span><strong id="count-online">—</strong></div>
@@ -154,40 +161,42 @@ _STATUS_HTML = """<!doctype html>
         If a backend is offline, check its address, firewall, and VPN connection.</p>
       </div>
 
-      <section class="card" aria-labelledby="backends-title">
-        <div class="card-heading"><div><h2 id="backends-title">Backends</h2><p class="muted">Known machines and their latest reachability checks. Address links open each backend’s own port; it may show an API response or 404 instead of a homepage. Your browser needs network/VPN access. The router key is never forwarded.</p></div></div>
+      <details id="backends-panel" class="card" open>
+        <summary class="card-summary"><h2 id="backends-title">Backends</h2></summary>
+        <div class="card-intro"><p class="muted">Known machines and their latest reachability checks. Address links open each backend’s own port; it may show an API response or 404 instead of a homepage. Your browser needs network/VPN access. The router key is never forwarded.</p></div>
         <div class="table-scroll"><table><caption class="sr-only">Backend reachability</caption>
           <thead><tr><th scope="col">Machine / backend</th><th scope="col">API address</th><th scope="col">Status</th><th scope="col">Models ready</th><th scope="col">Last probe</th></tr></thead>
           <tbody id="endpoints-body"></tbody>
         </table></div>
-      </section>
+      </details>
 
-      <section class="card" aria-labelledby="models-title">
-        <div class="card-heading"><div><h2 id="models-title">Model deployments</h2><p class="muted">Each model copy on each machine; readiness is not a test generation.</p></div></div>
+      <details id="models-panel" class="card" open>
+        <summary class="card-summary"><h2 id="models-title">Model deployments</h2></summary>
+        <div class="card-intro"><p class="muted">Each model copy on each machine; readiness is not a test generation.</p></div>
         <div class="table-scroll"><table><caption class="sr-only">Model deployments and request counters</caption>
           <thead><tr><th scope="col">Model / deployment</th><th scope="col">Machine</th><th scope="col">Status</th><th scope="col">Active requests</th><th scope="col">Succeeded / failed</th></tr></thead>
           <tbody id="models-body"></tbody>
         </table></div>
-      </section>
+      </details>
 
-      <section class="card" aria-labelledby="aliases-title">
-        <div class="card-heading"><div><h2 id="aliases-title">Client model names</h2><p class="muted">HA shares replicas; preferred tries one machine first; pinned never fails over.</p></div></div>
+      <details id="aliases-panel" class="card" open>
+        <summary class="card-summary"><h2 id="aliases-title">Client model names</h2></summary>
+        <div class="card-intro"><p class="muted">HA shares replicas; preferred tries one machine first; pinned never fails over.</p></div>
         <div class="table-scroll"><table><caption class="sr-only">High availability and machine-specific aliases</caption>
           <thead><tr><th scope="col">Alias</th><th scope="col">Routing</th><th scope="col">Status</th><th scope="col">Deployments</th></tr></thead>
           <tbody id="aliases-body"></tbody>
         </table></div>
-      </section>
-      <section class="card" aria-labelledby="performance-title">
-        <div class="card-heading"><div><h2 id="performance-title">Observed model performance</h2>
-          <p class="muted">Measured passively from real requests through this router and saved across restarts and updates. Refresh never runs a benchmark or model. Smoothed averages use EWMA, which gives recent samples more weight. Request time covers the whole upstream call; token rates and load/setup time require backend-reported timings, which some backends do not provide.</p>
-        </div></div>
+      </details>
+      <details id="performance-panel" class="card" open>
+        <summary class="card-summary"><h2 id="performance-title">Observed model performance</h2></summary>
+        <div class="card-intro"><p class="muted">Measured passively from real requests through this router and saved across restarts and updates. Refresh never runs a benchmark or model. Smoothed averages use EWMA, which gives recent samples more weight. Request time covers the whole upstream call; token rates and load/setup time require backend-reported timings, which some backends do not provide.</p></div>
         <p id="performance-message" class="performance-message muted" role="status">Waiting for saved performance observations.</p>
         <div class="table-scroll"><table><caption class="sr-only">Saved request performance by model and server</caption>
           <thead><tr><th scope="col">Model / server</th><th scope="col">Input tok/s</th><th scope="col">Output tok/s</th><th scope="col">Reported load / setup</th><th scope="col">Request time (wall clock)</th><th scope="col">Requests</th><th scope="col">Last observed</th></tr></thead>
           <tbody id="performance-body"></tbody>
         </table></div>
         <p class="performance-note muted">Load/setup times are backend-reported. Slow reported loads may be cold starts, but do not prove disk I/O. Missing timings are not estimated from request latency. Historical rows preserve observations for deployments no longer in the current routing configuration.</p>
-      </section>
+      </details>
       <p class="muted snapshot-note">Last discovery: <span id="last-discovery">—</span>. Refresh reads the current snapshot; it does not scan your network or run a model.</p>
     </section>
     <noscript><p class="help-box">Enable JavaScript to view live status. The JSON readiness endpoint is <a href="/healthz">/healthz</a>.</p></noscript>
@@ -202,21 +211,21 @@ STATUS_CSS = """
 :root{color-scheme:light;--navy:#14253d;--ink:#1c3048;--muted:#52657b;--line:#d9e2ec;--surface:#fff;--background:#f3f6fa;--green:#176943;--amber:#845108;--red:#a22b35}
 *{box-sizing:border-box}body{margin:0;background:var(--background);color:var(--ink);font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:15px;line-height:1.6}
 [hidden]{display:none!important}a{color:#245aba}button,input{font:inherit}button{cursor:pointer;border:1px solid #a9b9cb;border-radius:8px;padding:9px 15px;color:var(--ink);background:#fff;font-weight:600;white-space:nowrap}button:hover{background:#edf3fa}button:disabled{cursor:wait;opacity:.65}button.primary{background:var(--navy);color:#fff;border-color:var(--navy)}button.primary:hover{background:#263e5d}button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid #669eea;outline-offset:3px}input{min-width:0;width:100%;border:1px solid #9aaec3;border-radius:8px;padding:10px 12px;color:var(--ink);background:#fff}code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.9em;overflow-wrap:anywhere}
-.topbar{background:var(--navy);color:#fff;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;padding:18px max(24px,calc((100% - 1160px)/2));gap:20px}.brand{display:flex;align-items:center;gap:12px;font-weight:700;letter-spacing:-.02em;font-size:19px}.brand-mark{display:grid;place-items:center;width:32px;height:32px;border:1px solid #6e83a1;border-radius:9px;font-size:24px;line-height:1}.brand-subtitle{font-weight:400;color:#bdcce0}.topbar-meta{display:flex;flex-wrap:wrap;align-items:center;gap:12px}.version-badge{display:inline-block;padding:3px 10px;border:1px solid #6e83a1;border-radius:999px;color:#fff;font-size:12px;font-weight:600;white-space:nowrap}.version-badge:empty{display:none}.readonly{font-size:12px;color:#d1deee;letter-spacing:.03em}
-main{max-width:1208px;margin:auto;padding:38px 24px 24px}.heading,.section-heading,.card-heading{display:flex;align-items:center;justify-content:space-between;gap:20px}.heading{margin-bottom:26px}.heading p{margin:7px 0 0}.eyebrow{text-transform:uppercase;font-size:11px;font-weight:700;letter-spacing:.15em;color:var(--muted)}h1{font-size:32px;letter-spacing:-.04em;line-height:1.2;margin:8px 0}h2{font-size:18px;letter-spacing:-.02em;margin:0}h3{font-size:15px;margin:0 0 5px}p{margin:0}.muted{color:var(--muted);font-size:13px}
+.topbar{background:var(--navy);color:#fff;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;padding:18px max(24px,calc((100% - 1352px)/2));gap:20px}.brand{display:flex;align-items:center;gap:12px;font-weight:700;letter-spacing:-.02em;font-size:19px}.brand-mark{display:grid;place-items:center;width:32px;height:32px;border:1px solid #6e83a1;border-radius:9px;font-size:24px;line-height:1}.brand-subtitle{font-weight:400;color:#bdcce0}.topbar-meta{display:flex;flex-wrap:wrap;align-items:center;gap:12px}.version-badge{display:inline-block;padding:3px 10px;border:1px solid #6e83a1;border-radius:999px;color:#fff;font-size:12px;font-weight:600;white-space:nowrap}.version-badge:empty{display:none}.readonly{font-size:12px;color:#d1deee;letter-spacing:.03em}
+main{max-width:1400px;margin:auto;padding:38px 24px 24px}.heading,.section-heading{display:flex;align-items:center;justify-content:space-between;gap:20px}.heading{margin-bottom:26px}.heading p{margin:7px 0 0}.heading-actions{display:flex;flex-wrap:wrap;gap:8px;flex:0 0 auto}.eyebrow{text-transform:uppercase;font-size:11px;font-weight:700;letter-spacing:.15em;color:var(--muted)}h1{font-size:32px;letter-spacing:-.04em;line-height:1.2;margin:8px 0}h2{font-size:18px;letter-spacing:-.02em;margin:0}h3{font-size:15px;margin:0 0 5px}p{margin:0}.muted{color:var(--muted);font-size:13px}
 .health-panel{display:flex;align-items:flex-start;gap:14px;border:1px solid;border-radius:12px;padding:21px 24px}.health-panel p{font-size:14px;margin-top:3px}.health-dot{width:12px;height:12px;flex:0 0 auto;border-radius:50%;margin-top:8px;background:currentColor}.tone-pending{background:#edf2f9;border-color:#c6d5e6;color:#354d6c}.tone-ready{background:#edf8f1;border-color:#b2d7c0;color:var(--green)}.tone-warning{background:#fff7e8;border-color:#e5ce9e;color:var(--amber)}.tone-error{background:#fff0f0;border-color:#eab9bf;color:var(--red)}
-.overview{display:grid;grid-template-columns:repeat(4,1fr);gap:20px;margin:24px 0 30px}.overview-item{padding-left:16px;border-left:2px solid #cbd7e5}.label{display:block;color:var(--muted);font-size:12px;font-weight:500}.overview strong{display:block;font-size:15px;margin-top:3px}.card{border:1px solid var(--line);border-radius:12px;background:var(--surface);margin-bottom:20px;overflow:hidden}.card-heading{padding:19px 22px}.card-heading p{margin-top:3px}.auth-card{padding:22px;display:grid;grid-template-columns:1.15fr 1fr;column-gap:36px;row-gap:16px}.auth-card h2{margin-bottom:7px}.auth-card p+p{margin-top:5px}.auth-card label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}.key-controls{display:flex;gap:10px}.auth-actions{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:16px}.section-heading{margin:30px 0 15px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}.stat{border:1px solid var(--line);background:var(--surface);border-radius:10px;padding:17px 20px}.stat strong{display:block;font-size:28px;font-weight:650;letter-spacing:-.03em;margin-top:4px;line-height:1.3}.help-box{padding:18px 22px;background:#fff8ea;border:1px solid #e6d1a6;border-radius:10px;margin:0 0 22px;color:#674810}.help-box p{font-size:14px}.table-scroll{width:100%;overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px;text-align:left}th{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);background:#f7f9fc;white-space:nowrap}th,td{padding:12px 22px;border-top:1px solid #e3e9f0;vertical-align:top}td{overflow-wrap:anywhere;max-width:360px}td .secondary{display:block;font-size:12px;color:var(--muted);margin-top:2px}.address{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}.badge{display:inline-block;border-radius:5px;padding:2px 8px;font-size:11px;font-weight:650;white-space:nowrap}.badge-ready{background:#e7f5ed;color:var(--green)}.badge-warning{background:#fff2d8;color:var(--amber)}.badge-error{background:#ffe9eb;color:var(--red)}.badge-neutral{background:#edf1f6;color:#53647a}.empty-row{text-align:center;color:var(--muted);padding:24px}.snapshot-note{margin:24px 0 0}footer{max-width:1208px;margin:0 auto;padding:0 24px 30px;color:var(--muted);font-size:12px}.sr-only,.skip-link:not(:focus){position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.skip-link:focus{position:absolute;top:8px;left:8px;z-index:10;background:white;padding:8px}
-@media(max-width:800px){.auth-card{grid-template-columns:1fr}.stats,.overview{grid-template-columns:repeat(2,1fr)}.auth-actions{grid-column:auto}th,td{padding:12px 16px}.heading{align-items:flex-start}.heading button{margin-top:12px}}
-@media(max-width:500px){main{padding:24px 16px}.topbar{padding:16px}.readonly{display:none}.heading{display:block}h1{font-size:28px}.heading button{width:100%;margin-top:18px}.health-panel{padding:18px}.auth-card{padding:18px}.key-controls{flex-direction:column}.auth-actions{align-items:flex-start;flex-direction:column}.stats{gap:10px}.stat{padding:14px}.stat strong{font-size:25px}.section-heading{align-items:flex-start;flex-direction:column;gap:3px}footer{padding:0 16px 24px}.brand{font-size:17px}}
-.quick-links{padding:19px 22px}.quick-links p{margin-top:6px}.quick-links nav{display:flex;flex-wrap:wrap;gap:8px 20px;margin:12px 0}.quick-links nav a{font-size:13px}.self-test-message{padding:0 22px 19px}.self-test-message.result-pass{color:var(--green)}.self-test-message.result-fail{color:var(--red)}.self-test-message.result-partial{color:var(--amber)}
-.host-form{padding:0 22px 16px}.host-form label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}.host-form p{margin-top:7px}.hosts-toolbar{padding:0 22px 19px;display:flex;align-items:center;justify-content:space-between;gap:16px}.hosts-actions{display:flex;flex-wrap:wrap;gap:8px}.hosts-actions button{padding:6px 10px;font-size:12px}.host-check+.host-check{margin-top:12px}.host-check .badge{margin-left:6px}.host-check .secondary{overflow-wrap:anywhere}#hosts-message.result-fail{color:var(--red)}#hosts-message.result-pass{color:var(--green)}
-.host-check{padding:14px;border:1px solid var(--line);border-radius:8px;background:#fafcfe}.host-check-heading{display:flex;align-items:center;flex-wrap:wrap;gap:5px}.host-check p{margin-top:7px}.host-check .host-api-address{display:block;font-size:12px;overflow-wrap:anywhere}.host-catalog{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}.host-catalog h3{font-size:13px;margin-bottom:5px}.host-catalog .catalog-warning{color:var(--amber)}.host-model-table{margin-top:10px;table-layout:fixed}.host-model-table th,.host-model-table td{padding:8px 10px;max-width:none;overflow-wrap:anywhere}.host-model-table th{white-space:normal}.host-model-table td{background:var(--surface)}.host-model-table th:first-child{width:43%}#hosts-results>table>thead>tr>th:nth-child(2){width:55%}#hosts-results>table>tbody>tr>td:nth-child(2){min-width:330px;max-width:none}
+.overview{display:grid;grid-template-columns:repeat(4,1fr);gap:20px;margin:24px 0 30px}.overview-item{padding-left:16px;border-left:2px solid #cbd7e5}.label{display:block;color:var(--muted);font-size:12px;font-weight:500}.overview strong{display:block;font-size:15px;margin-top:3px}.card{border:1px solid var(--line);border-radius:12px;background:var(--surface);margin-bottom:20px;overflow:hidden}.card-summary{list-style:none;display:flex;align-items:center;gap:12px;padding:17px 22px;cursor:pointer;user-select:none}.card-summary::-webkit-details-marker{display:none}.card-summary::before{content:"";flex:0 0 auto;width:9px;height:9px;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);transform:translate(-2px,0) rotate(-45deg);transition:transform .15s}details[open]>.card-summary::before{transform:translate(0,-2px) rotate(45deg)}.card-summary:hover{background:#f7f9fc}.card-summary:focus-visible{outline:3px solid #669eea;outline-offset:-3px}.card-summary h2{flex:1 1 auto;min-width:0}.card-summary::after{content:"Hide";font-size:12px;font-weight:500;color:var(--muted)}details:not([open])>.card-summary::after{content:"Show"}.card-intro{padding:0 22px 16px}.card-intro p{max-width:100ch}.card-intro p+p{margin-top:5px}.card-body{padding:0 22px 20px}.auth-card{padding:22px;display:grid;grid-template-columns:1.15fr 1fr;column-gap:36px;row-gap:16px}.auth-card h2{margin-bottom:7px}.auth-card p+p{margin-top:5px}.auth-card label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}.key-controls{display:flex;gap:10px}.auth-actions{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:16px}.section-heading{margin:30px 0 15px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}.stat{border:1px solid var(--line);background:var(--surface);border-radius:10px;padding:17px 20px}.stat strong{display:block;font-size:28px;font-weight:650;letter-spacing:-.03em;margin-top:4px;line-height:1.3}.help-box{padding:18px 22px;background:#fff8ea;border:1px solid #e6d1a6;border-radius:10px;margin:0 0 22px;color:#674810}.help-box p{font-size:14px}.table-scroll{width:100%;overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px;text-align:left}th{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);background:#f7f9fc;white-space:nowrap}th,td{padding:12px 22px;border-top:1px solid #e3e9f0;vertical-align:top}td{overflow-wrap:anywhere;max-width:360px}.secondary{display:block;font-size:12px;color:var(--muted);margin-top:2px}.address{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}.badge{display:inline-block;border-radius:5px;padding:2px 8px;font-size:11px;font-weight:650;white-space:nowrap}.badge-ready{background:#e7f5ed;color:var(--green)}.badge-warning{background:#fff2d8;color:var(--amber)}.badge-error{background:#ffe9eb;color:var(--red)}.badge-neutral{background:#edf1f6;color:#53647a}.empty-row{text-align:center;color:var(--muted);padding:24px}.snapshot-note{margin:24px 0 0}footer{max-width:1400px;margin:0 auto;padding:0 24px 30px;color:var(--muted);font-size:12px}.sr-only,.skip-link:not(:focus){position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.skip-link:focus{position:absolute;top:8px;left:8px;z-index:10;background:white;padding:8px}
+@media(max-width:800px){.auth-card{grid-template-columns:1fr}.stats,.overview{grid-template-columns:repeat(2,1fr)}.auth-actions{grid-column:auto}th,td{padding:12px 16px}.heading{align-items:flex-start}.heading-actions{margin-top:12px}}
+@media(max-width:500px){main{padding:24px 16px}.topbar{padding:16px}.readonly{display:none}.heading{display:block}h1{font-size:28px}.heading-actions{margin-top:18px}.heading-actions button{flex:1 1 auto}.health-panel{padding:18px}.auth-card{padding:18px}.key-controls{flex-direction:column}.auth-actions{align-items:flex-start;flex-direction:column}.stats{gap:10px}.stat{padding:14px}.stat strong{font-size:25px}.section-heading{align-items:flex-start;flex-direction:column;gap:3px}footer{padding:0 16px 24px}.brand{font-size:17px}.card-summary{padding:15px 16px}.card-intro,.card-body{padding-left:16px;padding-right:16px}.host-list{padding:0 12px 16px}}
+.quick-links .card-body p{margin-top:6px}.quick-links nav{display:flex;flex-wrap:wrap;gap:8px 20px;margin:12px 0}.quick-links nav a{font-size:13px}.self-test-intro{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.self-test-intro button{flex:0 0 auto}.self-test-message{padding:0 22px 19px}.self-test-message.result-pass{color:var(--green)}.self-test-message.result-fail{color:var(--red)}.self-test-message.result-partial{color:var(--amber)}
+.host-form{padding:0 22px 16px}.host-form label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}.host-form p{margin-top:7px}.hosts-toolbar{padding:0 22px 19px;display:flex;align-items:center;justify-content:space-between;gap:16px}.hosts-actions{display:flex;flex-wrap:wrap;gap:8px}.hosts-actions button{padding:6px 10px;font-size:12px}.host-check .badge{margin-left:6px}.host-check .secondary{overflow-wrap:anywhere}#hosts-message.result-fail{color:var(--red)}#hosts-message.result-pass{color:var(--green)}
+.host-list{padding:0 22px 22px}.host-entries{list-style:none;margin:0;padding:0}.host-entry{border:1px solid var(--line);border-radius:10px;background:var(--surface);overflow:hidden}.host-entry+.host-entry{margin-top:14px}.host-entry-head{display:flex;flex-wrap:wrap;align-items:flex-start;gap:12px 28px;padding:14px 16px;background:#f7f9fc}.host-entry-identity{flex:1 1 280px;min-width:0}.host-entry-identity .address{font-size:14px;font-weight:650;overflow-wrap:anywhere}.host-entry-checked{flex:0 1 auto;font-size:13px}.host-entry-head .hosts-actions{margin-left:auto}.host-checks{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:12px;padding:14px 16px;border-top:1px solid var(--line)}.host-checks>p{grid-column:1/-1}.host-check{padding:14px;border:1px solid var(--line);border-radius:8px;background:#fafcfe;min-width:0}.host-check-heading{display:flex;align-items:center;flex-wrap:wrap;gap:5px}.host-check p{margin-top:7px}.host-check .host-api-address{display:block;font-size:12px;overflow-wrap:anywhere}.host-catalog{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}.host-catalog-summary{list-style:none;display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;font-size:13px;cursor:pointer;user-select:none}.host-catalog-summary::-webkit-details-marker{display:none}.host-catalog-summary::before{content:"";flex:0 0 auto;align-self:center;width:7px;height:7px;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);transform:translate(-1px,0) rotate(-45deg)}.host-catalog[open]>.host-catalog-summary::before{transform:translate(0,-2px) rotate(45deg)}.host-catalog-title{font-weight:600}.host-catalog .catalog-warning{color:var(--amber)}.host-model-list{list-style:none;margin:10px 0 0;padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,190px),1fr));gap:6px}.host-model-list li{min-width:0;padding:5px 9px;border:1px solid var(--line);border-radius:6px;background:var(--surface)}.host-model-list code{font-size:12px}.host-model-list .secondary{font-size:11px;overflow-wrap:anywhere}
 .public-summary-counts{display:grid;grid-template-columns:1fr 1fr 1.6fr;gap:18px;padding:0 22px 16px}.public-summary-counts strong{display:block;font-size:20px;line-height:1.5;overflow-wrap:anywhere}.public-summary-counts>div:last-child strong{font-size:15px}.public-summary>p{padding:0 22px 19px}
 .performance-message{padding:0 22px 19px}.performance-message.result-warning{color:var(--amber)}.performance-note{padding:16px 22px;border-top:1px solid var(--line)}.metric-value{display:block;font-weight:650;white-space:nowrap}.metric-detail{display:block;min-width:130px;color:var(--muted);font-size:11px;margin-top:4px}.performance-identity{min-width:180px}.performance-identity .badge{margin-top:7px}.performance-identity code{display:block;margin-top:5px}.slow-load-count{margin-top:9px;font-size:12px}
 .host-routing{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:12px;margin-top:10px}.host-routing .secondary{margin-top:6px}
-.update-panel{padding:18px 22px}.update-panel p{margin-top:7px}.update-panel progress{display:block;width:min(100%,480px);height:14px;margin:12px 0}.update-panel button{margin-top:12px}.update-panel .result-fail{color:var(--red)}.update-panel .result-pass{color:var(--green)}.update-stage{font-size:14px}
-@media(max-width:800px){.self-test-heading{align-items:flex-start;flex-direction:column}}
-@media(max-width:600px){.hosts-toolbar{align-items:flex-start;flex-direction:column}.host-form .key-controls{flex-direction:column}}
+.update-panel .card-body{padding-bottom:18px}.update-panel .card-body p{margin-top:7px}.update-panel progress{display:block;width:min(100%,480px);height:14px;margin:12px 0}.update-panel button{margin-top:12px}.update-panel .result-fail{color:var(--red)}.update-panel .result-pass{color:var(--green)}.update-stage{font-size:14px}
+@media(max-width:800px){.self-test-intro{align-items:flex-start;flex-direction:column}}
+@media(max-width:600px){.hosts-toolbar{align-items:flex-start;flex-direction:column}.host-form .key-controls{flex-direction:column}.host-entry-head .hosts-actions{margin-left:0}}
 @media(max-width:600px){.public-summary-counts{grid-template-columns:1fr 1fr}.public-summary-counts>div:last-child{grid-column:1/-1}}
 """
 
@@ -249,6 +258,11 @@ STATUS_JS = r"""
   let updateAwaitingRun = false;
   let updateLastStage = "";
   let updateLastRunId = null;
+  // Per-address and per-server view state lives only in this page's memory and
+  // is forgotten with the rest of the private details on lock or navigation.
+  const collapsedHosts = new Set();
+  const collapsedCatalogs = new Set();
+  const panels = ["update-panel", "summary-panel", "links-panel", "hosts-panel", "self-test-panel", "backends-panel", "models-panel", "aliases-panel", "performance-panel"];
   const text = (id, value) => { el(id).textContent = String(value); };
   const count = (value) => Number.isFinite(value) && value >= 0 ? String(value) : "—";
   const date = (value) => {
@@ -419,6 +433,8 @@ STATUS_JS = r"""
     activeHosts = null;
     hostsLoaded = false;
     savedHosts = [];
+    collapsedHosts.clear();
+    collapsedCatalogs.clear();
     el("host-address").value = "";
     el("hosts-body").replaceChildren();
     hostMessage(authRequired ? "Unlock details to manage saved addresses." : "Address management is disabled. Set LLM_ROUTER_GATEWAY_API_KEY in router.env and restart the router to enable it.");
@@ -470,23 +486,30 @@ STATUS_JS = r"""
       new Set(data.hosts.map(item => item.id)).size !== data.hosts.length) throw new Error("invalid-hosts-response");
     return data.hosts;
   }
-  function hostCatalog(check) {
-    const catalog = document.createElement("div");
+  function hostCatalog(item, check) {
+    const catalog = document.createElement("details");
     catalog.className = "host-catalog";
-    const title = document.createElement("h3");
+    const key = `${item.id}\n${check.provider}\n${check.base_url}`;
+    catalog.open = !collapsedCatalogs.has(key);
+    catalog.addEventListener("toggle", () => { if (catalog.open) collapsedCatalogs.delete(key); else collapsedCatalogs.add(key); });
+    const summary = document.createElement("summary");
+    summary.className = "host-catalog-summary";
+    const title = document.createElement("span");
+    title.className = "host-catalog-title";
     title.textContent = "Models listed by this server";
-    const summary = document.createElement("p");
-    summary.className = "muted";
-    catalog.append(title, summary);
+    const state = document.createElement("span");
+    state.className = "muted";
+    summary.append(title, state);
+    catalog.append(summary);
     if (check.catalog_status === undefined) {
-      summary.textContent = "Check again to retrieve model list.";
+      state.textContent = "Check again to retrieve model list.";
       return catalog;
     }
     if (check.catalog_status === "error") {
-      summary.className = "muted catalog-warning";
-      summary.textContent = `Model list unavailable; model count is unknown. ${check.catalog_detail}`;
+      state.className = "muted catalog-warning";
+      state.textContent = `Model list unavailable; model count is unknown. ${check.catalog_detail}`;
     } else {
-      summary.textContent = check.model_count === 0 ? "No models listed by this server." : `${check.model_count} model${check.model_count === 1 ? "" : "s"} listed by this server.`;
+      state.textContent = check.model_count === 0 ? "No models listed by this server." : `${check.model_count} model${check.model_count === 1 ? "" : "s"} listed by this server.`;
       if (check.models_truncated) {
         const truncated = document.createElement("p");
         truncated.className = "muted catalog-warning";
@@ -494,32 +517,32 @@ STATUS_JS = r"""
         catalog.append(truncated);
       }
       if (check.models.length) {
-        const table = document.createElement("table");
-        table.className = "host-model-table";
-        const caption = document.createElement("caption");
-        caption.className = "sr-only";
-        caption.textContent = `Model IDs and API addresses reported by ${check.provider}`;
-        const head = document.createElement("thead");
-        const heading = document.createElement("tr");
-        for (const label of ["Model ID", "API address"]) {
-          const column = document.createElement("th");
-          column.setAttribute("scope", "col");
-          column.textContent = label;
-          heading.append(column);
-        }
-        head.append(heading);
-        const body = document.createElement("tbody");
+        const list = document.createElement("ul");
+        list.className = "host-model-list";
+        list.setAttribute("aria-label", `Model IDs reported by ${check.provider}`);
+        // The router reports one API address per server check; show it once
+        // unless the catalog really does mix addresses.
+        const shared = new Set(check.models.map(model => model.address)).size === 1 ? check.models[0].address : null;
         for (const model of check.models) {
-          const row = document.createElement("tr");
-          for (const value of [model.id, model.address]) {
-            const code = document.createElement("code");
-            code.textContent = value;
-            cell(row, code);
+          const entry = document.createElement("li");
+          const code = document.createElement("code");
+          code.textContent = model.id;
+          entry.append(code);
+          if (shared === null) {
+            const where = document.createElement("span");
+            where.className = "secondary";
+            where.textContent = model.address;
+            entry.append(where);
           }
-          body.append(row);
+          list.append(entry);
         }
-        table.append(caption, head, body);
-        catalog.append(table);
+        catalog.append(list);
+        if (shared !== null) {
+          const address = document.createElement("p");
+          address.className = "muted host-api-address host-models-address";
+          address.textContent = `Models API address: ${shared}`;
+          catalog.append(address);
+        }
       }
     }
     const source = document.createElement("p");
@@ -546,45 +569,98 @@ STATUS_JS = r"""
       ? "Model lists are incomplete; the model count is a lower bound. Cached metadata does not prove models are loaded or inference works."
       : "Counts reflect cached metadata, not a live network scan. They do not prove models are loaded or inference works.");
   }
-  function renderHosts() {
-    rows("hosts-body", savedHosts, 4, "No saved addresses. Add a machine above to check its backend ports.", (row, item) => {
-      cell(row, item.address, null, "address");
-      row.children[0].append(hostRouting(item.routing));
-      const results = document.createElement("div");
-      if (!item.checks.length) results.textContent = "Not checked in this router session";
-      for (const check of item.checks) {
-        const result = document.createElement("div");
-        result.className = "host-check";
-        const heading = document.createElement("div");
-        heading.className = "host-check-heading";
-        const name = document.createElement("strong");
-        name.textContent = `${check.provider} `;
-        heading.append(name, badge(check.status === "pass" ? "Found" : "Not confirmed", check.status === "pass" ? "ready" : "warning"));
-        const address = document.createElement("p");
-        address.className = "host-api-address address";
-        address.textContent = `API base: ${check.base_url}`;
-        const detail = document.createElement("p");
-        detail.className = "muted";
-        const elapsed = Number.isFinite(check.elapsed_ms) && check.elapsed_ms >= 0 ? ` · ${Math.round(check.elapsed_ms)} ms` : "";
-        detail.textContent = `${check.detail}${Number.isInteger(check.http_status) ? ` · HTTP ${check.http_status}` : ""}${elapsed}`;
-        result.append(heading, address, detail, hostCatalog(check));
-        results.append(result);
-      }
-      cell(row, results);
-      cell(row, date(item.checked_at));
-      const actions = document.createElement("div");
-      actions.className = "hosts-actions";
-      for (const [label, action] of [["Check", "check"], ["Remove", "remove"]]) {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.textContent = label;
-        button.disabled = Boolean(activeHosts) || !authRequired || !apiKey;
-        button.setAttribute("aria-label", `${label} ${item.address}`);
-        button.addEventListener("click", () => hostOperation(action, item.id));
-        actions.append(button);
-      }
-      cell(row, actions);
+  function hostCheck(item, check) {
+    const result = document.createElement("div");
+    result.className = "host-check";
+    const heading = document.createElement("div");
+    heading.className = "host-check-heading";
+    const name = document.createElement("strong");
+    name.textContent = `${check.provider} `;
+    heading.append(name, badge(check.status === "pass" ? "Found" : "Not confirmed", check.status === "pass" ? "ready" : "warning"));
+    const address = document.createElement("p");
+    address.className = "host-api-address address";
+    address.textContent = `API base: ${check.base_url}`;
+    const detail = document.createElement("p");
+    detail.className = "muted";
+    const elapsed = Number.isFinite(check.elapsed_ms) && check.elapsed_ms >= 0 ? ` · ${Math.round(check.elapsed_ms)} ms` : "";
+    detail.textContent = `${check.detail}${Number.isInteger(check.http_status) ? ` · HTTP ${check.http_status}` : ""}${elapsed}`;
+    result.append(heading, address, detail, hostCatalog(item, check));
+    return result;
+  }
+  function hostEntry(item, index) {
+    const entry = document.createElement("li");
+    entry.className = "host-entry";
+    const head = document.createElement("div");
+    head.className = "host-entry-head";
+    const identity = document.createElement("div");
+    identity.className = "host-entry-identity";
+    const address = document.createElement("span");
+    address.className = "address";
+    address.textContent = item.address;
+    identity.append(address, hostRouting(item.routing));
+    const checked = document.createElement("div");
+    checked.className = "host-entry-checked";
+    const label = document.createElement("span");
+    label.className = "label";
+    label.textContent = "Last checked";
+    const when = document.createElement("span");
+    when.textContent = date(item.checked_at);
+    checked.append(label, when);
+    const results = document.createElement("div");
+    results.className = "host-checks";
+    results.id = `host-checks-${index}`;
+    results.hidden = collapsedHosts.has(item.id);
+    if (!item.checks.length) {
+      const none = document.createElement("p");
+      none.className = "muted";
+      none.textContent = "Not checked in this router session";
+      results.append(none);
+    }
+    for (const check of item.checks) results.append(hostCheck(item, check));
+    const actions = document.createElement("div");
+    actions.className = "hosts-actions";
+    for (const [label, action] of [["Check", "check"], ["Remove", "remove"]]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      button.disabled = Boolean(activeHosts) || !authRequired || !apiKey;
+      button.setAttribute("aria-label", `${label} ${item.address}`);
+      button.addEventListener("click", () => hostOperation(action, item.id));
+      actions.append(button);
+    }
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "host-toggle";
+    toggle.setAttribute("aria-controls", results.id);
+    const describeToggle = () => {
+      toggle.textContent = results.hidden ? "Show results" : "Hide results";
+      toggle.setAttribute("aria-expanded", String(!results.hidden));
+      toggle.setAttribute("aria-label", `${results.hidden ? "Show" : "Hide"} results for ${item.address}`);
+    };
+    describeToggle();
+    toggle.addEventListener("click", () => {
+      results.hidden = !results.hidden;
+      if (results.hidden) collapsedHosts.add(item.id); else collapsedHosts.delete(item.id);
+      describeToggle();
     });
+    actions.append(toggle);
+    head.append(identity, checked, actions);
+    entry.append(head, results);
+    return entry;
+  }
+  function renderHosts() {
+    const body = el("hosts-body");
+    body.replaceChildren();
+    if (!savedHosts.length) {
+      const empty = document.createElement("li");
+      empty.className = "empty-row";
+      empty.textContent = "No saved addresses. Add a machine above to check its backend ports.";
+      body.append(empty);
+    } else {
+      const fragment = document.createDocumentFragment();
+      savedHosts.forEach((item, index) => fragment.append(hostEntry(item, index)));
+      body.append(fragment);
+    }
     hostControls();
   }
   async function hostOperation(action, id) {
@@ -975,6 +1051,7 @@ STATUS_JS = r"""
       updateStartRunId = updateLastRunId;
       updateRunId = null;
       updateAwaitingRun = true;
+      el("update-panel").open = true;
       text("update-stage", "Submitting update request");
       text("update-observed", "");
       el("update-details").hidden = false;
@@ -1174,6 +1251,9 @@ STATUS_JS = r"""
   el("host-form").addEventListener("submit", (event) => { event.preventDefault(); hostOperation("save"); });
   el("hosts-reload-button").addEventListener("click", () => hostOperation("load"));
   el("hosts-check-button").addEventListener("click", () => hostOperation("check"));
+  const setPanels = open => { for (const id of panels) el(id).open = open; };
+  el("collapse-all-button").addEventListener("click", () => setPanels(false));
+  el("expand-all-button").addEventListener("click", () => setPanels(true));
   text("router-origin", safeOrigin(window.location.origin) || "Current server");
   apiKey = consumeURLKey();
   authControls(apiKey ? "Checking your URL key…" : undefined);
