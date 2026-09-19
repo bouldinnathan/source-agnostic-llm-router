@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "source-agnostic-llm-router"
-version = "0.3.2"
+version = "0.3.3"
 description = "Self-provisioning LLM gateway with capability routing, failover, MCP, and Home Assistant support"
 readme = "README.md"
 requires-python = ">=3.10"

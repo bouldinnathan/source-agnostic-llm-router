@@ -6,10 +6,10 @@ import asyncio
 import os
 import re
 import time
-from typing import Any
+from typing import Any, Sequence
 
 from .adapters import AdapterRegistry
-from .errors import AllModelsFailed, UpstreamError, UpstreamFailure
+from .errors import AllModelsFailed, NoEligibleModel, UpstreamError, UpstreamFailure
 from .metrics import MetricsStore
 from .ranking import Ranker
 from .runtime import RuntimeRegistry
@@ -44,10 +44,15 @@ class LLMRouter:
     async def complete(self, request: QueryRequest) -> RoutedCompletion:
         """Call the highest-ranked deployment and fail over across sources."""
 
-        decision = self.route(request)
+        try:
+            decision = self.route(request)
+        except NoEligibleModel:
+            await self._record_request(success=False, rerouted=False, failure_kinds=("no_eligible_model",))
+            raise
         limit = min(self.config.policy.max_attempts, len(decision.candidates))
         failures: list[UpstreamFailure] = []
         attempts: list[dict[str, Any]] = []
+        failure_kinds: list[str] = []
 
         for candidate in decision.candidates[:limit]:
             model = candidate.model
@@ -69,8 +74,10 @@ class LLMRouter:
                     reason=exc.reason,
                     retryable=exc.retryable,
                     status_code=exc.status_code,
+                    kind=exc.kind,
                 )
                 failures.append(failure)
+                failure_kinds.append(exc.kind)
                 attempts.append(
                     {
                         **failure.to_dict(),
@@ -89,8 +96,10 @@ class LLMRouter:
                     endpoint=model.endpoint,
                     reason=reason,
                     retryable=False,
+                    kind="adapter",
                 )
                 failures.append(failure)
+                failure_kinds.append("adapter")
                 attempts.append(
                     {
                         **failure.to_dict(),
@@ -103,7 +112,11 @@ class LLMRouter:
 
             latency_ms = (time.perf_counter() - started) * 1_000
             self.runtime.record_success(model.id, latency_ms)
-            await self._record_metrics(endpoint, model, latency_ms, success=True, result=result)
+            observation = await self._record_metrics(endpoint, model, latency_ms, success=True, result=result)
+            await self._record_request(
+                success=True, rerouted=bool(failures), failure_kinds=failure_kinds,
+                input_tokens=observation.get("input_tokens"), output_tokens=observation.get("output_tokens"),
+            )
             attempts.append(
                 {
                     "deployment": model.id,
@@ -125,18 +138,33 @@ class LLMRouter:
                 tool_calls=result.tool_calls,
             )
 
+        await self._record_request(success=False, rerouted=len(failures) > 1, failure_kinds=failure_kinds)
         raise AllModelsFailed(failures)
+
+    async def _record_request(
+        self, *, success: bool, rerouted: bool, failure_kinds: Sequence[str] = (),
+        input_tokens: float | int | None = None, output_tokens: float | int | None = None,
+    ) -> None:
+        """Count one client request outcome; a storage problem never affects the answer."""
+        try:
+            await asyncio.to_thread(
+                self.metrics.record_request, success=success, rerouted=rerouted,
+                input_tokens=input_tokens, output_tokens=output_tokens, failure_kinds=tuple(failure_kinds),
+            )
+        except Exception:
+            pass
 
     async def _record_metrics(
         self, endpoint: EndpointConfig, model: ModelConfig, latency_ms: float,
         *, success: bool, result: UpstreamResult | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Observe only completed real attempts; telemetry must never cause a retry.
 
         The upstream timer has already stopped. SQLite work runs off the event
         loop and persists no prompts, responses, tool arguments, or credentials.
+        Returns the sanitized observation so request-level totals reuse it.
         """
-        observation = {"request_duration_ms": latency_ms}
+        observation: dict[str, Any] = {"request_duration_ms": latency_ms}
         if result is not None:
             try:
                 observation = extract_observation(endpoint.adapter, result, latency_ms)
@@ -151,6 +179,7 @@ class LLMRouter:
             # A full disk, locked database, or malformed optional statistics
             # must not discard a valid answer or repeat inference on a fallback.
             pass
+        return observation
 
     def list_models(self, *, include_disabled: bool = False) -> list[dict[str, Any]]:
         models: list[dict[str, Any]] = []

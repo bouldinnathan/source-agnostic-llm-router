@@ -141,6 +141,15 @@ refreshing, and starting a software update reopens the update panel so its
 progress is visible. This view state lives only in the open page; it is never
 written to browser storage or URLs, and a reload or lock shows every panel again.
 
+The page is grouped into three zones. **Overview** holds the health strip, the
+client-traffic panel, and the network summary. **Fleet** holds saved backend
+addresses, backends, model deployments, client model names, and observed
+performance. **Operations** holds the connection self-test, software updates,
+router links, and a folded **How to read this page** panel that collects the
+caveats instead of repeating them under every card. Each panel heading carries a
+live count, such as `2 of 3 online` or `82 requests · last 24 hours`, so a
+folded panel still tells you its state.
+
 Enter the **router's** `LLM_ROUTER_GATEWAY_API_KEY` from `router.env` to unlock fleet
 details. This is not an LM Studio/provider token. A key entered in the password
 field is kept only in the page's memory, never added to URLs or browser storage,
@@ -220,6 +229,46 @@ HTTP connection; use TLS or a trusted VPN. Backend credentials and private URL
 query strings are never included in dashboard data; saved checks display only
 validated addresses and fixed metadata API paths.
 
+### Client traffic
+
+Unlock `/status` and open **Client traffic** to see how clients have used the
+router. Counts are **per client request**, not per upstream attempt: a request
+that fails on one backend and is rerouted to another is one request, one reroute,
+and one failed attempt. Four tiles show, for the selected window, client requests
+with the succeeded/failed split, tokens in and out for **successful requests
+only**, HA reroutes with how many were rescued and how many still failed, and
+failed backend attempts broken down by kind. A stacked bar chart shows requests
+per hour, succeeded in green and failed in red, with a hover value per hour and a
+folded table view of the same numbers. Buttons switch between the **last 24
+hours**, the **last 7 days**, and **all time**; the chart keeps the seven-day
+view for all time.
+
+Failure kinds are a fixed vocabulary: `timeout`, `connection`, `http_5xx`,
+`http_4xx`, `invalid_response`, `configuration`, `adapter`, `no_eligible_model`,
+and `other`. They come from the classified upstream error, never from response
+text, and the same `kind` field appears on each failed attempt in completion
+diagnostics. Requests rejected before any backend was tried, because no
+configured deployment satisfied the request constraints, count as failed requests
+of kind `no_eligible_model`. Cancelled requests are not counted.
+
+Traffic lives in the same private SQLite database as performance history, as
+hourly buckets kept for **30 days** plus an all-time totals row. The `traffic`
+object in `GET /router/metrics` and in detailed `/status/data` under
+`performance` carries `available`, `since`, `retention_hours`, `totals`,
+`windows` (`24h` and `7d`), and `hourly` (up to 168 rows, each with `hour`,
+`requests_ok`, `requests_failed`, `reroutes_ok`, `reroutes_failed`,
+`input_tokens`, `output_tokens`, and a `failures` object keyed by kind). Public
+health summaries do not expose it. The metrics `schema_version` is now `2`.
+
+Updating from 0.3.2 upgrades an existing metrics database **in place on the
+first recorded request**: the traffic tables are added and the stored layout
+version moves from 1 to 2 while deployment history is left untouched. Reads of a
+not-yet-upgraded database work unchanged and simply show no traffic. Rolling the
+runtime back to 0.3.2 after that upgrade makes the older code report the metrics
+store as unavailable, because it refuses layouts it does not recognize; the data
+is intact and is served again once 0.3.3 or later runs. Unexpected tables,
+columns, or malformed rows are reported and never reset, as before.
+
 ### Passive model performance history
 
 Unlock `/status` and open **Observed model performance** to see input and output tokens
@@ -265,8 +314,8 @@ curl -fsS \
   http://YOUR_ROUTER_IP:8088/router/metrics | python3 -m json.tool
 ```
 
-The response includes `schema_version`, `available`, `updated_at`, and a
-`deployments` list. Each row identifies `machine`, `endpoint`, `model`, sanitized
+The response includes `schema_version`, `available`, `updated_at`, the
+`traffic` object described above, and a `deployments` list. Each row identifies `machine`, `endpoint`, `model`, sanitized
 `address`, and whether it is `current`. The `metrics` object contains
 `input_tokens_per_second`, `output_tokens_per_second`, `load_duration_ms`, and
 `request_duration_ms`; each is `null` or an object with `latest`, `ewma`,
@@ -515,7 +564,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.3.2-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.3.3-py3-none-any.whl
 llm-router --json discover
 ```
 

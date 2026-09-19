@@ -12,6 +12,8 @@ from llm_router.adapters.generic import GenericJSONAdapter
 from llm_router.adapters.ollama import OllamaChatAdapter
 from llm_router.adapters.openai import OpenAIChatAdapter
 from llm_router.errors import UpstreamError
+import httpx
+
 from llm_router.schema import AuthConfig, EndpointConfig, ModelConfig, QueryRequest
 
 
@@ -261,3 +263,60 @@ def test_provider_tool_only_responses_are_valid() -> None:
     assert anthropic_adapter.payload["tools"][0]["input_schema"] == {"type": "object"}
     assert gemini.tool_calls[0]["function"]["arguments"] == {"room": "kitchen"}
     assert gemini_adapter.payload["tools"][0]["functionDeclarations"][0]["name"] == "turn_on"
+
+
+@pytest.mark.parametrize(
+    "outcome,kind,retryable",
+    [
+        (httpx.ReadTimeout("slow"), "timeout", True),
+        (httpx.ConnectError("refused"), "connection", True),
+        (httpx.RemoteProtocolError("closed"), "connection", True),
+        (httpx.Response(503, json={"error": "busy"}), "http_5xx", True),
+        (httpx.Response(404, json={"error": "missing"}), "http_4xx", False),
+        (httpx.Response(200, content=b"<html>not json</html>"), "invalid_response", False),
+        (httpx.Response(200, json=["not", "an", "object"]), "invalid_response", False),
+    ],
+)
+def test_http_failures_carry_a_traffic_failure_kind(monkeypatch, outcome, kind, retryable) -> None:
+    from llm_router.adapters import base
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    real_client = httpx.AsyncClient
+
+    def client(**kwargs):  # type: ignore[no-untyped-def]
+        kwargs.pop("verify", None)
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(base.httpx, "AsyncClient", client)
+    adapter = base.BaseHTTPAdapter()
+    endpoint = EndpointConfig(name="source", adapter="openai-chat", base_url="http://source.invalid/v1", auth=AuthConfig(scheme="none"))
+    with pytest.raises(UpstreamError) as captured:
+        asyncio.run(adapter.post_json(endpoint, "/chat/completions", {"model": "x"}))
+    assert captured.value.kind == kind
+    assert captured.value.retryable is retryable
+    assert "private" not in str(captured.value)
+
+
+def test_configuration_problems_are_configuration_failures(monkeypatch) -> None:
+    from llm_router.adapters import base
+
+    adapter = base.BaseHTTPAdapter()
+    with pytest.raises(UpstreamError) as missing_url:
+        asyncio.run(adapter.post_json(EndpointConfig(name="source", adapter="openai-chat"), "/x", {}))
+    assert missing_url.value.kind == "configuration"
+    monkeypatch.delenv("ROUTER_TEST_MISSING_KEY", raising=False)
+    endpoint = EndpointConfig(
+        name="source", adapter="openai-chat", base_url="http://source.invalid/v1",
+        auth=AuthConfig(key_env="ROUTER_TEST_MISSING_KEY", scheme="bearer"),
+    )
+    with pytest.raises(UpstreamError) as missing_key:
+        adapter.connection_metadata(endpoint, {})
+    assert missing_key.value.kind == "configuration"
+    assert UpstreamError("parse problem", retryable=False).kind == "invalid_response"
+    assert UpstreamError("unknown", status_code=429).kind == "http_4xx"
+    assert UpstreamError("unknown").kind == "other"
+    assert UpstreamError("unknown", kind="not-a-kind").kind == "other"

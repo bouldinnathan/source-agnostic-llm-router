@@ -21,6 +21,7 @@ class Element {
     this.hidden = false;
     this.disabled = false;
     this.className = "";
+    this.style = {};
     this._text = "";
   }
   set textContent(value) { this._text = String(value); this.children = []; }
@@ -32,7 +33,7 @@ class Element {
     }
   }
   replaceChildren(...nodes) { this._text = ""; this.children = []; this.append(...nodes); }
-  setAttribute(name, value) { this.attributes[name] = value; }
+  setAttribute(name, value) { this.attributes[name] = value; if (name === "class") this.className = String(value); }
   addEventListener(name, callback) { this.events[name] = callback; }
 }
 
@@ -69,6 +70,7 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
       body: {dataset: {authRequired: String(authRequired)}},
       getElementById: element,
       createElement: tag => new Element(tag),
+      createElementNS: (namespace, tag) => new Element(tag),
       createDocumentFragment: () => new Element("#fragment"),
     },
     window: {
@@ -164,7 +166,7 @@ async function reply(request, status, data) {
 
 function snapshot() {
   return {
-    ready: true, status: "ready", version: "0.3.2", uptime_seconds: 65,
+    ready: true, status: "ready", version: "0.3.3", uptime_seconds: 65,
     checked_at: "2026-09-16T12:00:00Z", last_discovery: null,
     counts: {endpoints: 1, online: 1, models: 1, available_models: 1, aliases: 1},
     endpoints: [{name: "backend", machine: "laptop", address: "http://private-backend:1234", state: "online", model_count: 1, available_models: 1}],
@@ -174,7 +176,7 @@ function snapshot() {
 }
 
 function updateSnapshot(overrides = {}) {
-  return {available: true, busy: false, state: "idle", stage: "idle", message: "Ready", run_id: null, updated_at: null, current_version: "0.3.2", ...overrides};
+  return {available: true, busy: false, state: "idle", stage: "idle", message: "Ready", run_id: null, updated_at: null, current_version: "0.3.3", ...overrides};
 }
 
 function selfTestResult(status = "pass") {
@@ -204,11 +206,11 @@ async function publicReadiness() {
     assert.equal(app.requests[0].url, "/healthz");
     assert.equal(app.requests[0].options.headers.Authorization, undefined);
     // The real public endpoint deliberately contains no ready field.
-    await reply(app.requests[0], httpStatus, {status, version: "0.3.2"});
+    await reply(app.requests[0], httpStatus, {status, version: "0.3.3"});
     assert.equal(app.element("health-panel").className, `health-panel tone-${tone}`);
     assert.equal(app.element("gateway-state").textContent, "Responding");
     assert.equal(app.element("model-readiness").textContent, readiness);
-    assert.equal(app.element("version").textContent, "Version 0.3.2", "Version should remain visible while details are locked");
+    assert.equal(app.element("version").textContent, "Version 0.3.3", "Version should remain visible while details are locked");
     assert.equal(app.element("details").hidden, true);
     assert.equal(app.element("refresh-button").disabled, false);
   }
@@ -222,10 +224,10 @@ async function topbarVersionTracksCurrentSnapshot() {
   assert.ok(header && /\bid="version"/.test(header[1]), "Version belongs at the top of the page, before locked details");
   assert.equal(Array.from(markup.matchAll(/\bid="version"/g)).length, 1);
   const app = harness();
-  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.2"});
+  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.3"});
   assert.equal(app.element("details").hidden, true);
   assert.equal(app.element("version").hidden, false);
-  assert.equal(app.element("version").textContent, "Version 0.3.2", "Even an unavailable public gateway identifies its version");
+  assert.equal(app.element("version").textContent, "Version 0.3.3", "Even an unavailable public gateway identifies its version");
   app.enterKey("secret-key");
   await reply(app.requests.at(-1), 200, {...snapshot(), version: "0.4.0"});
   assert.equal(app.element("version").textContent, "Version 0.4.0");
@@ -249,7 +251,7 @@ async function nonoverlapAndNetworkFailure() {
   app.tick();
   app.element("refresh-button").events.click();
   assert.equal(app.requests.length, 1, "In-flight requests must not overlap");
-  await reply(app.requests[0], 200, {status: "ready", version: "0.3.2"});
+  await reply(app.requests[0], 200, {status: "ready", version: "0.3.3"});
   app.tick();
   assert.equal(app.requests.length, 2);
   app.requests[1].reject(new Error("network offline"));
@@ -264,7 +266,7 @@ async function nonoverlapAndNetworkFailure() {
 
 async function authenticationAndSafeRendering() {
   const app = harness();
-  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.2"});
+  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.3"});
   app.enterKey("secret-key");
   assert.equal(app.requests[1].url, "/status/data");
   assert.equal(app.requests[1].options.headers.Authorization, "Bearer secret-key");
@@ -295,9 +297,9 @@ async function lockLateResponsesAndRejectedKeys() {
   assert.equal(app.requests[3].url, "/healthz");
   await reply(app.requests[2], 200, snapshot());
   assert.equal(app.element("details").hidden, true, "A late authenticated result must not unlock details");
-  await reply(app.requests[0], 200, {status: "ready", version: "0.3.2"});
+  await reply(app.requests[0], 200, {status: "ready", version: "0.3.3"});
   assert.equal(app.element("health-panel").className, "health-panel tone-pending", "A cancelled old public request must not overwrite pending state");
-  await reply(app.requests[3], 503, {status: "unavailable", version: "0.3.2"});
+  await reply(app.requests[3], 503, {status: "unavailable", version: "0.3.3"});
   app.enterKey("rejected-key");
   await reply(app.requests[4], 401, {});
   assert.equal(app.element("details").hidden, true);
@@ -906,16 +908,29 @@ async function savedHostCatalogStaleAndPrivate() {
 }
 
 async function collapsiblePanelsAndSavedHostResults() {
-  for (const id of ["update-panel", "summary-panel", "links-panel", "hosts-panel", "self-test-panel", "backends-panel", "models-panel", "aliases-panel", "performance-panel"]) {
+  for (const id of ["traffic-panel", "update-panel", "summary-panel", "links-panel", "hosts-panel", "self-test-panel", "backends-panel", "models-panel", "aliases-panel", "performance-panel"]) {
     const tag = markup.match(new RegExp(`<details\\b[^>]*\\bid="${id}"[^>]*>`));
     assert.ok(tag && /\bopen\b/.test(tag[0]), `${id} must be a native details panel that starts expanded`);
   }
+  const about = markup.match(/<details\b[^>]*\bid="about-panel"[^>]*>/);
+  assert.ok(about && !/\bopen\b/.test(about[0]), "Reading notes start folded so they do not compete with live status");
+  for (const id of ["traffic-panel", "self-test-panel"]) assert.match(markup.match(new RegExp(`<details\\b[^>]*\\bid="${id}"[^>]*>`))[0], /\bhidden\b/, `${id} is private and starts hidden`);
+  const zones = markup.match(/<div class="zone-heading"><h2>([^<]+)<\/h2><\/div>/g).map(item => item.replace(/<[^>]+>/g, ""));
+  assert.deepEqual(zones, ["Overview", "Fleet", "Operations"]);
+  assert.ok(markup.indexOf('id="traffic-panel"') < markup.indexOf('id="public-summary-title"'), "Traffic leads the overview zone");
+  assert.ok(markup.indexOf('id="self-test-panel"') > markup.indexOf('id="details"'), "Self-test lives in operations after the fleet");
   for (const summary of markup.match(/<summary[\s\S]*?<\/summary>/g)) assert.doesNotMatch(summary, /<(button|a|input)\b/, "Interactive controls inside a summary would also toggle the panel");
   const app = await unlocked();
+  assert.equal(app.element("self-test-panel").hidden, false);
+  assert.equal(app.element("traffic-panel").hidden, false);
+  assert.equal(app.element("backends-meta").textContent, "1 of 1 online");
+  assert.equal(app.element("models-meta").textContent, "1 of 1 available");
+  assert.equal(app.element("self-test-meta").textContent, "Not run");
   app.element("collapse-all-button").events.click();
-  for (const id of ["hosts-panel", "update-panel", "performance-panel", "links-panel"]) assert.equal(app.element(id).open, false);
+  for (const id of ["hosts-panel", "update-panel", "performance-panel", "links-panel", "about-panel", "traffic-panel"]) assert.equal(app.element(id).open, false);
   app.element("expand-all-button").events.click();
   assert.equal(app.element("hosts-panel").open, true);
+  assert.equal(app.element("about-panel").open, true);
   app.element("collapse-all-button").events.click();
   assert.equal(app.element("update-button").disabled, false);
   app.update();
@@ -934,6 +949,7 @@ async function collapsiblePanelsAndSavedHostResults() {
   const hosts = await unlockedHosts(saved().hosts);
   const body = hosts.element("hosts-body");
   assert.equal(body.children.length, 2);
+  assert.equal(hosts.element("hosts-meta").textContent, "2 saved");
   assert.equal(body.children[0].children[1].className, "host-checks");
   assert.equal(body.children[0].children[1].children.length, 2, "Both server checks render in one results grid");
   const toggle = body.children[0].children[0].children[2].children[2];
@@ -971,11 +987,110 @@ async function collapsiblePanelsAndSavedHostResults() {
   assert.ok(hosts.allRequests.slice(requestCount).every(request => request.options.method === "GET"), "Folding and unfolding never sends requests");
   hosts.lock();
   assert.equal(body.textContent, "");
+  assert.equal(hosts.element("hosts-meta").textContent, "");
+  assert.equal(hosts.element("self-test-panel").hidden, true);
   hosts.enterKey("secret-key");
   await reply(hosts.requests.at(-1), 200, snapshot());
   await reply(hosts.hostRequests.at(-1), 200, saved());
   assert.equal(body.children[0].children[1].hidden, false, "Locking forgets per-address view state");
   assert.equal(descendants(body, "host-catalog")[0].open, true, "Locking forgets folded model lists");
+}
+
+function trafficSample(now, overrides = {}) {
+  const hourMs = 3600000;
+  const hour = ms => new Date(Math.floor(ms / hourMs) * hourMs).toISOString().replace(".000Z", "+00:00");
+  const recent = {hour: hour(now), requests_ok: 80, requests_failed: 2, reroutes_ok: 3, reroutes_failed: 1, input_tokens: 12000, output_tokens: 3000, failures: {timeout: 2, http_5xx: 1}};
+  const older = {hour: hour(now - 30 * hourMs), requests_ok: 10, requests_failed: 0, reroutes_ok: 0, reroutes_failed: 0, input_tokens: 500, output_tokens: 100, failures: {}};
+  const strip = row => { const {hour: _, ...rest} = row; return rest; };
+  const week = {requests_ok: 90, requests_failed: 2, reroutes_ok: 3, reroutes_failed: 1, input_tokens: 12500, output_tokens: 3100, failures: {timeout: 2, http_5xx: 1}};
+  const totals = {requests_ok: 500, requests_failed: 20, reroutes_ok: 9, reroutes_failed: 4, input_tokens: 2100000, output_tokens: 612000, failures: {timeout: 12, connection: 7, http_5xx: 3, no_eligible_model: 2}};
+  return {available: true, retention_hours: 720, since: "2026-09-01T00:00:00+00:00", totals, windows: {"24h": strip(recent), "7d": week}, hourly: [older, recent], ...overrides};
+}
+
+async function trafficTilesChartAndWindows() {
+  const app = await unlocked();
+  assert.equal(app.element("traffic-panel").hidden, false);
+  assert.match(app.element("traffic-message").textContent, /does not report client traffic/);
+  assert.equal(app.element("traffic-tiles").children.length, 0);
+  assert.equal(app.element("traffic-meta").textContent, "Not reported");
+  const now = Date.parse(snapshot().checked_at);
+  const withTraffic = traffic => ({...snapshot(), performance: {available: true, updated_at: null, deployments: [], traffic}});
+  app.tick();
+  await reply(app.requests.at(-1), 200, withTraffic(trafficSample(now)));
+  assert.match(app.element("traffic-message").textContent, /Counting since .*kept for 30 days/);
+  const tiles = app.element("traffic-tiles").children;
+  assert.equal(tiles.length, 4);
+  assert.equal(tiles[0].children[1]._text, "82");
+  const segments = descendants(tiles[0], "seg");
+  assert.equal(segments.length, 2);
+  assert.equal(segments[0].style.width, `${100 * 80 / 82}%`);
+  assert.equal(segments[1].className, "seg seg-failed");
+  assert.match(tiles[0].textContent, /80 succeeded \(97\.6%\) · 2 failed/);
+  assert.match(tiles[1].textContent, /12K in/);
+  assert.match(tiles[1].textContent, /3,000 out/);
+  assert.equal(descendants(tiles[1], "bar-fill")[1].style.width, "25%", "Token bars share one scale");
+  assert.equal(tiles[2].children[1]._text, "4");
+  assert.match(tiles[2].textContent, /3 rescued · 1 still failed · 4\.9 per 100 requests/);
+  assert.equal(tiles[3].children[1]._text, "3");
+  const kinds = descendants(tiles[3], "bar-row");
+  assert.deepEqual(kinds.map(row => row.children[0].textContent), ["Timeouts", "Backend 5xx errors"]);
+  assert.equal(kinds[0].children[1].children[0].style.width, "100%");
+  const chart = app.element("traffic-chart");
+  assert.equal(chart.children[0].tagName, "svg");
+  assert.equal(descendants(chart, "hit").length, 24, "One hover target per hour, wider than the bar");
+  assert.equal(descendants(chart, "bar-ok").length, 1);
+  assert.equal(descendants(chart, "bar-failed").length, 1);
+  assert.match(chart.children[0].attributes["aria-label"], /80 succeeded, 2 failed; busiest hour 82 requests/);
+  assert.equal(app.element("traffic-table-body").children.length, 1, "The table view lists only hours with traffic");
+  assert.match(app.element("traffic-table-hint").textContent, /24 hours · 1 with traffic/);
+  assert.equal(app.element("traffic-meta").textContent, "82 requests · last 24 hours");
+  assert.match(app.element("traffic-chart-title").textContent, /last 24 hours/);
+  const requestCount = app.allRequests.length;
+  app.element("traffic-window-7d").events.click();
+  assert.equal(app.element("traffic-window-7d").attributes["aria-pressed"], "true");
+  assert.equal(app.element("traffic-window-24h").attributes["aria-pressed"], "false");
+  assert.equal(app.element("traffic-tiles").children[0].children[1]._text, "92");
+  assert.equal(descendants(chart, "hit").length, 168);
+  assert.equal(app.element("traffic-table-body").children.length, 2);
+  app.element("traffic-window-all").events.click();
+  assert.equal(app.element("traffic-tiles").children[0].children[1]._text, "520");
+  assert.match(app.element("traffic-tiles").children[1].textContent, /2\.1M in/);
+  assert.match(app.element("traffic-tiles").children[1].textContent, /612K out/);
+  assert.deepEqual(descendants(app.element("traffic-tiles").children[3], "bar-row").map(row => row.children[0].textContent), ["Timeouts", "Connection errors", "Backend 5xx errors", "No eligible model"]);
+  assert.equal(descendants(chart, "hit").length, 168, "All time keeps the seven-day chart");
+  assert.match(app.element("traffic-chart-title").textContent, /last 7 days/);
+  assert.equal(app.element("traffic-meta").textContent, "520 requests · all time");
+  assert.equal(app.allRequests.length, requestCount, "Switching windows is a local re-render");
+  app.tick();
+  await reply(app.requests.at(-1), 200, withTraffic(trafficSample(now, {totals: {...trafficSample(now).totals, failures: {'<img src=x onerror="alert(1)">': 5, constructor: 1}}})));
+  const hostile = descendants(app.element("traffic-tiles").children[3], "bar-row");
+  assert.deepEqual(hostile.map(row => row.children[0].textContent), ["Other"]);
+  assert.equal(hostile[0].children[2].textContent, "6", "Unknown kinds fold into one Other row");
+  assert.doesNotMatch(app.element("traffic-tiles").textContent, /onerror/);
+  for (const broken of [{hourly: "nope"}, {totals: {requests_ok: -1}}, {windows: {}}, {hourly: [{hour: "not a time", requests_ok: 1, requests_failed: 0, reroutes_ok: 0, reroutes_failed: 0, input_tokens: 0, output_tokens: 0, failures: {}}]}, {since: 5}]) {
+    app.tick();
+    await reply(app.requests.at(-1), 200, withTraffic(trafficSample(now, broken)));
+    assert.match(app.element("traffic-message").textContent, /could not be read/);
+    assert.equal(app.element("traffic-message").className, "traffic-message muted result-warning");
+    assert.equal(app.element("traffic-tiles").children.length, 0);
+    assert.equal(app.element("traffic-chart").children.length, 0);
+  }
+  app.tick();
+  await reply(app.requests.at(-1), 200, withTraffic(trafficSample(now, {available: false})));
+  assert.match(app.element("traffic-message").textContent, /history is unavailable/);
+  assert.equal(app.element("traffic-meta").textContent, "Unavailable");
+  app.tick();
+  await reply(app.requests.at(-1), 200, withTraffic(trafficSample(now, {since: null, hourly: [], windows: {"24h": trafficSample(now).windows["7d"], "7d": trafficSample(now).windows["7d"]}})));
+  assert.match(app.element("traffic-message").textContent, /No client requests have been recorded yet/);
+  assert.match(chart.children[0].textContent, /No requests in this window/);
+  assert.equal(app.element("details").hidden, false, "Traffic problems never hide the rest of the dashboard");
+  app.lock();
+  assert.equal(app.element("traffic-panel").hidden, true);
+  assert.equal(app.element("traffic-tiles").children.length, 0);
+  assert.equal(app.element("traffic-chart").children.length, 0);
+  assert.equal(app.element("traffic-table-body").children.length, 0);
+  assert.match(app.element("traffic-message").textContent, /Unlock backend details/);
+  assert.equal(app.element("traffic-meta").textContent, "");
 }
 
 async function publicCachedSummary() {
@@ -1785,7 +1900,7 @@ async function updateStatusValidationAndSafeRendering() {
 }
 
 (async () => {
-  for (const test of [publicReadiness, topbarVersionTracksCurrentSnapshot, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession, performanceIsPassiveAndPerDeployment, performanceUnknownZeroAndMissingTimings, performanceEmptyOlderAndUnavailableStorage, performanceEscapingAndPrivateStateClearing, performanceLateBodyAndNewSessionGuards, savedHostRoutingStatesAndSafeDetails, savedHostSaveEnrollmentAndRouterRefresh, savedHostSnapshotPollingIsAuthenticatedAndReadOnly, savedHostEnrollmentMutationRaceGuards, collapsiblePanelsAndSavedHostResults]) {
+  for (const test of [publicReadiness, topbarVersionTracksCurrentSnapshot, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession, performanceIsPassiveAndPerDeployment, performanceUnknownZeroAndMissingTimings, performanceEmptyOlderAndUnavailableStorage, performanceEscapingAndPrivateStateClearing, performanceLateBodyAndNewSessionGuards, savedHostRoutingStatesAndSafeDetails, savedHostSaveEnrollmentAndRouterRefresh, savedHostSnapshotPollingIsAuthenticatedAndReadOnly, savedHostEnrollmentMutationRaceGuards, collapsiblePanelsAndSavedHostResults, trafficTilesChartAndWindows]) {
     await test();
     console.log(`PASS ${test.name}`);
   }

@@ -43,21 +43,7 @@ _STATUS_HTML = """<!doctype html>
       </div>
     </section>
 
-    <details id="update-panel" class="card update-panel" open>
-      <summary class="card-summary"><h2 id="update-title">Router software updates</h2></summary>
-      <div class="card-body">
-        <p id="update-warning" class="muted">Check for updates checks official main and automatically installs a newer commit. Installation briefly restarts the router and can interrupt requests. Your API key is required.</p>
-        <p id="update-message" class="muted" role="status">Unlock backend details to enable software updates.</p>
-        <div id="update-details" hidden>
-          <p class="update-stage">Stage: <strong id="update-stage"></strong></p>
-          <progress id="update-progress" aria-label="Router update in progress" hidden></progress>
-          <p id="update-observed" class="muted"></p>
-          <button id="update-refresh-button" type="button">Refresh update status</button>
-          <p class="muted">Status refresh reads the local update job only; it never starts another update.</p>
-        </div>
-      </div>
-    </details>
-
+    <div class="zone-heading"><h2>Overview</h2></div>
     <section id="health-panel" class="health-panel tone-pending" aria-labelledby="health-title" aria-live="polite" aria-atomic="true">
       <span class="health-dot" aria-hidden="true"></span>
       <div><h2 id="health-title">Checking router…</h2>
@@ -72,33 +58,40 @@ _STATUS_HTML = """<!doctype html>
       <div class="overview-item"><span class="label">Last checked</span><strong id="checked-at">—</strong></div>
     </section>
 
+    <details id="traffic-panel" class="card traffic-panel" open hidden>
+      <summary class="card-summary"><h2 id="traffic-title">Client traffic <span class="card-summary-meta" id="traffic-meta"></span></h2></summary>
+      <div class="card-intro traffic-intro">
+        <p class="muted">Requests that clients sent through this router, counted once each even when a failed backend attempt was rerouted. Tokens count successful requests only. Nothing here sends prompts or runs benchmarks.</p>
+        <div class="traffic-windows" role="group" aria-label="Traffic time window">
+          <button id="traffic-window-24h" type="button" class="window-button" aria-pressed="true">Last 24 hours</button>
+          <button id="traffic-window-7d" type="button" class="window-button" aria-pressed="false">Last 7 days</button>
+          <button id="traffic-window-all" type="button" class="window-button" aria-pressed="false">All time</button>
+        </div>
+      </div>
+      <p id="traffic-message" class="traffic-message muted" role="status">Unlock backend details to see client traffic.</p>
+      <div id="traffic-tiles" class="traffic-tiles" aria-label="Traffic totals"></div>
+      <div class="traffic-chart-wrap">
+        <div class="traffic-chart-heading"><h3 id="traffic-chart-title">Requests per hour</h3>
+          <ul class="chart-legend" aria-label="Chart legend"><li><span class="swatch swatch-ok" aria-hidden="true"></span>Succeeded</li><li><span class="swatch swatch-failed" aria-hidden="true"></span>Failed</li></ul></div>
+        <div id="traffic-chart" class="traffic-chart"></div>
+        <details class="traffic-table"><summary class="host-catalog-summary"><span class="host-catalog-title">Table view</span><span id="traffic-table-hint" class="muted"></span></summary>
+          <div class="table-scroll"><table><caption class="sr-only">Hourly client requests</caption>
+            <thead><tr><th scope="col">Hour</th><th scope="col">Succeeded</th><th scope="col">Failed</th><th scope="col">Reroutes (rescued / failed)</th><th scope="col">Tokens in</th><th scope="col">Tokens out</th></tr></thead>
+            <tbody id="traffic-table-body"></tbody>
+          </table></div>
+        </details>
+      </div>
+    </details>
+
     <details id="summary-panel" class="card public-summary" open>
-      <summary class="card-summary"><h2 id="public-summary-title">Network summary</h2></summary>
-      <div class="card-intro"><p class="muted">Cached counts only; this summary does not include addresses or model names. No network scan or inference runs when this page refreshes.</p></div>
+      <summary class="card-summary"><h2 id="public-summary-title">Network summary <span class="card-summary-meta" id="summary-meta"></span></h2></summary>
+      <div class="card-intro"><p class="muted">Cached counts only, with no addresses or model names. Refreshing this page never scans the network or runs inference.</p></div>
       <div class="public-summary-counts">
         <div><span class="label">Known servers</span><strong id="public-count-servers">Unknown</strong></div>
         <div><span class="label">Listed model copies</span><strong id="public-count-models">Unknown</strong></div>
         <div><span class="label">Last successful metadata check</span><strong id="public-last-verified">Unknown</strong></div>
       </div>
       <p id="public-summary-note" class="muted">Waiting for a current summary. Counts do not prove models are loaded or inference works.</p>
-    </details>
-
-    <details id="links-panel" class="card quick-links" open>
-      <summary class="card-summary"><h2 id="links-title">Router links</h2></summary>
-      <div class="card-body">
-      <p class="muted">This router: <code id="router-origin">Current server</code>. Links open in a new tab.</p>
-      <nav aria-label="Router API and diagnostic links">
-        <a href="/healthz" target="_blank" rel="noopener noreferrer">Health</a>
-        <a href="/readyz" target="_blank" rel="noopener noreferrer">Readiness</a>
-        <a href="/status/data" target="_blank" rel="noopener noreferrer">Status JSON</a>
-        <a href="/router/status" target="_blank" rel="noopener noreferrer">Router diagnostics</a>
-        <a href="/router/metrics" target="_blank" rel="noopener noreferrer">Performance JSON</a>
-        <a href="/api/version" target="_blank" rel="noopener noreferrer">Ollama API version</a>
-        <a href="/api/tags" target="_blank" rel="noopener noreferrer">Ollama model list</a>
-        <a href="/v1/models" target="_blank" rel="noopener noreferrer">OpenAI model list</a>
-      </nav>
-      <p class="muted">These are API responses, not separate apps. Protected links may show 401 because new tabs do not receive this page’s API key. Model-list links list metadata; they do not run models.</p>
-      </div>
     </details>
 
     <p id="url-key-message" class="help-box" role="status" hidden></p>
@@ -121,12 +114,24 @@ _STATUS_HTML = """<!doctype html>
     </section>
 
     <section id="details" aria-label="Backend details" hidden>
-      <div class="section-heading"><h2>Backend details</h2></div>
+      <div class="zone-heading"><h2>Fleet</h2></div>
+      <div class="stats" aria-label="Backend counts">
+        <div class="stat"><span class="label">Known backends</span><strong id="count-endpoints">—</strong></div>
+        <div class="stat"><span class="label">Backends online</span><strong id="count-online">—</strong></div>
+        <div class="stat"><span class="label">Available / enabled models</span><strong id="count-models">—</strong></div>
+        <div class="stat"><span class="label">Model aliases</span><strong id="count-aliases">—</strong></div>
+      </div>
+      <div id="setup-help" class="help-box" hidden>
+        <h3>No usable model yet</h3>
+        <p>Start Ollama or LM Studio, make a chat model available, and save its IP address below to enroll discovered models automatically.
+        You can also explicitly configure backends using <code>LLM_ROUTER_DISCOVERY_URLS</code> in <code>router.env</code> and restart the router.
+        If a backend is offline, check its address, firewall, and VPN connection.</p>
+      </div>
       <details id="hosts-panel" class="card" open>
-        <summary class="card-summary"><h2 id="hosts-title">Saved backend addresses</h2></summary>
+        <summary class="card-summary"><h2 id="hosts-title">Saved backend addresses <span class="card-summary-meta" id="hosts-meta"></span></h2></summary>
         <div class="card-intro">
-          <p class="muted">Save an IP address or hostname to automatically enroll its discovered models for client routing. The router checks saved addresses at startup and every 30 seconds using metadata only: no prompts, model loading, or downloads. Listed models may not be loaded; inference is not tested. Only the addresses you save are checked, not whole subnets.</p>
-          <p class="muted">Remove stops checks for that address and removes routes owned only by it. Explicitly configured routes are preserved. Server checks for one address sit side by side; Hide results shrinks an address to one line, and each model list folds from its heading.</p>
+          <p class="muted">Save an IP address or hostname to automatically enroll its discovered models for client routing. The router checks saved addresses at startup and every 30 seconds using metadata only: no prompts, model loading, or downloads. Only the addresses you save are checked, not whole subnets.</p>
+          <p class="muted">Remove withdraws routes owned only by that address; explicitly configured routes are preserved. Server checks sit side by side, Hide results shrinks an address to one line, and each model list folds from its heading.</p>
         </div>
         <form id="host-form" class="host-form" autocomplete="off">
           <label for="host-address">IP address, hostname, or backend URL</label>
@@ -138,32 +143,10 @@ _STATUS_HTML = """<!doctype html>
           <div class="hosts-actions"><button id="hosts-reload-button" type="button">Reload saved</button><button id="hosts-check-button" type="button">Check all saved</button></div></div>
         <div id="hosts-results" class="host-list"><ul id="hosts-body" class="host-entries" aria-label="Saved addresses and metadata checks"></ul></div>
       </details>
-      <details id="self-test-panel" class="card" open>
-        <summary class="card-summary"><h2 id="self-test-title">Connection self-test</h2></summary>
-        <div class="card-intro self-test-intro"><p class="muted">Checks router APIs and backend metadata only. Never sends prompts, runs inference, loads models, or downloads anything.</p>
-          <button id="self-test-button" type="button">Run self-test (no models)</button></div>
-        <p id="self-test-message" class="self-test-message muted" role="status">Runs only when you click. No self-test has been run in this page.</p>
-        <div id="self-test-results" class="table-scroll" hidden><table><caption class="sr-only">Connection self-test results</caption>
-          <thead><tr><th scope="col">Check / target</th><th scope="col">Result</th><th scope="col">Detail</th><th scope="col">Time</th></tr></thead>
-          <tbody id="self-test-body"></tbody>
-        </table></div>
-      </details>
-      <div class="stats" aria-label="Backend counts">
-        <div class="stat"><span class="label">Known backends</span><strong id="count-endpoints">—</strong></div>
-        <div class="stat"><span class="label">Backends online</span><strong id="count-online">—</strong></div>
-        <div class="stat"><span class="label">Available / enabled models</span><strong id="count-models">—</strong></div>
-        <div class="stat"><span class="label">Model aliases</span><strong id="count-aliases">—</strong></div>
-      </div>
-      <div id="setup-help" class="help-box" hidden>
-        <h3>No usable model yet</h3>
-        <p>Start Ollama or LM Studio, make a chat model available, and save its IP address above to enroll discovered models automatically.
-        You can also explicitly configure backends using <code>LLM_ROUTER_DISCOVERY_URLS</code> in <code>router.env</code> and restart the router.
-        If a backend is offline, check its address, firewall, and VPN connection.</p>
-      </div>
 
       <details id="backends-panel" class="card" open>
-        <summary class="card-summary"><h2 id="backends-title">Backends</h2></summary>
-        <div class="card-intro"><p class="muted">Known machines and their latest reachability checks. Address links open each backend’s own port; it may show an API response or 404 instead of a homepage. Your browser needs network/VPN access. The router key is never forwarded.</p></div>
+        <summary class="card-summary"><h2 id="backends-title">Backends <span class="card-summary-meta" id="backends-meta"></span></h2></summary>
+        <div class="card-intro"><p class="muted">Known machines and their latest metadata reachability checks. Address links open each backend’s own API port in your browser; the router key is never forwarded.</p></div>
         <div class="table-scroll"><table><caption class="sr-only">Backend reachability</caption>
           <thead><tr><th scope="col">Machine / backend</th><th scope="col">API address</th><th scope="col">Status</th><th scope="col">Models ready</th><th scope="col">Last probe</th></tr></thead>
           <tbody id="endpoints-body"></tbody>
@@ -171,7 +154,7 @@ _STATUS_HTML = """<!doctype html>
       </details>
 
       <details id="models-panel" class="card" open>
-        <summary class="card-summary"><h2 id="models-title">Model deployments</h2></summary>
+        <summary class="card-summary"><h2 id="models-title">Model deployments <span class="card-summary-meta" id="models-meta"></span></h2></summary>
         <div class="card-intro"><p class="muted">Each model copy on each machine; readiness is not a test generation.</p></div>
         <div class="table-scroll"><table><caption class="sr-only">Model deployments and request counters</caption>
           <thead><tr><th scope="col">Model / deployment</th><th scope="col">Machine</th><th scope="col">Status</th><th scope="col">Active requests</th><th scope="col">Succeeded / failed</th></tr></thead>
@@ -180,7 +163,7 @@ _STATUS_HTML = """<!doctype html>
       </details>
 
       <details id="aliases-panel" class="card" open>
-        <summary class="card-summary"><h2 id="aliases-title">Client model names</h2></summary>
+        <summary class="card-summary"><h2 id="aliases-title">Client model names <span class="card-summary-meta" id="aliases-meta"></span></h2></summary>
         <div class="card-intro"><p class="muted">HA shares replicas; preferred tries one machine first; pinned never fails over.</p></div>
         <div class="table-scroll"><table><caption class="sr-only">High availability and machine-specific aliases</caption>
           <thead><tr><th scope="col">Alias</th><th scope="col">Routing</th><th scope="col">Status</th><th scope="col">Deployments</th></tr></thead>
@@ -188,17 +171,80 @@ _STATUS_HTML = """<!doctype html>
         </table></div>
       </details>
       <details id="performance-panel" class="card" open>
-        <summary class="card-summary"><h2 id="performance-title">Observed model performance</h2></summary>
-        <div class="card-intro"><p class="muted">Measured passively from real requests through this router and saved across restarts and updates. Refresh never runs a benchmark or model. Smoothed averages use EWMA, which gives recent samples more weight. Request time covers the whole upstream call; token rates and load/setup time require backend-reported timings, which some backends do not provide.</p></div>
+        <summary class="card-summary"><h2 id="performance-title">Observed model performance <span class="card-summary-meta" id="performance-meta"></span></h2></summary>
+        <div class="card-intro"><p class="muted">Measured passively from real requests through this router and saved across restarts and updates. Refresh never runs a benchmark or model. Smoothed averages use EWMA; token rates and load/setup time need backend-reported timings. Request time covers the whole upstream call.</p></div>
         <p id="performance-message" class="performance-message muted" role="status">Waiting for saved performance observations.</p>
         <div class="table-scroll"><table><caption class="sr-only">Saved request performance by model and server</caption>
           <thead><tr><th scope="col">Model / server</th><th scope="col">Input tok/s</th><th scope="col">Output tok/s</th><th scope="col">Reported load / setup</th><th scope="col">Request time (wall clock)</th><th scope="col">Requests</th><th scope="col">Last observed</th></tr></thead>
           <tbody id="performance-body"></tbody>
         </table></div>
-        <p class="performance-note muted">Load/setup times are backend-reported. Slow reported loads may be cold starts, but do not prove disk I/O. Missing timings are not estimated from request latency. Historical rows preserve observations for deployments no longer in the current routing configuration.</p>
+        <p class="performance-note muted">Load/setup times are backend-reported. Slow reported loads may be cold starts, but do not prove disk I/O. Missing timings are not estimated from request latency. Historical rows keep observations for deployments no longer in the routing configuration.</p>
       </details>
       <p class="muted snapshot-note">Last discovery: <span id="last-discovery">—</span>. Refresh reads the current snapshot; it does not scan your network or run a model.</p>
     </section>
+
+    <div class="zone-heading"><h2>Operations</h2></div>
+    <details id="self-test-panel" class="card" open hidden>
+      <summary class="card-summary"><h2 id="self-test-title">Connection self-test <span class="card-summary-meta" id="self-test-meta"></span></h2></summary>
+      <div class="card-intro self-test-intro"><p class="muted">Checks router APIs and backend metadata only. Never sends prompts, runs inference, loads models, or downloads anything.</p>
+        <button id="self-test-button" type="button">Run self-test (no models)</button></div>
+      <p id="self-test-message" class="self-test-message muted" role="status">Runs only when you click. No self-test has been run in this page.</p>
+      <div id="self-test-results" class="table-scroll" hidden><table><caption class="sr-only">Connection self-test results</caption>
+        <thead><tr><th scope="col">Check / target</th><th scope="col">Result</th><th scope="col">Detail</th><th scope="col">Time</th></tr></thead>
+        <tbody id="self-test-body"></tbody>
+      </table></div>
+    </details>
+
+    <details id="update-panel" class="card update-panel" open>
+      <summary class="card-summary"><h2 id="update-title">Router software updates <span class="card-summary-meta" id="update-meta"></span></h2></summary>
+      <div class="card-body">
+        <p id="update-warning" class="muted">Check for updates checks official main and automatically installs a newer commit. Installation briefly restarts the router and can interrupt requests. Your API key is required.</p>
+        <p id="update-message" class="muted" role="status">Unlock backend details to enable software updates.</p>
+        <div id="update-details" hidden>
+          <p class="update-stage">Stage: <strong id="update-stage"></strong></p>
+          <progress id="update-progress" aria-label="Router update in progress" hidden></progress>
+          <p id="update-observed" class="muted"></p>
+          <button id="update-refresh-button" type="button">Refresh update status</button>
+          <p class="muted">Status refresh reads the local update job only; it never starts another update.</p>
+        </div>
+      </div>
+    </details>
+
+    <details id="links-panel" class="card quick-links" open>
+      <summary class="card-summary"><h2 id="links-title">Router links</h2></summary>
+      <div class="card-body">
+      <p class="muted">This router: <code id="router-origin">Current server</code>. Links open in a new tab.</p>
+      <nav aria-label="Router API and diagnostic links">
+        <a href="/healthz" target="_blank" rel="noopener noreferrer">Health</a>
+        <a href="/readyz" target="_blank" rel="noopener noreferrer">Readiness</a>
+        <a href="/status/data" target="_blank" rel="noopener noreferrer">Status JSON</a>
+        <a href="/router/status" target="_blank" rel="noopener noreferrer">Router diagnostics</a>
+        <a href="/router/metrics" target="_blank" rel="noopener noreferrer">Performance JSON</a>
+        <a href="/api/version" target="_blank" rel="noopener noreferrer">Ollama API version</a>
+        <a href="/api/tags" target="_blank" rel="noopener noreferrer">Ollama model list</a>
+        <a href="/v1/models" target="_blank" rel="noopener noreferrer">OpenAI model list</a>
+      </nav>
+      <p class="muted">These are API responses, not separate apps. Protected links may show 401 because new tabs do not receive this page’s API key.</p>
+      </div>
+    </details>
+
+    <details id="about-panel" class="card about-panel">
+      <summary class="card-summary"><h2 id="about-title">How to read this page</h2></summary>
+      <div class="card-body about-body">
+        <dl>
+          <dt>What refreshes do</dt>
+          <dd>Status refreshes every 10 seconds and saved addresses every 30 seconds. Both read cached results. Nothing on this page scans your network, loads a model, or sends a prompt unless you click Save, Check, or Run self-test, and those read metadata only.</dd>
+          <dt>Online is not inference</dt>
+          <dd>“Online”, “Found”, and a listed model mean an API answered a metadata request. They do not prove a model is loaded or that generation will succeed.</dd>
+          <dt>Client traffic</dt>
+          <dd>Requests are counted once each, as clients see them. A reroute is a request that needed another backend after a failed attempt; “rescued” means it still succeeded. Every failed attempt counts once under its kind, so a rescued request still shows the failure that caused the reroute. Tokens are backend-reported and counted for successful requests only. Hourly history is kept for 30 days.</dd>
+          <dt>Performance numbers</dt>
+          <dd>Token rates and load times come from timings that backends include in ordinary responses. Smoothed values are exponentially weighted moving averages with alpha 0.2. Missing timings show as Not reported, never as zero. A slow reported load suggests a cold start without proving a disk read.</dd>
+          <dt>Links and keys</dt>
+          <dd>Router links open raw API responses, not apps, and protected ones may show 401 because new tabs never receive this page’s key. Your key stays in page memory only, and backends never receive it.</dd>
+        </dl>
+      </div>
+    </details>
     <noscript><p class="help-box">Enable JavaScript to view live status. The JSON readiness endpoint is <a href="/healthz">/healthz</a>.</p></noscript>
   </main>
   <footer><p>Status refreshes every 10 seconds · saved backends are rechecked every 30 seconds · self-tests run only on click · metadata checks do not prove inference works</p></footer>
@@ -208,7 +254,7 @@ _STATUS_HTML = """<!doctype html>
 
 
 STATUS_CSS = """
-:root{color-scheme:light;--navy:#14253d;--ink:#1c3048;--muted:#52657b;--line:#d9e2ec;--surface:#fff;--background:#f3f6fa;--green:#176943;--amber:#845108;--red:#a22b35}
+:root{color-scheme:light;--navy:#14253d;--ink:#1c3048;--muted:#52657b;--line:#d9e2ec;--surface:#fff;--background:#f3f6fa;--green:#176943;--amber:#845108;--red:#a22b35;--chart-ok:#238b6a;--chart-failed:#c0392b;--track:#e7edf4}
 *{box-sizing:border-box}body{margin:0;background:var(--background);color:var(--ink);font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:15px;line-height:1.6}
 [hidden]{display:none!important}a{color:#245aba}button,input{font:inherit}button{cursor:pointer;border:1px solid #a9b9cb;border-radius:8px;padding:9px 15px;color:var(--ink);background:#fff;font-weight:600;white-space:nowrap}button:hover{background:#edf3fa}button:disabled{cursor:wait;opacity:.65}button.primary{background:var(--navy);color:#fff;border-color:var(--navy)}button.primary:hover{background:#263e5d}button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid #669eea;outline-offset:3px}input{min-width:0;width:100%;border:1px solid #9aaec3;border-radius:8px;padding:10px 12px;color:var(--ink);background:#fff}code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.9em;overflow-wrap:anywhere}
 .topbar{background:var(--navy);color:#fff;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;padding:18px max(24px,calc((100% - 1352px)/2));gap:20px}.brand{display:flex;align-items:center;gap:12px;font-weight:700;letter-spacing:-.02em;font-size:19px}.brand-mark{display:grid;place-items:center;width:32px;height:32px;border:1px solid #6e83a1;border-radius:9px;font-size:24px;line-height:1}.brand-subtitle{font-weight:400;color:#bdcce0}.topbar-meta{display:flex;flex-wrap:wrap;align-items:center;gap:12px}.version-badge{display:inline-block;padding:3px 10px;border:1px solid #6e83a1;border-radius:999px;color:#fff;font-size:12px;font-weight:600;white-space:nowrap}.version-badge:empty{display:none}.readonly{font-size:12px;color:#d1deee;letter-spacing:.03em}
@@ -227,6 +273,20 @@ main{max-width:1400px;margin:auto;padding:38px 24px 24px}.heading,.section-headi
 @media(max-width:800px){.self-test-intro{align-items:flex-start;flex-direction:column}}
 @media(max-width:600px){.hosts-toolbar{align-items:flex-start;flex-direction:column}.host-form .key-controls{flex-direction:column}.host-entry-head .hosts-actions{margin-left:0}}
 @media(max-width:600px){.public-summary-counts{grid-template-columns:1fr 1fr}.public-summary-counts>div:last-child{grid-column:1/-1}}
+.zone-heading{display:flex;align-items:center;gap:14px;margin:34px 0 14px}.zone-heading h2{font-size:12px;text-transform:uppercase;letter-spacing:.14em;color:var(--muted);font-weight:700;margin:0}.zone-heading::after{content:"";flex:1 1 auto;height:1px;background:var(--line)}.heading+.zone-heading{margin-top:0}
+.card-summary-meta{font-size:12px;font-weight:500;color:var(--muted);margin-left:10px;letter-spacing:0;white-space:nowrap}.card-summary-meta:empty{display:none}
+.traffic-intro{display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:12px 24px}.traffic-intro p{flex:1 1 320px}.traffic-windows{display:flex;flex-wrap:wrap;gap:6px}.window-button{padding:6px 10px;font-size:12px}.window-button[aria-pressed="true"]{background:var(--navy);color:#fff;border-color:var(--navy)}
+.traffic-message{padding:0 22px 14px}.traffic-message.result-warning{color:var(--amber)}
+.traffic-tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;padding:0 22px 18px}.traffic-tiles:empty{padding:0}.tile{border:1px solid var(--line);border-radius:10px;padding:14px 16px;background:#fbfcfe;min-width:0}.tile-value{display:block;font-size:26px;font-weight:650;letter-spacing:-.03em;line-height:1.25;margin-top:4px;overflow-wrap:anywhere}.tile-value small{font-size:13px;font-weight:500;color:var(--muted);letter-spacing:0;margin-left:6px}.tile-caption{display:block;font-size:12px;color:var(--muted);margin-top:8px}
+.seg-bar{display:flex;gap:2px;height:8px;margin-top:10px;border-radius:4px;overflow:hidden;background:var(--track)}.seg{height:100%;min-width:0}.seg-ok{background:var(--chart-ok)}.seg-failed{background:var(--chart-failed)}
+.bar-rows{margin-top:10px;display:grid;gap:6px}.bar-row{display:grid;grid-template-columns:minmax(64px,38%) 1fr auto;align-items:center;gap:8px;font-size:12px}.bar-row .label{margin:0;font-size:12px;color:var(--ink);overflow-wrap:anywhere}.bar-track{height:8px;border-radius:4px;background:var(--track);overflow:hidden}.bar-fill{height:100%;border-radius:4px;background:var(--chart-ok)}.bar-fill.bar-failed{background:var(--chart-failed)}.bar-fill.bar-neutral{background:#5f7fa8}.bar-row .count{font-variant-numeric:tabular-nums;color:var(--muted)}
+.traffic-chart-wrap{padding:0 22px 18px}.traffic-chart-heading{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:8px 16px;margin-bottom:8px}.traffic-chart-heading h3{font-size:13px;margin:0}.chart-legend{display:flex;gap:16px;list-style:none;margin:0;padding:0;font-size:12px;color:var(--muted)}.chart-legend li{display:flex;align-items:center;gap:6px}.swatch{width:10px;height:10px;border-radius:2px;display:inline-block}.swatch-ok{background:var(--chart-ok)}.swatch-failed{background:var(--chart-failed)}
+.traffic-chart svg{display:block;width:100%;height:auto}.traffic-chart .bar-ok{fill:var(--chart-ok)}.traffic-chart .bar-failed{fill:var(--chart-failed)}.traffic-chart .axis{stroke:#cbd5e1;stroke-width:1}.traffic-chart .grid{stroke:var(--track);stroke-width:1}.traffic-chart text{font-size:11px;fill:var(--muted);font-family:inherit}.traffic-chart .hit{fill:transparent}.traffic-chart g:hover .hit{fill:rgba(20,37,61,.06)}.traffic-chart .chart-empty{font-size:12px}
+.traffic-table{margin-top:10px}.traffic-table .table-scroll{margin-top:8px}.traffic-table th,.traffic-table td{padding:8px 12px}.traffic-table td{font-variant-numeric:tabular-nums}
+.about-body dl{margin:0;display:grid;grid-template-columns:minmax(140px,190px) 1fr;gap:10px 18px;font-size:13px}.about-body dt{font-weight:600}.about-body dd{margin:0;color:var(--muted)}
+@media(max-width:900px){.traffic-tiles{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:600px){.about-body dl{grid-template-columns:1fr;gap:4px}.about-body dd{margin-bottom:8px}}
+@media(max-width:500px){.traffic-tiles{grid-template-columns:1fr;padding:0 16px 16px}.traffic-chart-wrap{padding:0 16px 16px}.traffic-message{padding:0 16px 14px}.card-summary-meta{display:block;margin:4px 0 0;white-space:normal}}
 """
 
 
@@ -262,8 +322,26 @@ STATUS_JS = r"""
   // is forgotten with the rest of the private details on lock or navigation.
   const collapsedHosts = new Set();
   const collapsedCatalogs = new Set();
-  const panels = ["update-panel", "summary-panel", "links-panel", "hosts-panel", "self-test-panel", "backends-panel", "models-panel", "aliases-panel", "performance-panel"];
+  const panels = ["traffic-panel", "summary-panel", "hosts-panel", "backends-panel", "models-panel", "aliases-panel", "performance-panel", "self-test-panel", "update-panel", "links-panel", "about-panel"];
+  const trafficKinds = {timeout: "Timeouts", connection: "Connection errors", http_5xx: "Backend 5xx errors", http_4xx: "Backend 4xx errors", invalid_response: "Invalid responses", configuration: "Configuration", adapter: "Adapter crashes", no_eligible_model: "No eligible model", other: "Other"};
+  const trafficWindows = {"24h": ["Last 24 hours", 24], "7d": ["Last 7 days", 168], all: ["All time", 168]};
+  let trafficWindow = "24h";
+  let trafficData = null;
+  let trafficCheckedAt = 0;
   const text = (id, value) => { el(id).textContent = String(value); };
+  const meta = (id, value) => { el(id).textContent = String(value == null ? "" : value); };
+  const compact = (value) => {
+    if (!Number.isFinite(value) || value < 0) return "—";
+    if (value < 10000) return value.toLocaleString(undefined, {maximumFractionDigits: 0});
+    for (const [suffix, size] of [["B", 1e9], ["M", 1e6], ["K", 1e3]]) {
+      if (value >= size) {
+        const scaled = value / size;
+        return `${scaled.toLocaleString(undefined, {maximumFractionDigits: scaled >= 100 ? 0 : 1})}${suffix}`;
+      }
+    }
+    return String(value);
+  };
+  const percent = (part, whole) => whole > 0 ? `${(100 * part / whole).toLocaleString(undefined, {maximumFractionDigits: 1})}%` : "—";
   const count = (value) => Number.isFinite(value) && value >= 0 ? String(value) : "—";
   const date = (value) => {
     if (!value) return "Not yet checked";
@@ -308,6 +386,7 @@ STATUS_JS = r"""
     el("self-test-message").className = "self-test-message muted";
     text("self-test-message", "Runs only when you click. No self-test has been run in this page.");
     el("self-test-results").setAttribute("aria-busy", "false");
+    meta("self-test-meta", "Not run");
   }
   function authControls(message) {
     el("auth-section").hidden = !authRequired;
@@ -354,10 +433,13 @@ STATUS_JS = r"""
     clearSelfTest();
     clearHosts();
     clearPerformance();
+    clearTraffic();
     if (!keepUpdate) clearUpdate();
     el("details").hidden = true;
+    el("self-test-panel").hidden = true;
     for (const id of ["endpoints-body", "models-body", "aliases-body"]) el(id).replaceChildren();
     for (const id of ["count-endpoints", "count-online", "count-models", "count-aliases", "uptime", "last-discovery"]) text(id, "—");
+    for (const id of ["backends-meta", "models-meta", "aliases-meta"]) meta(id, "");
     text("version", "");
     el("setup-help").hidden = true;
   }
@@ -438,6 +520,7 @@ STATUS_JS = r"""
     el("host-address").value = "";
     el("hosts-body").replaceChildren();
     hostMessage(authRequired ? "Unlock details to manage saved addresses." : "Address management is disabled. Set LLM_ROUTER_GATEWAY_API_KEY in router.env and restart the router to enable it.");
+    meta("hosts-meta", "");
     hostControls();
   }
   function validHost(item) {
@@ -557,12 +640,16 @@ STATUS_JS = r"""
   function clearSummary() {
     for (const id of ["public-count-servers", "public-count-models", "public-last-verified"]) text(id, "Unknown");
     text("public-summary-note", "No current summary. Counts do not prove models are loaded or inference works.");
+    meta("summary-meta", "");
   }
   function renderSummary(summary) {
     clearSummary();
     if (!summary || typeof summary !== "object") return;
     text("public-count-servers", Number.isSafeInteger(summary.servers) && summary.servers >= 0 ? summary.servers : "Unknown");
     text("public-count-models", Number.isSafeInteger(summary.models) && summary.models >= 0 ? `${summary.models}${summary.models_truncated === true ? "+" : ""}` : "Unknown");
+    if (Number.isSafeInteger(summary.servers) && summary.servers >= 0 && Number.isSafeInteger(summary.models) && summary.models >= 0) {
+      meta("summary-meta", `${summary.servers} server${summary.servers === 1 ? "" : "s"} · ${summary.models}${summary.models_truncated === true ? "+" : ""} model cop${summary.models === 1 ? "y" : "ies"}`);
+    }
     if (summary.last_verified_at === null) text("public-last-verified", "Not yet verified");
     else if (typeof summary.last_verified_at === "string") text("public-last-verified", date(summary.last_verified_at));
     text("public-summary-note", summary.models_truncated === true
@@ -661,6 +748,8 @@ STATUS_JS = r"""
       savedHosts.forEach((item, index) => fragment.append(hostEntry(item, index)));
       body.append(fragment);
     }
+    const offline = savedHosts.filter(item => item.routing && item.routing.status === "offline").length;
+    meta("hosts-meta", savedHosts.length ? `${savedHosts.length} saved${offline ? ` · ${offline} offline` : ""}` : "None saved");
     hostControls();
   }
   async function hostOperation(action, id) {
@@ -780,6 +869,7 @@ STATUS_JS = r"""
     el("performance-body").replaceChildren();
     text("performance-message", "");
     el("performance-message").className = "performance-message muted";
+    meta("performance-meta", "");
   }
   function validObservation(metric) {
     return metric && Number.isFinite(metric.latest) && metric.latest >= 0 &&
@@ -824,8 +914,10 @@ STATUS_JS = r"""
       el("performance-message").className = "performance-message muted result-warning";
       text("performance-message", "Saved performance history is unavailable. Check the service account’s metrics-storage access and the router’s service logs. No current metrics are being shown.");
       rows("performance-body", [], 7, "Performance history is unavailable.", () => {});
+      meta("performance-meta", "Unavailable");
       return;
     }
+    meta("performance-meta", `${performance.deployments.length} observed`);
     const updated = performance.updated_at ? date(performance.updated_at) : "Not yet recorded";
     text("performance-message", `Saved observations updated: ${updated}. This table reads saved observations only; it does not generate traffic to models.`);
     if (performance.error) {
@@ -874,14 +966,282 @@ STATUS_JS = r"""
       cell(row, item.last_seen_at ? date(item.last_seen_at) : "Not recorded");
     });
   }
+  function validBucket(bucket) {
+    return Boolean(bucket) && typeof bucket === "object" && !Array.isArray(bucket) &&
+      ["requests_ok", "requests_failed", "reroutes_ok", "reroutes_failed"].every(name => Number.isSafeInteger(bucket[name]) && bucket[name] >= 0) &&
+      ["input_tokens", "output_tokens"].every(name => Number.isFinite(bucket[name]) && bucket[name] >= 0) &&
+      Boolean(bucket.failures) && typeof bucket.failures === "object" && !Array.isArray(bucket.failures) &&
+      Object.keys(bucket.failures).length <= 32 &&
+      Object.entries(bucket.failures).every(([kind, total]) => kind.length <= 64 && Number.isSafeInteger(total) && total >= 0);
+  }
+  function validTraffic(traffic) {
+    return Boolean(traffic) && typeof traffic === "object" && typeof traffic.available === "boolean" &&
+      (traffic.since === null || typeof traffic.since === "string") &&
+      validBucket(traffic.totals) && Boolean(traffic.windows) && typeof traffic.windows === "object" &&
+      validBucket(traffic.windows["24h"]) && validBucket(traffic.windows["7d"]) &&
+      Array.isArray(traffic.hourly) && traffic.hourly.length <= 744 &&
+      traffic.hourly.every(row => validBucket(row) && typeof row.hour === "string" && Number.isFinite(Date.parse(row.hour)));
+  }
+  function trafficMessage(message, tone = "") {
+    el("traffic-message").className = tone ? `traffic-message muted result-${tone}` : "traffic-message muted";
+    text("traffic-message", message);
+  }
+  function clearTraffic() {
+    trafficData = null;
+    trafficCheckedAt = 0;
+    for (const id of ["traffic-tiles", "traffic-chart", "traffic-table-body"]) el(id).replaceChildren();
+    text("traffic-table-hint", "");
+    text("traffic-chart-title", "Requests per hour");
+    meta("traffic-meta", "");
+    trafficMessage("Unlock backend details to see client traffic.");
+    el("traffic-panel").hidden = true;
+  }
+  function tile(label, value, unit) {
+    const node = document.createElement("div");
+    node.className = "tile";
+    const name = document.createElement("span");
+    name.className = "label";
+    name.textContent = label;
+    const figure = document.createElement("strong");
+    figure.className = "tile-value";
+    figure.textContent = value;
+    if (unit) {
+      const small = document.createElement("small");
+      small.textContent = unit;
+      figure.append(small);
+    }
+    node.append(name, figure);
+    return node;
+  }
+  function caption(node, value) {
+    const line = document.createElement("span");
+    line.className = "tile-caption";
+    line.textContent = value;
+    node.append(line);
+  }
+  function segBar(parts, label) {
+    const bar = document.createElement("div");
+    bar.className = "seg-bar";
+    bar.setAttribute("role", "img");
+    bar.setAttribute("aria-label", label);
+    const total = parts.reduce((sum, [total]) => sum + total, 0);
+    for (const [total_, className] of parts) {
+      if (total_ <= 0) continue;
+      const segment = document.createElement("span");
+      segment.className = `seg ${className}`;
+      segment.style.width = `${100 * total_ / total}%`;
+      bar.append(segment);
+    }
+    return bar;
+  }
+  function barRows(entries, className) {
+    const list = document.createElement("div");
+    list.className = "bar-rows";
+    const peak = Math.max(1, ...entries.map(([, total]) => total));
+    for (const [label, total] of entries) {
+      const row = document.createElement("div");
+      row.className = "bar-row";
+      const name = document.createElement("span");
+      name.className = "label";
+      name.textContent = label;
+      const track = document.createElement("div");
+      track.className = "bar-track";
+      const fill = document.createElement("div");
+      fill.className = `bar-fill ${className}`;
+      fill.style.width = `${100 * total / peak}%`;
+      track.append(fill);
+      const value = document.createElement("span");
+      value.className = "count";
+      value.textContent = compact(total);
+      row.append(name, track, value);
+      list.append(row);
+    }
+    return list;
+  }
+  function renderTrafficTiles(bucket, windowLabel) {
+    const tiles = el("traffic-tiles");
+    tiles.replaceChildren();
+    const requests = bucket.requests_ok + bucket.requests_failed;
+    const reroutes = bucket.reroutes_ok + bucket.reroutes_failed;
+    const failures = Object.values(bucket.failures).reduce((sum, total) => sum + total, 0);
+    const requestsTile = tile("Client requests", compact(requests), windowLabel.toLowerCase());
+    requestsTile.append(segBar([[bucket.requests_ok, "seg-ok"], [bucket.requests_failed, "seg-failed"]], `${percent(bucket.requests_ok, requests)} of requests succeeded`));
+    caption(requestsTile, requests ? `${compact(bucket.requests_ok)} succeeded (${percent(bucket.requests_ok, requests)}) · ${compact(bucket.requests_failed)} failed` : "No requests in this window");
+    const tokensTile = tile("Tokens, successful requests", `${compact(bucket.input_tokens)} in`, null);
+    tokensTile.append(barRows([["In", bucket.input_tokens], ["Out", bucket.output_tokens]], "bar-neutral"));
+    caption(tokensTile, `${compact(bucket.output_tokens)} out · backend-reported counts`);
+    const reroutesTile = tile("HA reroutes", compact(reroutes), null);
+    reroutesTile.append(segBar([[bucket.reroutes_ok, "seg-ok"], [bucket.reroutes_failed, "seg-failed"]], `${compact(bucket.reroutes_ok)} rescued, ${compact(bucket.reroutes_failed)} still failed`));
+    caption(reroutesTile, reroutes
+      ? `${compact(bucket.reroutes_ok)} rescued · ${compact(bucket.reroutes_failed)} still failed · ${(100 * reroutes / Math.max(1, requests)).toLocaleString(undefined, {maximumFractionDigits: 1})} per 100 requests`
+      : "No reroutes were needed");
+    const failuresTile = tile("Failed backend attempts", compact(failures), null);
+    const merged = new Map();
+    for (const [kind, total] of Object.entries(bucket.failures)) {
+      if (total <= 0) continue;
+      const label = Object.prototype.hasOwnProperty.call(trafficKinds, kind) ? trafficKinds[kind] : trafficKinds.other;
+      merged.set(label, (merged.get(label) || 0) + total);
+    }
+    const sorted = Array.from(merged.entries()).sort((first, second) => second[1] - first[1]);
+    if (sorted.length) failuresTile.append(barRows(sorted, "bar-failed"));
+    else caption(failuresTile, "No failed attempts recorded");
+    tiles.append(requestsTile, tokensTile, reroutesTile, failuresTile);
+  }
+  const SVG = "http://www.w3.org/2000/svg";
+  function svgNode(tag, attributes) {
+    const node = document.createElementNS(SVG, tag);
+    for (const [name, value] of Object.entries(attributes)) node.setAttribute(name, String(value));
+    return node;
+  }
+  function roundedTop(x, y, width, height, radius) {
+    const r = Math.max(0, Math.min(radius, width / 2, height));
+    return `M${x} ${y + height}V${y + r}Q${x} ${y} ${x + r} ${y}H${x + width - r}Q${x + width} ${y} ${x + width} ${y + r}V${y + height}Z`;
+  }
+  function renderTrafficChart(traffic, hours, now, windowLabel) {
+    const chart = el("traffic-chart");
+    const body = el("traffic-table-body");
+    chart.replaceChildren();
+    body.replaceChildren();
+    const hourMs = 3600000;
+    const current = Math.floor(now / hourMs) * hourMs;
+    const byHour = new Map();
+    for (const row of traffic.hourly) byHour.set(Math.floor(Date.parse(row.hour) / hourMs) * hourMs, row);
+    const slots = [];
+    for (let index = hours - 1; index >= 0; index -= 1) {
+      const start = current - index * hourMs;
+      slots.push({start, row: byHour.get(start) || null});
+    }
+    // Draw in real pixels so axis text keeps its size at every viewport width.
+    const measured = chart.clientWidth;
+    const width = Number.isFinite(measured) && measured >= 280 ? Math.round(measured) : 720;
+    const height = 168, left = 40, right = 8, top = 10, baseline = 136;
+    const plotWidth = width - left - right, plotHeight = baseline - top;
+    const total = slot => slot.row ? slot.row.requests_ok + slot.row.requests_failed : 0;
+    const peak = Math.max(1, ...slots.map(total));
+    const okTotal = slots.reduce((sum, slot) => sum + (slot.row ? slot.row.requests_ok : 0), 0);
+    const failedTotal = slots.reduce((sum, slot) => sum + (slot.row ? slot.row.requests_failed : 0), 0);
+    const svg = svgNode("svg", {
+      viewBox: `0 0 ${width} ${height}`, width, height, role: "img",
+      "aria-label": `Requests per hour, ${windowLabel.toLowerCase()}: ${compact(okTotal)} succeeded, ${compact(failedTotal)} failed; busiest hour ${compact(okTotal + failedTotal ? peak : 0)} request${peak === 1 ? "" : "s"}.`,
+    });
+    svg.append(svgNode("line", {class: "grid", x1: left, x2: width - right, y1: top + plotHeight / 2, y2: top + plotHeight / 2}));
+    svg.append(svgNode("line", {class: "axis", x1: left, x2: width - right, y1: baseline, y2: baseline}));
+    const yPeak = svgNode("text", {x: left - 6, y: top + 4, "text-anchor": "end"});
+    yPeak.textContent = compact(okTotal + failedTotal ? peak : 0);
+    const yZero = svgNode("text", {x: left - 6, y: baseline, "text-anchor": "end"});
+    yZero.textContent = "0";
+    svg.append(yPeak, yZero);
+    const slotWidth = plotWidth / hours;
+    const barWidth = Math.max(1, Math.min(24, slotWidth - 2));
+    const gap = 2;
+    const dayStep = slotWidth * 24 >= 64 ? 1 : 2;
+    let midnights = 0;
+    slots.forEach((slot, index) => {
+      const x = left + index * slotWidth + (slotWidth - barWidth) / 2;
+      const ok = slot.row ? slot.row.requests_ok : 0;
+      const failed = slot.row ? slot.row.requests_failed : 0;
+      const when = new Date(slot.start);
+      const group = svgNode("g", {});
+      const title = svgNode("title", {});
+      title.textContent = `${when.toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"})} · ${compact(ok)} succeeded · ${compact(failed)} failed`;
+      group.append(title, svgNode("rect", {class: "hit", x: left + index * slotWidth, y: top, width: slotWidth, height: plotHeight}));
+      let y = baseline;
+      if (ok > 0) {
+        const barHeight = Math.max(1, plotHeight * ok / peak);
+        y -= barHeight;
+        group.append(barWidth >= 8 && failed === 0
+          ? svgNode("path", {class: "bar-ok", d: roundedTop(x, y, barWidth, barHeight, 4)})
+          : svgNode("rect", {class: "bar-ok", x, y, width: barWidth, height: barHeight}));
+      }
+      if (failed > 0) {
+        const barHeight = Math.max(1, plotHeight * failed / peak);
+        y -= barHeight + (ok > 0 ? gap : 0);
+        group.append(barWidth >= 8
+          ? svgNode("path", {class: "bar-failed", d: roundedTop(x, y, barWidth, barHeight, 4)})
+          : svgNode("rect", {class: "bar-failed", x, y, width: barWidth, height: barHeight}));
+      }
+      svg.append(group);
+      let labelled = index % 6 === 0;
+      if (hours > 48) {
+        labelled = when.getHours() === 0 && midnights % dayStep === 0;
+        if (when.getHours() === 0) midnights += 1;
+      }
+      if (labelled) {
+        const label = svgNode("text", {x: left + index * slotWidth + slotWidth / 2, y: baseline + 16, "text-anchor": "middle"});
+        label.textContent = hours > 48 ? when.toLocaleDateString([], {weekday: "short", day: "numeric"}) : when.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+        svg.append(label);
+      }
+      if (slot.row && (ok || failed || slot.row.reroutes_ok || slot.row.reroutes_failed)) {
+        const row = document.createElement("tr");
+        cell(row, when.toLocaleString([], {weekday: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}));
+        cell(row, compact(ok));
+        cell(row, compact(failed));
+        cell(row, `${compact(slot.row.reroutes_ok)} / ${compact(slot.row.reroutes_failed)}`);
+        cell(row, compact(slot.row.input_tokens));
+        cell(row, compact(slot.row.output_tokens));
+        body.append(row);
+      }
+    });
+    if (okTotal + failedTotal === 0) {
+      const empty = svgNode("text", {class: "chart-empty", x: left + plotWidth / 2, y: top + plotHeight / 2, "text-anchor": "middle"});
+      empty.textContent = "No requests in this window";
+      svg.append(empty);
+    }
+    chart.append(svg);
+    text("traffic-table-hint", `${hours} hours · ${body.children.length} with traffic`);
+  }
+  function drawTraffic() {
+    if (!trafficData) return;
+    for (const key of Object.keys(trafficWindows)) el(`traffic-window-${key}`).setAttribute("aria-pressed", String(key === trafficWindow));
+    const [label, hours] = trafficWindows[trafficWindow];
+    const bucket = trafficWindow === "all" ? trafficData.totals : trafficData.windows[trafficWindow];
+    renderTrafficTiles(bucket, label);
+    const chartLabel = trafficWindow === "all" ? trafficWindows["7d"][0] : label;
+    renderTrafficChart(trafficData, hours, trafficCheckedAt, chartLabel);
+    text("traffic-chart-title", `Requests per hour · ${chartLabel.toLowerCase()}`);
+    meta("traffic-meta", `${compact(bucket.requests_ok + bucket.requests_failed)} requests · ${label.toLowerCase()}`);
+  }
+  function renderTraffic(traffic, checkedAt) {
+    el("traffic-panel").hidden = false;
+    trafficData = null;
+    const stamp = Date.parse(typeof checkedAt === "string" ? checkedAt : "");
+    trafficCheckedAt = Number.isFinite(stamp) ? stamp : Date.now();
+    for (const id of ["traffic-tiles", "traffic-chart", "traffic-table-body"]) el(id).replaceChildren();
+    text("traffic-table-hint", "");
+    if (traffic === undefined || traffic === null) {
+      trafficMessage("This router version does not report client traffic. Update the router to see request, token, and reroute counts.");
+      meta("traffic-meta", "Not reported");
+      return;
+    }
+    if (!validTraffic(traffic)) {
+      trafficMessage("Client traffic could not be read from this snapshot, so no counts are shown.", "warning");
+      meta("traffic-meta", "Unavailable");
+      return;
+    }
+    if (traffic.available !== true) {
+      trafficMessage("Client traffic history is unavailable. Check the service account’s metrics-storage access and the router’s service logs.", "warning");
+      meta("traffic-meta", "Unavailable");
+      return;
+    }
+    trafficData = traffic;
+    const days = Number.isSafeInteger(traffic.retention_hours) && traffic.retention_hours > 0 ? Math.round(traffic.retention_hours / 24) : 30;
+    trafficMessage(traffic.since
+      ? `Counting since ${date(traffic.since)}. Hourly history is kept for ${days} days; requests are counted once each and tokens only for successful requests.`
+      : "No client requests have been recorded yet. Counts appear after real requests pass through this router.");
+    drawTraffic();
+  }
   function renderDetails(data) {
     renderHealth(data, true);
     renderPerformance(data.performance);
+    renderTraffic(data.performance && typeof data.performance === "object" ? data.performance.traffic : undefined, data.checked_at);
     const totals = data.counts || {};
     text("count-endpoints", count(totals.endpoints));
     text("count-online", count(totals.online));
     text("count-models", `${count(totals.available_models)} / ${count(totals.models)}`);
     text("count-aliases", count(totals.aliases));
+    meta("backends-meta", `${count(totals.online)} of ${count(totals.endpoints)} online`);
+    meta("models-meta", `${count(totals.available_models)} of ${count(totals.models)} available`);
+    meta("aliases-meta", `${count(totals.aliases)} client names`);
     text("last-discovery", date(data.last_discovery));
     el("setup-help").hidden = data.ready === true;
     rows("endpoints-body", data.endpoints, 5, "No backend has been discovered or configured yet.", (row, item) => {
@@ -908,6 +1268,7 @@ STATUS_JS = r"""
       cell(row, count(item.deployments));
     });
     el("details").hidden = false;
+    el("self-test-panel").hidden = false;
     hostControls();
     if (authRequired && apiKey && !hostsLoaded && !activeHosts) hostOperation("load");
     if (!authRequired) hostMessage("Address management is disabled. Set LLM_ROUTER_GATEWAY_API_KEY in router.env and restart the router to enable it.");
@@ -943,6 +1304,7 @@ STATUS_JS = r"""
     el("update-progress").hidden = true;
     text("update-stage", "");
     text("update-observed", "");
+    meta("update-meta", "");
     updateMessage(authRequired ? "Unlock backend details to enable software updates." : "Software updates are disabled without a router API key. Set LLM_ROUTER_GATEWAY_API_KEY and restart the router.");
     updateControls();
   }
@@ -1001,6 +1363,7 @@ STATUS_JS = r"""
     const stages = {checking: "Checking official main", downloading: "Downloading update", validating: "Validating installation", restarting: "Restarting router", complete: "Complete", failed: "Failed", queued: "Queued", idle: "Idle"};
     updateLastStage = stages[data.stage];
     text("update-stage", updateLastStage);
+    meta("update-meta", updateLastStage);
     text("update-observed", `Installed version: ${data.current_version || "Unknown"} · Job status recorded: ${data.updated_at ? date(data.updated_at) : "Not yet recorded"}`);
     if (data.busy || ["queued", "running"].includes(data.state)) {
       updateWatching = true;
@@ -1154,6 +1517,7 @@ STATUS_JS = r"""
       });
       el("self-test-results").hidden = false;
       el("self-test-message").className = `self-test-message result-${data.status}`;
+      meta("self-test-meta", {pass: "Passed", fail: "Failed", partial: "Incomplete"}[data.status]);
       const summary = {pass: "Metadata checks passed", fail: "One or more checks failed", partial: "Self-test incomplete"};
       text("self-test-message", `${summary[data.status]} · ${date(data.checked_at)}. ${data.notice || "No models were used. This does not verify inference."}`);
     } catch (error) {
@@ -1254,6 +1618,13 @@ STATUS_JS = r"""
   const setPanels = open => { for (const id of panels) el(id).open = open; };
   el("collapse-all-button").addEventListener("click", () => setPanels(false));
   el("expand-all-button").addEventListener("click", () => setPanels(true));
+  for (const key of Object.keys(trafficWindows)) el(`traffic-window-${key}`).addEventListener("click", () => { trafficWindow = key; drawTraffic(); });
+  el("traffic-panel").addEventListener("toggle", () => { if (el("traffic-panel").open) drawTraffic(); });
+  let resizeTimer = null;
+  window.addEventListener("resize", () => {
+    if (resizeTimer !== null) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => { resizeTimer = null; drawTraffic(); }, 150);
+  });
   text("router-origin", safeOrigin(window.location.origin) || "Current server");
   apiKey = consumeURLKey();
   authControls(apiKey ? "Checking your URL key…" : undefined);

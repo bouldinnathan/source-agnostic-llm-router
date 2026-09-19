@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+import json
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -211,7 +212,7 @@ def test_metrics_api_and_detailed_status_include_historical_rows(tmp_path, monke
     page = asyncio.run(get(app, "/status/data")).json()
     assert api["deployments"][0]["current"] is False
     assert page["performance"] == api
-    assert api["schema_version"] == 1 and api["collection"] == "passive"
+    assert api["schema_version"] == 2 and api["collection"] == "passive"
 
 
 def test_metrics_store_error_is_generic_and_does_not_break_dashboard(tmp_path, monkeypatch):
@@ -290,3 +291,47 @@ def test_runtime_update_and_rollback_never_wipe_metrics(tmp_path, monkeypatch, r
     router.metrics = restored
     asyncio.run(router.complete(QueryRequest.from_prompt("Hello again")))
     assert restored.snapshot()["deployments"][0]["successes"] == 2
+
+
+def test_traffic_counts_client_requests_across_failover_and_is_private(tmp_path, monkeypatch):
+    monkeypatch.setenv("LLM_ROUTER_GATEWAY_API_KEY", "router-key")
+    router, gateway, store, adapter = configured(tmp_path, fail_first=True)
+    app = create_app(gateway=gateway)
+
+    async def exercise():
+        headers = {"Authorization": "Bearer router-key"}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router.test") as client:
+            response = await client.post("/v1/chat/completions", headers=headers, json={
+                "model": "qwen-ha", "messages": [{"role": "user", "content": "private user prompt"}],
+            })
+            assert response.status_code == 200, response.text
+            return (
+                (await client.get("/router/metrics", headers=headers)).json(),
+                (await client.get("/status/data", headers=headers)).json(),
+                (await client.get("/healthz")).json(),
+                (await client.get("/readyz")).json(),
+            )
+
+    api, page, health, ready = asyncio.run(exercise())
+    assert adapter.calls == ["source-a", "source-b"]
+    totals = api["traffic"]["totals"]
+    assert totals["requests_ok"] == 1 and totals["requests_failed"] == 0
+    assert totals["reroutes_ok"] == 1 and totals["failures"] == {"http_5xx": 1}
+    assert totals["input_tokens"] == 100 and totals["output_tokens"] == 20
+    assert api["traffic"]["windows"]["24h"] == totals
+    assert page["performance"]["traffic"]["totals"] == totals
+    for public in (health, ready):
+        assert "traffic" not in public and "requests_ok" not in json.dumps(public)
+    assert "private user prompt" not in json.dumps(api) + json.dumps(page)
+
+
+def test_traffic_storage_failure_never_loses_answer_or_retries_inference(tmp_path, monkeypatch):
+    router, _, store, adapter = configured(tmp_path)
+
+    def broken(*args, **kwargs):
+        raise OSError("private path disk failure")
+
+    monkeypatch.setattr(store, "record_request", broken)
+    result = asyncio.run(router.complete(QueryRequest.from_prompt("Hello")))
+    assert result.text == "private generated answer"
+    assert adapter.calls == ["source-a"]

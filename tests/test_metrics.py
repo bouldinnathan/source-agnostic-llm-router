@@ -38,7 +38,17 @@ def only(store):
 def test_empty_snapshot_and_constructor_do_not_write(tmp_path):
     path = tmp_path / "missing" / "metrics.sqlite3"
     store = MetricsStore(path)
-    assert store.snapshot() == {"available": True, "error": None, "updated_at": None, "deployments": []}
+    empty_bucket = {
+        "requests_ok": 0, "requests_failed": 0, "reroutes_ok": 0, "reroutes_failed": 0,
+        "input_tokens": 0, "output_tokens": 0, "failures": {},
+    }
+    assert store.snapshot() == {
+        "available": True, "error": None, "updated_at": None, "deployments": [],
+        "traffic": {
+            "available": True, "retention_hours": 720, "since": None, "totals": empty_bucket,
+            "windows": {"24h": empty_bucket, "7d": empty_bucket}, "hourly": [],
+        },
+    }
     assert not path.parent.exists()
     assert not list(tmp_path.iterdir())
 

@@ -3,12 +3,16 @@
 Only allowlisted numbers and deployment identity are stored. Reported model-load
 durations of at least one second are counted as slow loads; that is a timing
 heuristic, not confirmation that a disk read occurred.
+
+Client traffic is counted per request, not per upstream attempt: one request that
+fails over to a second server is one request, one reroute, and one failed attempt
+of a classified kind. Hourly buckets are kept for 30 days plus all-time totals.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import ipaddress
 import json
@@ -18,10 +22,11 @@ from pathlib import Path
 import sqlite3
 import stat
 import time
-from typing import Mapping
+from typing import Iterable, Mapping
 import unicodedata
 from urllib.parse import quote, urlsplit
 
+from .errors import FAILURE_KINDS
 from .schema import EndpointConfig, ModelConfig
 
 try:
@@ -38,7 +43,13 @@ SLOW_LOAD_THRESHOLD_MS = 1000
 _MAX_TOTAL = 1e18
 _MAX_COUNT = 2**63 - 1
 _APPLICATION_ID = 0x4C4C4D52
-_VERSION = 1
+_VERSION = 2
+TRAFFIC_RETENTION_HOURS = 24 * 30
+_TRAFFIC_WINDOWS = {"24h": 24, "7d": 24 * 7}
+_TRAFFIC_HOURLY_ROWS = 24 * 7
+_MAX_FAILURE_KINDS_PER_REQUEST = 64
+_TRAFFIC_COUNTERS = ("requests_ok", "requests_failed", "reroutes_ok", "reroutes_failed")
+_TRAFFIC_TOKENS = ("input_tokens", "output_tokens")
 _METRICS = (
     "input_tokens_per_second", "output_tokens_per_second", "load_duration_ms", "request_duration_ms",
 )
@@ -64,6 +75,39 @@ CREATE TABLE deployments (
     UNIQUE(machine, endpoint, model)
 )
 """
+_TRAFFIC_HOURLY_COLUMNS = ("hour", *_TRAFFIC_COUNTERS, *_TRAFFIC_TOKENS, "failures_json")
+_TRAFFIC_HOURLY_SCHEMA = """
+CREATE TABLE traffic_hourly (
+    hour TEXT PRIMARY KEY NOT NULL,
+    requests_ok INTEGER NOT NULL,
+    requests_failed INTEGER NOT NULL,
+    reroutes_ok INTEGER NOT NULL,
+    reroutes_failed INTEGER NOT NULL,
+    input_tokens REAL NOT NULL,
+    output_tokens REAL NOT NULL,
+    failures_json TEXT NOT NULL
+)
+"""
+_TRAFFIC_TOTALS_COLUMNS = ("id", "since", *_TRAFFIC_COUNTERS, *_TRAFFIC_TOKENS, "failures_json")
+_TRAFFIC_TOTALS_SCHEMA = """
+CREATE TABLE traffic_totals (
+    id INTEGER PRIMARY KEY NOT NULL,
+    since TEXT NOT NULL,
+    requests_ok INTEGER NOT NULL,
+    requests_failed INTEGER NOT NULL,
+    reroutes_ok INTEGER NOT NULL,
+    reroutes_failed INTEGER NOT NULL,
+    input_tokens REAL NOT NULL,
+    output_tokens REAL NOT NULL,
+    failures_json TEXT NOT NULL
+)
+"""
+_TABLES = {
+    "deployments": (_COLUMNS, _SCHEMA),
+    "traffic_hourly": (_TRAFFIC_HOURLY_COLUMNS, _TRAFFIC_HOURLY_SCHEMA),
+    "traffic_totals": (_TRAFFIC_TOTALS_COLUMNS, _TRAFFIC_TOTALS_SCHEMA),
+}
+_LEGACY_TABLES = ("deployments",)
 _ERROR = "Passive metrics storage is unavailable or unsafe; existing data was not reset."
 
 
@@ -174,6 +218,94 @@ def _decode(row: sqlite3.Row) -> dict:
     return deployment
 
 
+def _hour_start(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
+
+
+def _hour(value: object) -> str:
+    text = _timestamp(value)
+    parsed = datetime.fromisoformat(text)
+    if parsed.utcoffset() != timedelta(0) or parsed.minute or parsed.second or parsed.microsecond:
+        raise ValueError("Invalid traffic hour")
+    return text
+
+
+def _kind(value: object) -> str:
+    return value if isinstance(value, str) and value in FAILURE_KINDS else "other"
+
+
+def _empty_bucket() -> dict:
+    return {**{name: 0 for name in _TRAFFIC_COUNTERS}, **{name: 0 for name in _TRAFFIC_TOKENS}, "failures": {}}
+
+
+def _decode_bucket(row: sqlite3.Row) -> dict:
+    bucket = dict(row)
+    for name in _TRAFFIC_COUNTERS:
+        if type(bucket[name]) is not int or not 0 <= bucket[name] <= _MAX_COUNT:
+            raise ValueError("Invalid traffic counter")
+    for name in _TRAFFIC_TOKENS:
+        value = bucket[name]
+        if type(value) not in {int, float} or not math.isfinite(value) or not 0 <= value <= _MAX_TOTAL:
+            raise ValueError("Invalid traffic total")
+        if float(value).is_integer():
+            bucket[name] = int(value)
+    raw = bucket.pop("failures_json")
+    if not isinstance(raw, str) or len(raw) > 4096:
+        raise ValueError("Invalid traffic failures")
+    failures = json.loads(raw, object_pairs_hook=_unique_json)
+    if not isinstance(failures, dict) or not set(failures) <= set(FAILURE_KINDS):
+        raise ValueError("Invalid traffic failures")
+    for count in failures.values():
+        if type(count) is not int or not 1 <= count <= _MAX_COUNT:
+            raise ValueError("Invalid traffic failure count")
+    bucket["failures"] = failures
+    return bucket
+
+
+def _decode_hourly(row: sqlite3.Row) -> dict:
+    bucket = _decode_bucket(row)
+    bucket["hour"] = _hour(bucket["hour"])
+    return bucket
+
+
+def _decode_totals(row: sqlite3.Row) -> dict:
+    bucket = _decode_bucket(row)
+    if bucket.pop("id") != 1:
+        raise ValueError("Invalid traffic totals row")
+    _timestamp(bucket["since"])
+    return bucket
+
+
+def _sum_buckets(buckets: Iterable[dict]) -> dict:
+    total = _empty_bucket()
+    for bucket in buckets:
+        for name in _TRAFFIC_COUNTERS:
+            total[name] = min(_MAX_COUNT, total[name] + bucket[name])
+        for name in _TRAFFIC_TOKENS:
+            total[name] = min(_MAX_TOTAL, total[name] + bucket[name])
+        for kind, count in bucket["failures"].items():
+            total["failures"][kind] = min(_MAX_COUNT, total["failures"].get(kind, 0) + count)
+    return total
+
+
+def _bucket_values(bucket: dict) -> tuple:
+    return (
+        *(bucket[name] for name in _TRAFFIC_COUNTERS), *(bucket[name] for name in _TRAFFIC_TOKENS),
+        json.dumps(bucket["failures"], separators=(",", ":"), sort_keys=True, allow_nan=False),
+    )
+
+
+def _empty_traffic(*, available: bool = True) -> dict:
+    return {
+        "available": available,
+        "retention_hours": TRAFFIC_RETENTION_HOURS,
+        "since": None,
+        "totals": _empty_bucket(),
+        "windows": {label: _empty_bucket() for label in _TRAFFIC_WINDOWS},
+        "hourly": [],
+    }
+
+
 class MetricsStore:
     """SQLite metrics outside the managed venv, with fail-closed storage checks."""
 
@@ -276,24 +408,48 @@ class MetricsStore:
             raise
         return connection, created
 
-    def _schema(self, connection: sqlite3.Connection, *, created: bool = False) -> None:
+    def _schema(self, connection: sqlite3.Connection, *, created: bool = False, writable: bool = False) -> int:
+        """Validate the exact expected layout; only a known older layout is upgraded.
+
+        A version-1 database (deployments only) is read as-is and gains the traffic
+        tables inside the caller's write transaction. Anything else is refused
+        without modification. Returns the layout version now in effect.
+        """
         if created:
-            connection.execute(_SCHEMA)
+            for _, schema in _TABLES.values():
+                connection.execute(schema)
             connection.execute(f"PRAGMA application_id={_APPLICATION_ID}")
             connection.execute(f"PRAGMA user_version={_VERSION}")
         if connection.execute("PRAGMA application_id").fetchone()[0] != _APPLICATION_ID:
             raise RuntimeError(_ERROR)
-        if connection.execute("PRAGMA user_version").fetchone()[0] != _VERSION:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version == 1:
+            self._check_tables(connection, _LEGACY_TABLES)
+            if not writable:
+                return 1
+            for name, (_, schema) in _TABLES.items():
+                if name not in _LEGACY_TABLES:
+                    connection.execute(schema)
+            connection.execute(f"PRAGMA user_version={_VERSION}")
+            version = _VERSION
+        if version != _VERSION:
             raise RuntimeError(_ERROR)
+        self._check_tables(connection, tuple(_TABLES))
+        return version
+
+    @staticmethod
+    def _check_tables(connection: sqlite3.Connection, names: tuple[str, ...]) -> None:
         objects = connection.execute("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchall()
-        if [tuple(item) for item in objects] != [("table", "deployments")]:
+        if sorted(tuple(item) for item in objects) != sorted(("table", name) for name in names):
             raise RuntimeError(_ERROR)
-        columns = connection.execute("PRAGMA table_info(deployments)").fetchall()
-        if tuple(column["name"] for column in columns) != _COLUMNS:
-            raise RuntimeError(_ERROR)
-        stored_sql = connection.execute("SELECT sql FROM sqlite_master WHERE name='deployments'").fetchone()[0]
-        if " ".join(stored_sql.split()).strip() != " ".join(_SCHEMA.split()).strip():
-            raise RuntimeError(_ERROR)
+        for name in names:
+            columns, schema = _TABLES[name]
+            info = connection.execute(f"PRAGMA table_info({name})").fetchall()
+            if tuple(column["name"] for column in info) != columns:
+                raise RuntimeError(_ERROR)
+            stored_sql = connection.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone()[0]
+            if " ".join(stored_sql.split()).strip() != " ".join(schema.split()).strip():
+                raise RuntimeError(_ERROR)
 
     def record(
         self, endpoint: EndpointConfig, model: ModelConfig,
@@ -316,7 +472,7 @@ class MetricsStore:
                 assert connection is not None
                 try:
                     connection.execute("BEGIN IMMEDIATE")
-                    self._schema(connection, created=created)
+                    self._schema(connection, created=created, writable=True)
                     raw = connection.execute(
                         "SELECT * FROM deployments WHERE id=? OR (machine=? AND endpoint=? AND model=?)",
                         (deployment_id, machine, endpoint_name, upstream),
@@ -368,12 +524,102 @@ class MetricsStore:
             self._last_write_failed = True
             raise RuntimeError(_ERROR) from None
 
+    def record_request(
+        self, *, success: bool, rerouted: bool,
+        input_tokens: float | int | None = None, output_tokens: float | int | None = None,
+        failure_kinds: Iterable[str] = (),
+    ) -> None:
+        """Count one finished client request in the current hour and all-time totals.
+
+        Tokens are added only for successful requests. Each failed upstream attempt
+        contributes one failure of its kind, so a rescued request still records the
+        attempt that made the reroute necessary. Buckets older than the retention
+        window are pruned here; reads never modify the database.
+        """
+        try:
+            if type(success) is not bool or type(rerouted) is not bool:
+                raise ValueError("Invalid traffic observation.")
+            kinds = [_kind(kind) for kind in list(failure_kinds)[:_MAX_FAILURE_KINDS_PER_REQUEST]]
+            tokens = {"input_tokens": _number(input_tokens), "output_tokens": _number(output_tokens)}
+            now = datetime.now(timezone.utc)
+            stamp = now.isoformat()
+            hour = _hour_start(now)
+            cutoff = _hour_start(now - timedelta(hours=TRAFFIC_RETENTION_HOURS))
+            with self._lock():
+                connection, created = self._connect(create=True)
+                assert connection is not None
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    self._schema(connection, created=created, writable=True)
+                    raw_hour = connection.execute("SELECT * FROM traffic_hourly WHERE hour=?", (hour,)).fetchone()
+                    bucket = _empty_bucket() if raw_hour is None else _decode_hourly(raw_hour)
+                    raw_totals = self._totals_row(connection)
+                    totals = {**_empty_bucket(), "since": stamp} if raw_totals is None else _decode_totals(raw_totals)
+                    for target in (bucket, totals):
+                        counter = "requests_ok" if success else "requests_failed"
+                        target[counter] = min(_MAX_COUNT, target[counter] + 1)
+                        if rerouted:
+                            counter = "reroutes_ok" if success else "reroutes_failed"
+                            target[counter] = min(_MAX_COUNT, target[counter] + 1)
+                        if success:
+                            for name, value in tokens.items():
+                                if value is not None:
+                                    target[name] = min(_MAX_TOTAL, target[name] + value)
+                        for kind in kinds:
+                            target["failures"][kind] = min(_MAX_COUNT, target["failures"].get(kind, 0) + 1)
+                    connection.execute(
+                        "INSERT OR REPLACE INTO traffic_hourly VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (hour, *_bucket_values(bucket)),
+                    )
+                    connection.execute(
+                        "INSERT OR REPLACE INTO traffic_totals VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (totals["since"], *_bucket_values(totals)),
+                    )
+                    connection.execute("DELETE FROM traffic_hourly WHERE hour < ?", (cutoff,))
+                    connection.execute("COMMIT")
+                    self._last_write_failed = False
+                finally:
+                    connection.close()
+        except (OSError, sqlite3.Error, RuntimeError, ValueError, TypeError, OverflowError, RecursionError, AttributeError):
+            self._last_write_failed = True
+            raise RuntimeError(_ERROR) from None
+
+    @staticmethod
+    def _totals_row(connection: sqlite3.Connection) -> sqlite3.Row | None:
+        rows = connection.execute("SELECT * FROM traffic_totals LIMIT 2").fetchall()
+        if len(rows) > 1:
+            raise RuntimeError(_ERROR)
+        return rows[0] if rows else None
+
+    @staticmethod
+    def _read_traffic(connection: sqlite3.Connection, now: datetime) -> dict:
+        cutoff = _hour_start(now - timedelta(hours=_TRAFFIC_HOURLY_ROWS - 1))
+        rows = connection.execute(
+            "SELECT * FROM traffic_hourly WHERE hour >= ? ORDER BY hour LIMIT ?", (cutoff, _TRAFFIC_HOURLY_ROWS + 1),
+        ).fetchall()
+        if len(rows) > _TRAFFIC_HOURLY_ROWS:
+            raise RuntimeError(_ERROR)
+        hourly = [_decode_hourly(row) for row in rows]
+        raw_totals = MetricsStore._totals_row(connection)
+        totals = None if raw_totals is None else _decode_totals(raw_totals)
+        windows = {}
+        for label, hours in _TRAFFIC_WINDOWS.items():
+            start = _hour_start(now - timedelta(hours=hours - 1))
+            windows[label] = _sum_buckets(bucket for bucket in hourly if bucket["hour"] >= start)
+        traffic = _empty_traffic()
+        traffic["since"] = None if totals is None else totals.pop("since")
+        traffic["totals"] = _empty_bucket() if totals is None else totals
+        traffic["windows"] = windows
+        traffic["hourly"] = hourly
+        return traffic
+
     def snapshot(self) -> dict:
         """Read private persisted aggregates; an absent store creates no files."""
         empty = {
             "available": not self._last_write_failed,
             "error": _ERROR if self._last_write_failed else None,
             "updated_at": None, "deployments": [],
+            "traffic": _empty_traffic(available=not self._last_write_failed),
         }
         try:
             connection, _ = self._connect()
@@ -381,16 +627,18 @@ class MetricsStore:
                 return empty
             try:
                 connection.execute("BEGIN")
-                self._schema(connection)
+                version = self._schema(connection)
                 rows = connection.execute("SELECT * FROM deployments ORDER BY machine, endpoint, model LIMIT ?", (MAX_DEPLOYMENTS + 1,)).fetchall()
                 if len(rows) > MAX_DEPLOYMENTS:
                     raise RuntimeError(_ERROR)
                 deployments = [_decode(row) for row in rows]
+                # A not-yet-upgraded database simply has no traffic history yet.
+                traffic = self._read_traffic(connection, datetime.now(timezone.utc)) if version == _VERSION else empty["traffic"]
             finally:
                 connection.close()
             return {
-                **empty, "deployments": deployments,
+                **empty, "deployments": deployments, "traffic": traffic,
                 "updated_at": max((row["last_seen_at"] for row in deployments), default=None),
             }
         except (OSError, sqlite3.Error, RuntimeError, ValueError, TypeError, OverflowError, RecursionError, AttributeError):
-            return {**empty, "available": False, "error": _ERROR}
+            return {**empty, "available": False, "error": _ERROR, "traffic": _empty_traffic(available=False)}

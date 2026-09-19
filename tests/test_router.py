@@ -24,11 +24,12 @@ class FakeAdapter:
         return UpstreamResult(
             text=f"answer from {model.id}",
             usage={"input_tokens": 5, "output_tokens": 3},
+            raw={"prompt_eval_count": 5, "eval_count": 3},
             finish_reason="stop",
         )
 
 
-def _router_with_fake(failures: set[str], *, breaker_failures: int = 1):
+def _router_with_fake(failures: set[str], *, breaker_failures: int = 1, metrics=None):  # type: ignore[no-untyped-def]
     config = make_config(
         models=[
             {
@@ -55,7 +56,7 @@ def _router_with_fake(failures: set[str], *, breaker_failures: int = 1):
     adapter = FakeAdapter(failures)
     registry = AdapterRegistry()
     registry.register("ollama-chat", adapter)
-    return LLMRouter(config, adapters=registry), adapter
+    return LLMRouter(config, adapters=registry, metrics=metrics), adapter
 
 
 def test_completion_fails_over_to_independent_source() -> None:
@@ -103,3 +104,76 @@ def test_success_updates_health_and_latency() -> None:
     assert state.successes == 1
     assert state.failures == 0
     assert state.latency_ewma_ms is not None
+
+
+def _traffic(router: LLMRouter) -> dict:
+    snapshot = router.metrics.snapshot()
+    assert snapshot["available"] is True, snapshot
+    return snapshot["traffic"]["totals"]
+
+
+def test_client_request_counters_follow_the_request_not_the_attempts() -> None:
+    router, adapter = _router_with_fake({"source-a"})
+    result = asyncio.run(router.complete(QueryRequest.from_prompt("hello")))
+    assert result.deployment == "fallback-b" and adapter.calls == ["source-a", "source-b"]
+    assert [attempt["kind"] for attempt in result.attempts if not attempt["success"]] == ["http_5xx"]
+    totals = _traffic(router)
+    assert totals["requests_ok"] == 1 and totals["requests_failed"] == 0, "One rescued request is one success"
+    assert totals["reroutes_ok"] == 1 and totals["reroutes_failed"] == 0
+    assert totals["failures"] == {"http_5xx": 1}, "The failed attempt still counts as a failure of its kind"
+    assert totals["input_tokens"] == 5 and totals["output_tokens"] == 3
+
+
+def test_clean_success_and_total_failure_are_counted_separately(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from llm_router.metrics import MetricsStore
+
+    clean, _ = _router_with_fake(set(), metrics=MetricsStore(tmp_path / "clean.sqlite3"))
+    asyncio.run(clean.complete(QueryRequest.from_prompt("hello")))
+    assert _traffic(clean) == {
+        "requests_ok": 1, "requests_failed": 0, "reroutes_ok": 0, "reroutes_failed": 0,
+        "input_tokens": 5, "output_tokens": 3, "failures": {},
+    }
+    broken, adapter = _router_with_fake({"source-a", "source-b"}, metrics=MetricsStore(tmp_path / "broken.sqlite3"))
+    with pytest.raises(AllModelsFailed):
+        asyncio.run(broken.complete(QueryRequest.from_prompt("hello")))
+    assert adapter.calls == ["source-a", "source-b"]
+    assert _traffic(broken) == {
+        "requests_ok": 0, "requests_failed": 1, "reroutes_ok": 0, "reroutes_failed": 1,
+        "input_tokens": 0, "output_tokens": 0, "failures": {"http_5xx": 2},
+    }
+
+
+def test_requests_with_no_eligible_model_are_failed_requests_without_attempts() -> None:
+    from llm_router.errors import NoEligibleModel
+
+    router, adapter = _router_with_fake(set())
+    with pytest.raises(NoEligibleModel):
+        asyncio.run(router.complete(QueryRequest.from_prompt("hello", min_context_window=10**9)))
+    assert adapter.calls == []
+    assert _traffic(router) == {
+        "requests_ok": 0, "requests_failed": 1, "reroutes_ok": 0, "reroutes_failed": 0,
+        "input_tokens": 0, "output_tokens": 0, "failures": {"no_eligible_model": 1},
+    }
+    router.route(QueryRequest.from_prompt("hello"))
+    assert _traffic(router)["requests_ok"] == 0, "Dry routing is not client traffic"
+
+
+def test_adapter_crash_is_an_adapter_failure_and_traffic_storage_errors_never_lose_answers(monkeypatch) -> None:
+    class CrashingAdapter(FakeAdapter):
+        async def complete(self, endpoint, model, request):  # type: ignore[no-untyped-def]
+            if endpoint.name == "source-a":
+                raise RuntimeError("private adapter crash")
+            return await super().complete(endpoint, model, request)
+
+    router, _ = _router_with_fake(set())
+    router.adapters.register("ollama-chat", CrashingAdapter(set()))
+    result = asyncio.run(router.complete(QueryRequest.from_prompt("hello")))
+    assert result.deployment == "fallback-b"
+    assert _traffic(router)["failures"] == {"adapter": 1}
+
+    def broken(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise OSError("private disk failure")
+
+    monkeypatch.setattr(router.metrics, "record_request", broken)
+    result = asyncio.run(router.complete(QueryRequest.from_prompt("hello")))
+    assert result.text.startswith("answer from")

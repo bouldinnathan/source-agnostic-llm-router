@@ -40,7 +40,7 @@ class BaseHTTPAdapter:
     ) -> Mapping[str, Any]:
         if not endpoint.base_url:
             raise UpstreamError(
-                f"Endpoint '{endpoint.name}' has no base_url", retryable=False
+                f"Endpoint '{endpoint.name}' has no base_url", retryable=False, kind="configuration"
             )
         headers, params = self.connection_metadata(endpoint, default_headers or {})
         url = endpoint.base_url.rstrip("/") + "/" + path.lstrip("/")
@@ -60,17 +60,19 @@ class BaseHTTPAdapter:
                 status_code=status,
                 retryable=retryable,
             ) from exc
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            raise UpstreamError(f"Upstream network failure: {type(exc).__name__}") from exc
+        except httpx.TimeoutException as exc:
+            raise UpstreamError(f"Upstream network failure: {type(exc).__name__}", kind="timeout") from exc
+        except httpx.NetworkError as exc:
+            raise UpstreamError(f"Upstream network failure: {type(exc).__name__}", kind="connection") from exc
         except httpx.HTTPError as exc:
-            raise UpstreamError(f"Upstream HTTP failure: {type(exc).__name__}") from exc
+            raise UpstreamError(f"Upstream HTTP failure: {type(exc).__name__}", kind="connection") from exc
 
         try:
             decoded = response.json()
         except ValueError as exc:
-            raise UpstreamError("Upstream returned invalid JSON", retryable=False) from exc
+            raise UpstreamError("Upstream returned invalid JSON", retryable=False, kind="invalid_response") from exc
         if not isinstance(decoded, Mapping):
-            raise UpstreamError("Upstream JSON response is not an object", retryable=False)
+            raise UpstreamError("Upstream JSON response is not an object", retryable=False, kind="invalid_response")
         return decoded
 
     def connection_metadata(
@@ -87,12 +89,12 @@ class BaseHTTPAdapter:
             return headers, params
         if not auth.key_env:
             raise UpstreamError(
-                f"Endpoint '{endpoint.name}' requires auth.key_env", retryable=False
+                f"Endpoint '{endpoint.name}' requires auth.key_env", retryable=False, kind="configuration"
             )
         secret = os.environ.get(auth.key_env)
         if not secret:
             raise UpstreamError(
-                f"Missing credential environment variable {auth.key_env}", retryable=False
+                f"Missing credential environment variable {auth.key_env}", retryable=False, kind="configuration"
             )
         if scheme == "query":
             params[auth.query_param or self.default_auth_query_param] = secret
@@ -108,7 +110,7 @@ class BaseHTTPAdapter:
         else:
             raise UpstreamError(
                 f"Endpoint '{endpoint.name}' has unsupported auth scheme '{scheme}'",
-                retryable=False,
+                retryable=False, kind="configuration",
             )
         return headers, params
 
@@ -120,7 +122,7 @@ def _expand_env(value: str) -> str:
         if resolved is None:
             raise UpstreamError(
                 f"Missing environment variable {name} used by an endpoint header",
-                retryable=False,
+                retryable=False, kind="configuration",
             )
         return resolved
 
