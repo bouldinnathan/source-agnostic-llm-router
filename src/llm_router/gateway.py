@@ -29,6 +29,8 @@ from .aliases import ModelAlias, alias_conflicts, build_aliases
 from .discovery import DiscoveryReport, DiscoverySettings, ProbeResult, merge_router_configs
 from .errors import AllModelsFailed, NoEligibleModel, RequestError, RouterError
 from .health import probe_endpoints
+from .inference_jobs import InferenceJobError, InferenceJobs, Runner
+from .inference_test import run_inference_checks
 from .metrics import MetricsStore
 from .provisioning import OllamaProvisioner, ProvisioningReport, ProvisioningSettings
 from .public_status import public_summary
@@ -40,7 +42,7 @@ from .self_test import run_backend_checks
 from .status_page import STATUS_CSS, STATUS_JS, render_status_html
 from .update_control import UpdateController, UpdateRequestError
 
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 SAVED_HOST_REFRESH_SECONDS = 30.0
 SAVED_HOST_CHECK_COOLDOWN_SECONDS = 3.0
 VIRTUAL_MODELS: dict[str, str] = {
@@ -598,6 +600,7 @@ def create_app(
     gateway: RouterGateway | None = None,
     saved_host_store: SavedHostStore | None = None,
     update_controller: UpdateController | None = None,
+    inference_test_runner: Runner | None = None,
 ) -> Starlette:
     service = gateway or RouterGateway(
         config_path=config_path,
@@ -607,6 +610,7 @@ def create_app(
         provisioner=provisioner,
     )
     updates = update_controller if update_controller is not None else UpdateController()
+    inference_jobs = InferenceJobs(inference_test_runner if inference_test_runner is not None else run_inference_checks)
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
@@ -618,6 +622,7 @@ def create_app(
             saved_task = asyncio.create_task(saved_host_loop(), name="llm-router-saved-hosts")
             yield
         finally:
+            await inference_jobs.close()
             if saved_task is not None:
                 saved_task.cancel()
                 try:
@@ -913,6 +918,45 @@ def create_app(
         payload = await asyncio.to_thread(service.metrics_status)
         return JSONResponse(payload, status_code=200 if payload["available"] else 503, headers=page_headers)
 
+    async def status_inference_test(request: Request) -> Response:
+        """Opt-in model use is separate from metadata-only connectivity tests."""
+        def reply(payload: Mapping[str, Any], code: int = 200) -> Response:
+            return JSONResponse(payload, status_code=code, headers=page_headers)
+
+        if not os.environ.get("LLM_ROUTER_GATEWAY_API_KEY", "").strip():
+            return reply({"error": "Set LLM_ROUTER_GATEWAY_API_KEY to run inference tests."}, 403)
+        denied = _authorize(request, openai=True)
+        if denied is not None:
+            denied.headers.update(page_headers)
+            return denied
+        if request.url.query:
+            return reply({"error": "Inference tests do not accept query parameters."}, 400)
+        if request.method in {"GET", "HEAD"}:
+            return reply(inference_jobs.status())
+        origin = request.headers.get("origin")
+        if request.headers.get("x-llm-router-inference-test") != "1" or origin is not None and origin != str(request.base_url).rstrip("/"):
+            return reply({"error": "Use the inference-test button on this router's status page."}, 403)
+
+        async def empty_body() -> bool:
+            async for chunk in request.stream():
+                if chunk:
+                    return False
+            return True
+
+        try:
+            if not await asyncio.wait_for(empty_body(), timeout=3.0):
+                return reply({"error": "Inference-test requests must have an empty body; custom targets or prompts are not accepted."}, 400)
+        except (asyncio.TimeoutError, RuntimeError):
+            return reply({"error": "Send an empty inference-test request."}, 400)
+        cached = service._router
+        try:
+            return reply(inference_jobs.start(cached.config if cached is not None else None), 202)
+        except InferenceJobError as exc:
+            response = reply({"error": str(exc)}, exc.status_code)
+            if exc.status_code == 429:
+                response.headers["Retry-After"] = "30"
+            return response
+
     async def status_self_test(request: Request) -> Response:
         """Explicit, bounded API checks; never discover, provision or infer."""
         nonlocal self_test_next_allowed
@@ -1192,6 +1236,7 @@ def create_app(
         Route("/status/data", status_data, methods=["GET"]),
         Route("/status/update", status_update, methods=["GET", "POST"]),
         Route("/status/self-test", status_self_test, methods=["POST"]),
+        Route("/status/inference-test", status_inference_test, methods=["GET", "POST"]),
         Route("/status/hosts", saved_hosts, methods=["GET", "POST"]),
         Route("/status/hosts/check", check_saved_hosts, methods=["POST"]),
         Route("/status/hosts/{host_id}", remove_saved_host, methods=["DELETE"]),
@@ -1215,6 +1260,7 @@ def create_app(
     app = Starlette(routes=routes, lifespan=lifespan)
     app.add_middleware(RedactStatusQueryKey)
     app.state.router_gateway = service
+    app.state.inference_jobs = inference_jobs
     return app
 
 

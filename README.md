@@ -144,7 +144,7 @@ written to browser storage or URLs, and a reload or lock shows every panel again
 The page is grouped into three zones. **Overview** holds the health strip, the
 client-traffic panel, and the network summary. **Fleet** holds saved backend
 addresses, backends, model deployments, client model names, and observed
-performance. **Operations** holds the connection self-test, software updates,
+performance. **Operations** holds the connection self-test, explicit inference test, software updates,
 router links, and a folded **How to read this page** panel that collects the
 caveats instead of repeating them under every card. Each panel heading carries a
 live count, such as `2 of 3 online` or `82 requests · last 24 hours`, so a
@@ -219,6 +219,40 @@ refresh remains a cached read and never starts the self-test. The page reports
 the gateway process, not the systemd service/timer state. The update timer can
 still be checked with the commands below. No external fonts, scripts or analytics
 are used.
+
+For an actual generation check, use the separate **Test smallest model on each
+backend (runs inference)** button and confirm the warning. It requires a
+configured router API key. This sends one tiny, fixed prompt directly to one
+enabled chat model on each supported backend, with a small output-token limit.
+It may load a model from disk, consume RAM/VRAM, evict another model according to
+the backend's settings, or incur provider charges. It never downloads models,
+retries inference, or fails over to a different server. The existing **Run
+self-test (no models)** button remains metadata-only.
+
+The test chooses the smallest eligible model using reported file sizes where
+available, then parameter counts/name estimates, and a deterministic fallback
+when sizes are unknown. The result identifies the selected model, server,
+selection basis, pass/fail/skipped status and elapsed time. Unknown or partially
+known sizes are labeled, not represented as proof of the absolute smallest model.
+Unsupported adapters, non-chat models, and excess targets are explicitly skipped.
+At most 16 backends are tested, two concurrently. Progress shows completed
+backends; polling only reads results and never starts another generation.
+
+Only an explicit, confirmed click starts a test. Refreshing the page, reading
+health/status, checking saved addresses and automatic scans do not start it.
+There is one job per gateway process, a 30-second cooldown after completion and
+a 15-minute whole-job deadline. Results are in memory, not retained across a
+router restart. If the connection is lost, the page only checks the job's status;
+it never automatically repeats the inference request. A timeout/cancel may not
+stop work already accepted by a backend. These direct diagnostics do not affect
+routing health or passive model-performance metrics, and do not prove tool use
+or HA failover works.
+
+For scripts, `POST /status/inference-test` starts the same job (HTTP 202), and
+`GET /status/inference-test` reads progress/results without invoking anything.
+Both require `Authorization: Bearer YOUR_ROUTER_KEY`; POST also requires
+`X-LLM-Router-Inference-Test: 1` and an empty body. Query parameters, caller-picked
+models/prompts/targets, and cross-origin POSTs are rejected.
 
 For localhost-only access, select `--localhost` at installation; you can then use
 an SSH tunnel instead of exposing port 8088. Manually launched `llm-router serve`
@@ -564,7 +598,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.3.3-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.3.4-py3-none-any.whl
 llm-router --json discover
 ```
 
@@ -594,6 +628,7 @@ pytest
 | HA, preferred-machine and no-failover aliases | Generated for enrolled models. Replica groups use exact upstream model IDs unless `replica_group` explicitly joins different IDs. Use a stable `machine_id` and DNS/VPN hostname for a roaming machine. |
 | Install router software updates | Daily, with up to one hour of jitter, **only after** installing with `--service --auto-update`. Updates preserve settings and restart an active service; a single router can briefly be unavailable during restart. |
 | Status page and self-test | Public summaries and page refreshes read cached data. Saved checks and the self-test fetch metadata only; they never run inference, load models, or download models. |
+| Explicit smallest-model inference test | Separate authenticated button, with confirmation. Runs one tiny prompt per supported backend and may load a model; never starts automatically, downloads models, retries inference or fails over. |
 
 LAN discovery currently checks Ollama on `11434` and OpenAI-compatible APIs on
 `1234`, `8000`, and `8080`. It examines the **first 64 host addresses per configured

@@ -51,6 +51,8 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
   const requests = [];
   const hostRequests = [];
   const updateRequests = [];
+  const inferenceRequests = [];
+  const confirmations = [];
   const allRequests = [];
   const historyCalls = [];
   const timeline = [];
@@ -75,6 +77,7 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
     },
     window: {
       location,
+      confirm: message => { confirmations.push(message); return options.confirm !== false; },
       history: {replaceState: (state, title, url) => {
         timeline.push("replaceState");
         historyCalls.push({state, title, url});
@@ -96,8 +99,15 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
       timeline.push("fetch");
       const hostRequest = /^\/status\/hosts(?:\/[^/?#]+)?$/.test(url);
       const updateRequest = url === "/status/update";
-      assert.ok(["/healthz", "/status/data", "/status/self-test"].includes(url) || hostRequest || updateRequest, "Only same-origin status endpoints may be fetched");
-      if (!hostRequest && !updateRequest) assert.equal(options.method, url === "/status/self-test" ? "POST" : "GET");
+      const inferenceRequest = url === "/status/inference-test";
+      assert.ok(["/healthz", "/status/data", "/status/self-test"].includes(url) || hostRequest || updateRequest || inferenceRequest, "Only same-origin status endpoints may be fetched");
+      if (!hostRequest && !updateRequest && !inferenceRequest) assert.equal(options.method, url === "/status/self-test" ? "POST" : "GET");
+      if (inferenceRequest) {
+        assert.match(options.headers.Authorization, /^Bearer .+/);
+        assert.equal(options.body, undefined, "Inference jobs never accept a backend, prompt, model, URL, or body");
+        if (options.method === "POST") assert.equal(options.headers["X-LLM-Router-Inference-Test"], "1");
+        else assert.equal(options.method, "GET");
+      }
       if (updateRequest) {
         assert.match(options.headers.Authorization, /^Bearer .+/);
         assert.equal(options.body, undefined, "Update requests may not supply a URL, revision, path or other body");
@@ -120,7 +130,7 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
       assert.equal(options.redirect, "error");
       const pending = {url, options, resolve, reject};
       allRequests.push(pending);
-      (hostRequest ? hostRequests : updateRequest ? updateRequests : requests).push(pending);
+      (hostRequest ? hostRequests : updateRequest ? updateRequests : inferenceRequest ? inferenceRequests : requests).push(pending);
       if (hostRequest && autoLoadHosts && options.method === "GET") resolve({status: 200, ok: true, json: async () => ({hosts: [], limit: 16})});
       if (updateRequest && context.autoLoadUpdates && options.method === "GET") resolve({status: 200, ok: true, json: async () => updateSnapshot()});
     }),
@@ -128,7 +138,7 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
   context.autoLoadUpdates = options.autoLoadUpdates !== false;
   vm.runInNewContext(script, context);
   return {
-    element, requests, hostRequests, updateRequests, allRequests, timeouts, historyCalls, timeline, location,
+    element, requests, hostRequests, updateRequests, inferenceRequests, confirmations, allRequests, timeouts, historyCalls, timeline, location,
     advanceTime: milliseconds => { currentTime += milliseconds; },
     expire: delay => {
       for (const [id, callback] of Array.from(timeouts.entries())) if (timeoutDelays.get(id) === delay) {
@@ -146,6 +156,8 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
     },
     lock: () => element("lock-button").events.click(),
     selfTest: () => element("self-test-button").events.click(),
+    inference: () => element("inference-button").events.click(),
+    readInference: () => element("inference-refresh-button").events.click(),
     saveHost: address => {
       element("host-address").value = address;
       element("host-form").events.submit({preventDefault() {}});
@@ -166,7 +178,7 @@ async function reply(request, status, data) {
 
 function snapshot() {
   return {
-    ready: true, status: "ready", version: "0.3.3", uptime_seconds: 65,
+    ready: true, status: "ready", version: "0.3.4", uptime_seconds: 65,
     checked_at: "2026-09-16T12:00:00Z", last_discovery: null,
     counts: {endpoints: 1, online: 1, models: 1, available_models: 1, aliases: 1},
     endpoints: [{name: "backend", machine: "laptop", address: "http://private-backend:1234", state: "online", model_count: 1, available_models: 1}],
@@ -176,7 +188,242 @@ function snapshot() {
 }
 
 function updateSnapshot(overrides = {}) {
-  return {available: true, busy: false, state: "idle", stage: "idle", message: "Ready", run_id: null, updated_at: null, current_version: "0.3.3", ...overrides};
+  return {available: true, busy: false, state: "idle", stage: "idle", message: "Ready", run_id: null, updated_at: null, current_version: "0.3.4", ...overrides};
+}
+
+function inferenceSnapshot(overrides = {}) {
+  return {state: "idle", run_id: null, started_at: null, finished_at: null, total: 0, completed: 0, checks: [], notice: "Explicit tiny-prompt test; no model downloads or fallback.", ...overrides};
+}
+
+function inferenceCheck(overrides = {}) {
+  return {name: "Ollama laptop", target: "http://private-backend:11434", status: "pass", model: "qwen:0.5b", selection: "Smallest reported installed size (500 MB)", detail: "Generation returned a non-empty response", elapsed_ms: 320, http_status: 200, ...overrides};
+}
+
+async function requestInference(app, previous = inferenceSnapshot()) {
+  app.inference();
+  const baseline = app.inferenceRequests.at(-1);
+  assert.equal(baseline.options.method, "GET", "Read a baseline only after the confirmed click");
+  await reply(baseline, 200, previous);
+  const post = app.inferenceRequests.at(-1);
+  assert.equal(post.options.method, "POST");
+  return post;
+}
+
+async function inferenceExplicitConsentAndNoPassiveRequests() {
+  assert.match(markup, /Test smallest model on each backend \(runs inference\)/);
+  assert.match(markup, /may load models from storage and use RAM \/ GPU memory/);
+  assert.match(markup, /Run self-test \(no models\)/);
+  const locked = harness();
+  locked.inference();
+  locked.readInference();
+  assert.equal(locked.inferenceRequests.length, 0);
+  assert.equal(locked.confirmations.length, 0);
+  const keyless = await unlocked(false);
+  keyless.inference();
+  assert.equal(keyless.inferenceRequests.length, 0);
+  assert.equal(keyless.element("inference-panel").hidden, true);
+  const cancelled = harness(true, true, {confirm: false});
+  cancelled.enterKey("secret-key");
+  await reply(cancelled.requests.at(-1), 200, snapshot());
+  cancelled.inference();
+  assert.equal(cancelled.confirmations.length, 1);
+  assert.equal(cancelled.inferenceRequests.length, 0, "Cancel must not even read a job baseline");
+  const app = await unlocked();
+  assert.equal(app.element("inference-panel").hidden, false);
+  app.tick();
+  await reply(app.requests.at(-1), 200, snapshot());
+  app.tick(30000);
+  app.element("collapse-all-button").events.click();
+  app.element("expand-all-button").events.click();
+  app.selfTest();
+  await reply(app.requests.at(-1), 200, selfTestResult());
+  assert.equal(app.inferenceRequests.length, 0, "Refresh, metadata self-test, saved hosts and layout must not invoke inference or read its job");
+  const post = await requestInference(app);
+  assert.match(app.confirmations[0], /Run real inference/);
+  assert.match(app.confirmations[0], /RAM \/ GPU memory/);
+  assert.match(app.confirmations[0], /provider credits/);
+  assert.match(app.confirmations[0], /evict a loaded model/);
+  assert.match(app.confirmations[0], /up to 16 per run/);
+  assert.match(app.confirmations[0], /No models are downloaded/);
+  assert.equal(post.options.headers.Authorization, "Bearer secret-key");
+  app.inference();
+  assert.equal(app.confirmations.length, 1, "Double click is ignored while an action is pending");
+  assert.equal(app.inferenceRequests.filter(request => request.options.method === "POST").length, 1);
+}
+
+async function inferenceProgressAndSafePerBackendResults() {
+  const app = await unlocked();
+  const post = await requestInference(app);
+  await reply(post, 202, inferenceSnapshot({state: "running", run_id: "job-one", total: 3}));
+  assert.equal(app.element("inference-progress").hidden, false);
+  assert.equal(app.element("inference-progress").max, 3);
+  assert.equal(app.element("inference-progress").value, 0);
+  assert.match(app.element("inference-message").textContent, /0 \/ 3/);
+  app.expire(2000);
+  assert.equal(app.inferenceRequests.at(-1).options.method, "GET");
+  const checks = [inferenceCheck({name: '<img src=x onerror="alert(1)">', model: '<script>alert(1)</script>'})];
+  await reply(app.inferenceRequests.at(-1), 200, inferenceSnapshot({state: "running", run_id: "job-one", total: 3, completed: 1, checks}));
+  assert.equal(app.element("inference-progress").value, 1);
+  assert.equal(app.element("inference-body").children.length, 1);
+  assert.match(app.element("inference-body").textContent, /<script>alert\(1\)<\/script>/);
+  assert.match(app.element("inference-body").textContent, /Smallest reported installed size/);
+  assert.match(app.element("inference-body").textContent, /private-backend:11434/);
+  assert.match(app.element("inference-body").textContent, /320 ms/);
+  assert.equal(descendants(app.element("inference-body"), "").filter(node => ["script", "img"].includes(node.tagName)).length, 0);
+  checks.push(inferenceCheck({status: "fail", detail: "Backend timed out", http_status: null}), inferenceCheck({status: "skip", model: null, selection: "No eligible chat model", http_status: null}));
+  app.expire(2000);
+  await reply(app.inferenceRequests.at(-1), 200, inferenceSnapshot({state: "complete", run_id: "job-one", total: 3, completed: 3, checks}));
+  assert.equal(app.element("inference-progress").hidden, true);
+  assert.match(app.element("inference-message").textContent, /1 passed, 1 failed, 1 skipped/);
+  assert.match(app.element("inference-body").textContent, /Skipped/);
+  assert.equal(app.element("inference-button").disabled, false);
+  const count = app.inferenceRequests.length;
+  app.expire(2000);
+  assert.equal(app.inferenceRequests.length, count, "Terminal result stops polling");
+  const large = await unlocked();
+  const largePost = await requestInference(large);
+  await reply(largePost, 202, inferenceSnapshot({state: "running", run_id: "large-fleet", total: 1000, completed: 1, checks: [inferenceCheck({name: "n".repeat(2048), status: "skip"})]}));
+  assert.equal(large.element("inference-progress").max, 1000, "All configured endpoints, including capped/skipped backends, count toward completion");
+  assert.match(large.element("inference-message").textContent, /1 \/ 1,?000/);
+}
+
+async function inferenceNoRepeatedPostOrHistoricalSuccess() {
+  const app = await unlocked();
+  const old = inferenceSnapshot({state: "complete", run_id: "old-job", total: 1, completed: 1, checks: [inferenceCheck()]});
+  const post = await requestInference(app, old);
+  post.reject(new Error("connection lost after the server accepted the job"));
+  await flush();
+  app.expire(2000);
+  await reply(app.inferenceRequests.at(-1), 200, old);
+  assert.match(app.element("inference-message").textContent, /older result/);
+  assert.equal(app.element("inference-results").hidden, true);
+  app.expire(2000);
+  await reply(app.inferenceRequests.at(-1), 200, inferenceSnapshot({state: "running", run_id: "new-job", total: 1}));
+  app.tick();
+  app.requests.at(-1).reject(new Error("dashboard connection lost"));
+  await flush();
+  app.expire(2000);
+  assert.equal(app.inferenceRequests.at(-1).options.method, "GET", "A main-dashboard error must not discard the pending inference job");
+  await reply(app.inferenceRequests.at(-1), 200, inferenceSnapshot());
+  assert.match(app.element("inference-message").textContent, /no longer available/);
+  assert.match(app.element("inference-meta").textContent, /Outcome unknown/);
+  assert.equal(app.inferenceRequests.filter(request => request.options.method === "POST").length, 1);
+  const neverConfirmed = await unlocked();
+  const uncertain = await requestInference(neverConfirmed, old);
+  await reply(uncertain, 503, {error: "unavailable"});
+  neverConfirmed.advanceTime(20 * 60 * 1000 + 1);
+  neverConfirmed.expire(2000);
+  assert.match(neverConfirmed.element("inference-message").textContent, /Stopped waiting after 20 minutes/);
+  assert.equal(neverConfirmed.element("inference-refresh-button").hidden, false);
+  assert.equal(neverConfirmed.inferenceRequests.filter(request => request.options.method === "POST").length, 1);
+}
+
+async function inferenceBusyCooldownAndPreparationFailures() {
+  const busy = await unlocked();
+  busy.inference();
+  await reply(busy.inferenceRequests.at(-1), 200, inferenceSnapshot({state: "running", run_id: "someone-else", total: 2}));
+  assert.equal(busy.inferenceRequests.filter(request => request.options.method === "POST").length, 0);
+  assert.match(busy.element("inference-message").textContent, /existing inference test/);
+  for (const code of [400, 409, 429]) {
+    const app = await unlocked();
+    const post = await requestInference(app);
+    await reply(post, code, {error: "do not render raw error"});
+    assert.match(app.element("inference-message").textContent, /no (new )?test was started/i);
+    assert.doesNotMatch(app.element("inference-message").textContent, /raw error/);
+    assert.equal(app.element("inference-button").disabled, false);
+    app.expire(2000);
+    assert.equal(app.inferenceRequests.length, 2);
+  }
+  for (const data of [{}, inferenceSnapshot({state: "constructor"}), inferenceSnapshot({total: 999999}), inferenceSnapshot({state: "complete", run_id: "old", total: 1}), inferenceSnapshot({notice: "x".repeat(2049)})]) {
+    const app = await unlocked();
+    app.inference();
+    await reply(app.inferenceRequests.at(-1), 200, data);
+    assert.match(app.element("inference-message").textContent, /No inference request was sent/);
+    assert.equal(app.inferenceRequests.filter(request => request.options.method === "POST").length, 0);
+  }
+}
+
+async function inferencePrivacyAuthenticationAndLateBodies() {
+  for (const clear of ["lock", "pagehide", "switch", "auth"]) {
+    const app = await unlocked();
+    const pending = await requestInference(app);
+    if (clear === "lock") app.lock();
+    if (clear === "pagehide") app.event("pagehide");
+    if (clear === "switch") app.enterKey("replacement-key");
+    if (clear === "auth") { app.tick(); await reply(app.requests.at(-1), 401, {}); }
+    assert.equal(pending.options.signal.aborted, true);
+    await reply(pending, 202, inferenceSnapshot({state: "complete", run_id: "private", total: 1, completed: 1, checks: [inferenceCheck()]}));
+    assert.equal(app.element("inference-panel").hidden, true);
+    assert.equal(app.element("inference-body").textContent, "");
+    const count = app.inferenceRequests.length;
+    app.expire(2000);
+    assert.equal(app.inferenceRequests.length, count);
+  }
+  for (const code of [401, 403]) {
+    const app = await unlocked();
+    const post = await requestInference(app);
+    app.tick();
+    const status = app.requests.at(-1);
+    await reply(post, code, {});
+    assert.equal(status.options.signal.aborted, true);
+    assert.equal(app.element("details").hidden, true);
+    assert.equal(app.element("inference-panel").hidden, true);
+    await reply(status, 200, snapshot());
+    assert.equal(app.element("inference-panel").hidden, true);
+  }
+  const app = await unlocked();
+  const post = await requestInference(app);
+  let resolveBody;
+  post.resolve({status: 202, ok: true, json: () => new Promise(resolve => { resolveBody = resolve; })});
+  await flush();
+  app.lock();
+  resolveBody(inferenceSnapshot({state: "running", run_id: "late-body", total: 1}));
+  await flush();
+  assert.equal(app.element("inference-panel").hidden, true);
+}
+
+async function inferenceVisibilityAndTimeoutRecovery() {
+  const app = await unlocked();
+  const post = await requestInference(app);
+  app.visibility(true);
+  assert.equal(post.options.signal.aborted, true);
+  const count = app.inferenceRequests.length;
+  app.expire(2000);
+  assert.equal(app.inferenceRequests.length, count);
+  app.visibility(false);
+  assert.equal(app.inferenceRequests.at(-1).options.method, "GET");
+  await reply(app.inferenceRequests.at(-1), 200, inferenceSnapshot({state: "running", run_id: "surviving", total: 2, completed: 1, checks: [inferenceCheck()]}));
+  await reply(post, 202, inferenceSnapshot({state: "complete", run_id: "late", total: 0}));
+  assert.match(app.element("inference-message").textContent, /1 \/ 2/);
+  app.visibility(true);
+  assert.equal(app.element("inference-body").textContent, "");
+  app.advanceTime(20 * 60 * 1000 + 1);
+  app.visibility(false);
+  assert.match(app.element("inference-message").textContent, /Stopped waiting after 20 minutes/);
+  app.readInference();
+  await reply(app.inferenceRequests.at(-1), 200, inferenceSnapshot({state: "interrupted", run_id: "surviving", total: 2, completed: 1, checks: [inferenceCheck()]}));
+  assert.match(app.element("inference-message").textContent, /Test interrupted/);
+  app.event("pagehide");
+  app.event("pageshow", {persisted: true});
+  app.expire(2000);
+  assert.equal(app.element("inference-panel").hidden, true);
+  assert.equal(app.inferenceRequests.filter(request => request.options.method === "POST").length, 1);
+  const preparing = await unlocked();
+  preparing.inference();
+  const baseline = preparing.inferenceRequests.at(-1);
+  preparing.visibility(true);
+  await reply(baseline, 200, inferenceSnapshot());
+  preparing.visibility(false);
+  assert.equal(preparing.inferenceRequests.filter(request => request.options.method === "POST").length, 0, "A hidden/aborted preparation cannot send a delayed prompt");
+  const timeout = await unlocked();
+  const timedPost = await requestInference(timeout);
+  timeout.expire(15000);
+  assert.equal(timedPost.options.signal.aborted, true);
+  await reply(timedPost, 202, inferenceSnapshot({state: "complete", run_id: "too-late", total: 0}));
+  assert.match(timeout.element("inference-message").textContent, /could not be confirmed/);
+  timeout.expire(2000);
+  assert.equal(timeout.inferenceRequests.at(-1).options.method, "GET");
+  assert.equal(timeout.inferenceRequests.filter(request => request.options.method === "POST").length, 1);
 }
 
 function selfTestResult(status = "pass") {
@@ -206,11 +453,11 @@ async function publicReadiness() {
     assert.equal(app.requests[0].url, "/healthz");
     assert.equal(app.requests[0].options.headers.Authorization, undefined);
     // The real public endpoint deliberately contains no ready field.
-    await reply(app.requests[0], httpStatus, {status, version: "0.3.3"});
+    await reply(app.requests[0], httpStatus, {status, version: "0.3.4"});
     assert.equal(app.element("health-panel").className, `health-panel tone-${tone}`);
     assert.equal(app.element("gateway-state").textContent, "Responding");
     assert.equal(app.element("model-readiness").textContent, readiness);
-    assert.equal(app.element("version").textContent, "Version 0.3.3", "Version should remain visible while details are locked");
+    assert.equal(app.element("version").textContent, "Version 0.3.4", "Version should remain visible while details are locked");
     assert.equal(app.element("details").hidden, true);
     assert.equal(app.element("refresh-button").disabled, false);
   }
@@ -224,10 +471,10 @@ async function topbarVersionTracksCurrentSnapshot() {
   assert.ok(header && /\bid="version"/.test(header[1]), "Version belongs at the top of the page, before locked details");
   assert.equal(Array.from(markup.matchAll(/\bid="version"/g)).length, 1);
   const app = harness();
-  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.3"});
+  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.4"});
   assert.equal(app.element("details").hidden, true);
   assert.equal(app.element("version").hidden, false);
-  assert.equal(app.element("version").textContent, "Version 0.3.3", "Even an unavailable public gateway identifies its version");
+  assert.equal(app.element("version").textContent, "Version 0.3.4", "Even an unavailable public gateway identifies its version");
   app.enterKey("secret-key");
   await reply(app.requests.at(-1), 200, {...snapshot(), version: "0.4.0"});
   assert.equal(app.element("version").textContent, "Version 0.4.0");
@@ -251,7 +498,7 @@ async function nonoverlapAndNetworkFailure() {
   app.tick();
   app.element("refresh-button").events.click();
   assert.equal(app.requests.length, 1, "In-flight requests must not overlap");
-  await reply(app.requests[0], 200, {status: "ready", version: "0.3.3"});
+  await reply(app.requests[0], 200, {status: "ready", version: "0.3.4"});
   app.tick();
   assert.equal(app.requests.length, 2);
   app.requests[1].reject(new Error("network offline"));
@@ -266,7 +513,7 @@ async function nonoverlapAndNetworkFailure() {
 
 async function authenticationAndSafeRendering() {
   const app = harness();
-  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.3"});
+  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.4"});
   app.enterKey("secret-key");
   assert.equal(app.requests[1].url, "/status/data");
   assert.equal(app.requests[1].options.headers.Authorization, "Bearer secret-key");
@@ -297,9 +544,9 @@ async function lockLateResponsesAndRejectedKeys() {
   assert.equal(app.requests[3].url, "/healthz");
   await reply(app.requests[2], 200, snapshot());
   assert.equal(app.element("details").hidden, true, "A late authenticated result must not unlock details");
-  await reply(app.requests[0], 200, {status: "ready", version: "0.3.3"});
+  await reply(app.requests[0], 200, {status: "ready", version: "0.3.4"});
   assert.equal(app.element("health-panel").className, "health-panel tone-pending", "A cancelled old public request must not overwrite pending state");
-  await reply(app.requests[3], 503, {status: "unavailable", version: "0.3.3"});
+  await reply(app.requests[3], 503, {status: "unavailable", version: "0.3.4"});
   app.enterKey("rejected-key");
   await reply(app.requests[4], 401, {});
   assert.equal(app.element("details").hidden, true);
@@ -908,13 +1155,13 @@ async function savedHostCatalogStaleAndPrivate() {
 }
 
 async function collapsiblePanelsAndSavedHostResults() {
-  for (const id of ["traffic-panel", "update-panel", "summary-panel", "links-panel", "hosts-panel", "self-test-panel", "backends-panel", "models-panel", "aliases-panel", "performance-panel"]) {
+  for (const id of ["traffic-panel", "update-panel", "summary-panel", "links-panel", "hosts-panel", "self-test-panel", "inference-panel", "backends-panel", "models-panel", "aliases-panel", "performance-panel"]) {
     const tag = markup.match(new RegExp(`<details\\b[^>]*\\bid="${id}"[^>]*>`));
     assert.ok(tag && /\bopen\b/.test(tag[0]), `${id} must be a native details panel that starts expanded`);
   }
   const about = markup.match(/<details\b[^>]*\bid="about-panel"[^>]*>/);
   assert.ok(about && !/\bopen\b/.test(about[0]), "Reading notes start folded so they do not compete with live status");
-  for (const id of ["traffic-panel", "self-test-panel"]) assert.match(markup.match(new RegExp(`<details\\b[^>]*\\bid="${id}"[^>]*>`))[0], /\bhidden\b/, `${id} is private and starts hidden`);
+  for (const id of ["traffic-panel", "self-test-panel", "inference-panel"]) assert.match(markup.match(new RegExp(`<details\\b[^>]*\\bid="${id}"[^>]*>`))[0], /\bhidden\b/, `${id} is private and starts hidden`);
   const zones = markup.match(/<div class="zone-heading"><h2>([^<]+)<\/h2><\/div>/g).map(item => item.replace(/<[^>]+>/g, ""));
   assert.deepEqual(zones, ["Overview", "Fleet", "Operations"]);
   assert.ok(markup.indexOf('id="traffic-panel"') < markup.indexOf('id="public-summary-title"'), "Traffic leads the overview zone");
@@ -1692,10 +1939,10 @@ async function updatesRequireExplicitAuthenticatedClick() {
     assert.doesNotMatch(app.element("update-message").textContent, /\d+%/);
   }
   app.expire(2000);
-  await reply(app.updateRequests.at(-1), 200, updateSnapshot({state: "succeeded", stage: "complete", run_id: "run-one", current_version: "0.3.3", updated_at: "2026-09-19T12:00:00Z"}));
+  await reply(app.updateRequests.at(-1), 200, updateSnapshot({state: "succeeded", stage: "complete", run_id: "run-one", current_version: "0.3.4", updated_at: "2026-09-19T12:00:00Z"}));
   assert.equal(app.element("update-progress").hidden, true);
   assert.match(app.element("update-message").textContent, /Update completed successfully/);
-  assert.match(app.element("update-observed").textContent, /0\.3\.3/);
+  assert.match(app.element("update-observed").textContent, /0\.3\.4/);
   assert.equal(app.requests.at(-1).url, "/status/data", "Confirmed completion refreshes installed version and router state");
   const count = app.updateRequests.length;
   app.expire(2000);
@@ -1905,6 +2152,10 @@ async function updateStatusValidationAndSafeRendering() {
     console.log(`PASS ${test.name}`);
   }
   for (const test of [updatesRequireExplicitAuthenticatedClick, updatesReconnectWithoutRepostingOrOldSuccess, updatesBusyFailuresAndBoundedWaiting, updateAuthenticationAndRacePrivacy, updatesVisibilityAndReloadAreReadOnly, updateStatusValidationAndSafeRendering]) {
+    await test();
+    console.log(`PASS ${test.name}`);
+  }
+  for (const test of [inferenceExplicitConsentAndNoPassiveRequests, inferenceProgressAndSafePerBackendResults, inferenceNoRepeatedPostOrHistoricalSuccess, inferenceBusyCooldownAndPreparationFailures, inferencePrivacyAuthenticationAndLateBodies, inferenceVisibilityAndTimeoutRecovery]) {
     await test();
     console.log(`PASS ${test.name}`);
   }

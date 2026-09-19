@@ -61,3 +61,9 @@ def test_status_page_client_flows() -> None:
     assert "PASS updateAuthenticationAndRacePrivacy" in result.stdout
     assert "PASS updatesVisibilityAndReloadAreReadOnly" in result.stdout
     assert "PASS updateStatusValidationAndSafeRendering" in result.stdout
+    assert "PASS inferenceExplicitConsentAndNoPassiveRequests" in result.stdout
+    assert "PASS inferenceProgressAndSafePerBackendResults" in result.stdout
+    assert "PASS inferenceNoRepeatedPostOrHistoricalSuccess" in result.stdout
+    assert "PASS inferenceBusyCooldownAndPreparationFailures" in result.stdout
+    assert "PASS inferencePrivacyAuthenticationAndLateBodies" in result.stdout
+    assert "PASS inferenceVisibilityAndTimeoutRecovery" in result.stdout

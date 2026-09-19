@@ -195,6 +195,21 @@ _STATUS_HTML = """<!doctype html>
       </table></div>
     </details>
 
+    <details id="inference-panel" class="card inference-panel" open hidden>
+      <summary class="card-summary"><h2>Smallest-model inference test <span class="card-summary-meta" id="inference-meta"></span></h2></summary>
+      <div class="card-body">
+        <p id="inference-warning" class="muted">This separate, optional test sends one tiny prompt to the smallest eligible chat model on each backend (up to 16 backends per run). It may load models from storage and use RAM / GPU memory, evict a loaded model, or use provider credits. No models are downloaded, no fallback backend is used, and nothing runs until you click and confirm. Your router API key is required.</p>
+        <button id="inference-button" type="button" class="primary" disabled aria-describedby="inference-warning">Test smallest model on each backend (runs inference)</button>
+        <p id="inference-message" class="muted" role="status">No inference test has been requested in this page.</p>
+        <progress id="inference-progress" max="1" value="0" aria-label="Backend inference tests completed" hidden></progress>
+        <button id="inference-refresh-button" type="button" hidden>Refresh test status (no inference)</button>
+      </div>
+      <div id="inference-results" class="table-scroll" hidden><table><caption class="sr-only">Explicit inference test results by backend</caption>
+        <thead><tr><th scope="col">Backend / address</th><th scope="col">Result</th><th scope="col">Selected model / selection basis</th><th scope="col">Detail</th><th scope="col">Time</th></tr></thead>
+        <tbody id="inference-body"></tbody>
+      </table></div>
+    </details>
+
     <details id="update-panel" class="card update-panel" open>
       <summary class="card-summary"><h2 id="update-title">Router software updates <span class="card-summary-meta" id="update-meta"></span></h2></summary>
       <div class="card-body">
@@ -233,7 +248,7 @@ _STATUS_HTML = """<!doctype html>
       <div class="card-body about-body">
         <dl>
           <dt>What refreshes do</dt>
-          <dd>Status refreshes every 10 seconds and saved addresses every 30 seconds. Both read cached results. Nothing on this page scans your network, loads a model, or sends a prompt unless you click Save, Check, or Run self-test, and those read metadata only.</dd>
+          <dd>Status refreshes every 10 seconds and saved addresses every 30 seconds. Both read cached results. Save, Check, and Run self-test read metadata only. Only the separate Test smallest model button sends prompts, after an explicit confirmation; it may load a model. No action downloads models or scans whole subnets.</dd>
           <dt>Online is not inference</dt>
           <dd>“Online”, “Found”, and a listed model mean an API answered a metadata request. They do not prove a model is loaded or that generation will succeed.</dd>
           <dt>Client traffic</dt>
@@ -270,6 +285,7 @@ main{max-width:1400px;margin:auto;padding:38px 24px 24px}.heading,.section-headi
 .performance-message{padding:0 22px 19px}.performance-message.result-warning{color:var(--amber)}.performance-note{padding:16px 22px;border-top:1px solid var(--line)}.metric-value{display:block;font-weight:650;white-space:nowrap}.metric-detail{display:block;min-width:130px;color:var(--muted);font-size:11px;margin-top:4px}.performance-identity{min-width:180px}.performance-identity .badge{margin-top:7px}.performance-identity code{display:block;margin-top:5px}.slow-load-count{margin-top:9px;font-size:12px}
 .host-routing{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:12px;margin-top:10px}.host-routing .secondary{margin-top:6px}
 .update-panel .card-body{padding-bottom:18px}.update-panel .card-body p{margin-top:7px}.update-panel progress{display:block;width:min(100%,480px);height:14px;margin:12px 0}.update-panel button{margin-top:12px}.update-panel .result-fail{color:var(--red)}.update-panel .result-pass{color:var(--green)}.update-stage{font-size:14px}
+.inference-panel .card-body p{margin-top:8px}.inference-panel button{margin-top:12px;white-space:normal;text-align:left}.inference-panel progress{display:block;width:min(100%,480px);height:14px;margin:12px 0}.inference-panel .result-fail{color:var(--red)}.inference-panel .result-pass{color:var(--green)}.inference-panel .result-partial{color:var(--amber)}
 @media(max-width:800px){.self-test-intro{align-items:flex-start;flex-direction:column}}
 @media(max-width:600px){.hosts-toolbar{align-items:flex-start;flex-direction:column}.host-form .key-controls{flex-direction:column}.host-entry-head .hosts-actions{margin-left:0}}
 @media(max-width:600px){.public-summary-counts{grid-template-columns:1fr 1fr}.public-summary-counts>div:last-child{grid-column:1/-1}}
@@ -301,6 +317,14 @@ STATUS_JS = r"""
   let activeRequest = null;
   let selfTestGeneration = 0;
   let activeSelfTest = null;
+  let inferenceGeneration = 0;
+  let activeInference = null;
+  let inferencePollTimer = null;
+  let inferenceWatching = false;
+  let inferenceAttempted = false;
+  let inferenceDeadline = 0;
+  let inferenceRunId = null;
+  let inferenceBaselineId = null;
   let hostsGeneration = 0;
   let activeHosts = null;
   let hostsLoaded = false;
@@ -322,7 +346,7 @@ STATUS_JS = r"""
   // is forgotten with the rest of the private details on lock or navigation.
   const collapsedHosts = new Set();
   const collapsedCatalogs = new Set();
-  const panels = ["traffic-panel", "summary-panel", "hosts-panel", "backends-panel", "models-panel", "aliases-panel", "performance-panel", "self-test-panel", "update-panel", "links-panel", "about-panel"];
+  const panels = ["traffic-panel", "summary-panel", "hosts-panel", "backends-panel", "models-panel", "aliases-panel", "performance-panel", "self-test-panel", "inference-panel", "update-panel", "links-panel", "about-panel"];
   const trafficKinds = {timeout: "Timeouts", connection: "Connection errors", http_5xx: "Backend 5xx errors", http_4xx: "Backend 4xx errors", invalid_response: "Invalid responses", configuration: "Configuration", adapter: "Adapter crashes", no_eligible_model: "No eligible model", other: "Other"};
   const trafficWindows = {"24h": ["Last 24 hours", 24], "7d": ["Last 7 days", 168], all: ["All time", 168]};
   let trafficWindow = "24h";
@@ -395,6 +419,7 @@ STATUS_JS = r"""
     text("auth-title", apiKey ? "Backend details unlocked" : "Unlock backend details");
     text("auth-message", message || (apiKey ? "Your key is held only in this page’s memory." : "Backend addresses and model details are locked."));
     updateControls();
+    inferenceControls();
   }
   function consumeURLKey() {
     const query = new URLSearchParams(window.location.search || "");
@@ -429,12 +454,13 @@ STATUS_JS = r"""
     if (queryKeys.length) warn("The URL key was removed from the address bar and will be held only in this page’s memory." + logWarning);
     return keys[0].trim();
   }
-  function clearDetails(keepUpdate = false) {
+  function clearDetails(keepUpdate = false, keepInference = false) {
     clearSelfTest();
     clearHosts();
     clearPerformance();
     clearTraffic();
     if (!keepUpdate) clearUpdate();
+    if (!keepInference) clearInference();
     el("details").hidden = true;
     el("self-test-panel").hidden = true;
     for (const id of ["endpoints-body", "models-body", "aliases-body"]) el(id).replaceChildren();
@@ -451,7 +477,7 @@ STATUS_JS = r"""
     text("model-readiness", models);
   }
   function unavailable(message) {
-    clearDetails(Boolean(apiKey) && updateWatching);
+    clearDetails(Boolean(apiKey) && updateWatching, Boolean(apiKey) && inferenceWatching);
     clearSummary();
     text("checked-at", "No current snapshot");
     health("error", "Status could not be confirmed", message, "Unconfirmed", "Unknown");
@@ -1269,12 +1295,197 @@ STATUS_JS = r"""
     });
     el("details").hidden = false;
     el("self-test-panel").hidden = false;
+    el("inference-panel").hidden = !authRequired || !apiKey;
+    inferenceControls();
     hostControls();
     if (authRequired && apiKey && !hostsLoaded && !activeHosts) hostOperation("load");
     if (!authRequired) hostMessage("Address management is disabled. Set LLM_ROUTER_GATEWAY_API_KEY in router.env and restart the router to enable it.");
     updateControls();
     if (authRequired && apiKey && !updateLoaded && !activeUpdate) updateRequest("GET");
     if (!authRequired) clearUpdate();
+  }
+  function inferenceControls() {
+    const authorized = authRequired && Boolean(apiKey) && pageActive && !document.hidden;
+    el("inference-button").disabled = !authorized || el("details").hidden || inferenceWatching || Boolean(activeInference);
+    el("inference-refresh-button").disabled = !authorized || Boolean(activeInference);
+  }
+  function inferenceMessage(message, tone = "") {
+    el("inference-message").className = tone ? `muted result-${tone}` : "muted";
+    text("inference-message", message);
+  }
+  function clearInference() {
+    inferenceGeneration += 1;
+    if (activeInference) activeInference.abort();
+    if (inferencePollTimer !== null) clearTimeout(inferencePollTimer);
+    activeInference = null;
+    inferencePollTimer = null;
+    inferenceWatching = false;
+    inferenceAttempted = false;
+    inferenceDeadline = 0;
+    inferenceRunId = null;
+    inferenceBaselineId = null;
+    el("inference-panel").hidden = true;
+    el("inference-results").hidden = true;
+    el("inference-body").replaceChildren();
+    el("inference-progress").hidden = true;
+    el("inference-refresh-button").hidden = true;
+    meta("inference-meta", "Not run");
+    inferenceMessage("No inference test has been requested in this page.");
+    inferenceControls();
+  }
+  function inferenceUnknown(message) {
+    inferenceWatching = false;
+    inferenceDeadline = 0;
+    el("inference-progress").hidden = true;
+    el("inference-refresh-button").hidden = false;
+    meta("inference-meta", "Outcome unknown");
+    inferenceMessage(message + " No inference request will be sent again automatically.", "fail");
+  }
+  function inferenceTimedOut() {
+    if (!inferenceWatching || Date.now() < inferenceDeadline) return false;
+    inferenceUnknown("Stopped waiting after 20 minutes. The test outcome is unknown; a backend may still be finishing a request. Refresh test status to read the local job.");
+    return true;
+  }
+  function pollInference() {
+    if (inferencePollTimer !== null) clearTimeout(inferencePollTimer);
+    inferencePollTimer = null;
+    if (!inferenceWatching || !apiKey || !pageActive || document.hidden || inferenceTimedOut()) { inferenceControls(); return; }
+    inferencePollTimer = setTimeout(() => { inferencePollTimer = null; inferenceRequest("GET"); }, 2000);
+  }
+  function validInference(data) {
+    const string = (value, limit) => typeof value === "string" && value.length <= limit;
+    const timestamp = value => value === null || string(value, 64);
+    return data && ["idle", "running", "complete", "interrupted"].includes(data.state) &&
+      (data.run_id === null || string(data.run_id, 128) && data.run_id.length > 0) &&
+      timestamp(data.started_at) && timestamp(data.finished_at) && string(data.notice, 2048) &&
+      Number.isSafeInteger(data.total) && data.total >= 0 && data.total <= 10000 &&
+      Number.isSafeInteger(data.completed) && data.completed >= 0 && data.completed <= data.total &&
+      Array.isArray(data.checks) && data.checks.length === data.completed &&
+      (data.state === "idle" ? data.run_id === null && data.total === 0 : Boolean(data.run_id)) &&
+      (data.state !== "complete" || data.completed === data.total) &&
+      data.checks.every(item => item && ["pass", "fail", "skip"].includes(item.status) &&
+        string(item.name, 2048) && string(item.target, 2048) && (item.model === null || string(item.model, 2048)) &&
+        string(item.selection, 2048) && string(item.detail, 4096) && Number.isSafeInteger(item.elapsed_ms) && item.elapsed_ms >= 0 &&
+        (item.http_status === null || Number.isInteger(item.http_status) && item.http_status >= 100 && item.http_status <= 599));
+  }
+  function renderInference(data) {
+    el("inference-panel").hidden = false;
+    el("inference-refresh-button").hidden = false;
+    if (!inferenceRunId) {
+      if (data.run_id && data.run_id !== inferenceBaselineId) inferenceRunId = data.run_id;
+      else {
+        inferenceMessage("Waiting for a new test job to be confirmed. An older result or an idle router does not confirm that this request completed. Only local status will be retried.");
+        return;
+      }
+    }
+    if (data.run_id !== inferenceRunId) {
+      inferenceUnknown("The requested test job is no longer available; the router may have restarted or another job replaced it. These results do not confirm completion.");
+      return;
+    }
+    const labels = {pass: ["Pass", "ready"], fail: ["Fail", "error"], skip: ["Skipped", "warning"]};
+    rows("inference-body", data.checks, 5, data.total ? "Waiting for the first backend result…" : "No backends were available to test.", (row, item) => {
+      const label = labels[item.status];
+      cell(row, item.name, item.target);
+      cell(row, badge(label[0], label[1]));
+      cell(row, item.model || "No eligible model selected", item.selection);
+      cell(row, item.detail, item.http_status === null ? null : `HTTP ${item.http_status}`);
+      cell(row, `${item.elapsed_ms.toLocaleString()} ms`);
+    });
+    el("inference-results").hidden = false;
+    el("inference-progress").max = Math.max(1, data.total);
+    el("inference-progress").value = data.completed;
+    el("inference-progress").hidden = data.state !== "running";
+    meta("inference-meta", `${data.completed} / ${data.total} checked`);
+    if (data.state === "running") {
+      inferenceWatching = true;
+      if (!inferenceDeadline) inferenceDeadline = Date.now() + 20 * 60 * 1000;
+      inferenceMessage(`${data.completed} / ${data.total} backends checked. A small inference request may be loading or running a model. Status polling never sends another prompt.`);
+      return;
+    }
+    inferenceWatching = false;
+    inferenceDeadline = 0;
+    const passed = data.checks.filter(item => item.status === "pass").length;
+    const failed = data.checks.filter(item => item.status === "fail").length;
+    const skipped = data.checks.filter(item => item.status === "skip").length;
+    inferenceMessage(`${data.state === "interrupted" ? "Test interrupted; not every backend is confirmed" : "Test finished"}: ${passed} passed, ${failed} failed, ${skipped} skipped (${data.completed} / ${data.total} checked). ${data.notice}`,
+      failed || data.state === "interrupted" ? "fail" : skipped || !data.total ? "partial" : "pass");
+  }
+  async function inferenceRequest(method, prepare = false) {
+    if (activeInference || !authRequired || !apiKey || !pageActive || document.hidden) return;
+    if (method === "GET" && !prepare && (!inferenceAttempted || inferenceTimedOut())) { inferenceControls(); return; }
+    if (method === "POST" && (inferenceWatching || el("details").hidden)) return;
+    if (inferencePollTimer !== null) clearTimeout(inferencePollTimer);
+    inferencePollTimer = null;
+    const currentGeneration = ++inferenceGeneration;
+    const controller = new AbortController();
+    activeInference = controller;
+    let launch = false;
+    if (method === "POST") {
+      inferenceAttempted = true;
+      inferenceWatching = true;
+      inferenceDeadline = Date.now() + 20 * 60 * 1000;
+      inferenceRunId = null;
+      el("inference-refresh-button").hidden = false;
+      inferenceMessage("Requesting one tiny inference test per backend. Waiting for the new job; this page will not repeat the request automatically.");
+    } else if (prepare) inferenceMessage("Reading local test status before starting. No inference has been requested yet.");
+    inferenceControls();
+    const headers = {Accept: "application/json", Authorization: `Bearer ${apiKey}`};
+    if (method === "POST") headers["X-LLM-Router-Inference-Test"] = "1";
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch("/status/inference-test", {method, headers, credentials: "omit", cache: "no-store", redirect: "error", signal: controller.signal});
+      if (currentGeneration !== inferenceGeneration) return;
+      if (controller.signal.aborted) throw new Error("inference-request-aborted");
+      if ([401, 403].includes(response.status)) {
+        cancelRefresh();
+        apiKey = "";
+        el("api-key").value = "";
+        authControls("The key was rejected. Enter the router’s client API key to try again.");
+        unavailable("Authentication failed. Backend and inference-test details have been cleared.");
+        return;
+      }
+      if (method === "POST" && [400, 409, 429].includes(response.status)) {
+        inferenceWatching = false;
+        inferenceDeadline = 0;
+        inferenceMessage(response.status === 409 ? "A test is already running; no new test was started. Refresh test status to inspect the local job."
+          : response.status === 429 ? "Tests were requested too recently; no new test was started. Wait before clicking and confirming again."
+          : "The inference request was rejected; no test was started.", "partial");
+        return;
+      }
+      if (!response.ok || method === "POST" && response.status !== 202) throw new Error("inference-response");
+      const data = await response.json();
+      if (currentGeneration !== inferenceGeneration) return;
+      if (controller.signal.aborted || !validInference(data)) throw new Error("invalid-inference-status");
+      if (prepare) {
+        if (data.state === "running") {
+          inferenceAttempted = true;
+          inferenceRunId = data.run_id;
+          renderInference(data);
+          inferenceMessage("An existing inference test is already running; following its progress without starting another request.");
+        } else { inferenceBaselineId = data.run_id; launch = true; }
+      } else renderInference(data);
+    } catch (error) {
+      if (currentGeneration !== inferenceGeneration) return;
+      if (inferenceAttempted) {
+        inferenceMessage("The test outcome could not be confirmed. Waiting for the router to reconnect; only local status will be read, never another inference request.", "partial");
+      } else inferenceMessage("Local test status could not be read. No inference request was sent; click again when the router is reachable.", "fail");
+    } finally {
+      clearTimeout(timeout);
+      if (currentGeneration === inferenceGeneration) {
+        activeInference = null;
+        inferenceControls();
+        if (launch) inferenceRequest("POST");
+        else pollInference();
+      }
+    }
+  }
+  function runInferenceTest() {
+    if (activeInference || inferenceWatching || !authRequired || !apiKey || !pageActive || document.hidden || el("details").hidden) return;
+    if (!window.confirm("Run real inference on each backend (up to 16 per run)? This sends one tiny prompt to its smallest eligible chat model. It may load models from storage, use RAM / GPU memory or provider credits, and evict a loaded model. No models are downloaded and no fallback backend is used.")) return;
+    clearInference();
+    el("inference-panel").hidden = false;
+    el("inference-panel").open = true;
+    inferenceRequest("GET", true);
   }
   function updateControls() {
     const authorized = authRequired && Boolean(apiKey) && pageActive && !document.hidden;
@@ -1610,6 +1821,8 @@ STATUS_JS = r"""
   });
   el("refresh-button").addEventListener("click", refresh);
   el("self-test-button").addEventListener("click", runSelfTest);
+  el("inference-button").addEventListener("click", runInferenceTest);
+  el("inference-refresh-button").addEventListener("click", () => inferenceRequest("GET"));
   el("update-button").addEventListener("click", () => updateRequest("POST"));
   el("update-refresh-button").addEventListener("click", () => updateRequest("GET"));
   el("host-form").addEventListener("submit", (event) => { event.preventDefault(); hostOperation("save"); });
@@ -1634,6 +1847,17 @@ STATUS_JS = r"""
   let hostsTimer = setInterval(reloadSavedSnapshot, 30000);
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
+      inferenceGeneration += 1;
+      if (activeInference) activeInference.abort();
+      if (inferencePollTimer !== null) clearTimeout(inferencePollTimer);
+      activeInference = null;
+      inferencePollTimer = null;
+      el("inference-results").hidden = true;
+      el("inference-body").replaceChildren();
+      el("inference-progress").hidden = true;
+      meta("inference-meta", "");
+      inferenceMessage(inferenceAttempted ? "Inference-test monitoring is paused while this page is hidden. A server-side test may continue; returning only reads status." : "No inference test has been requested in this page.");
+      inferenceControls();
       updateGeneration += 1;
       if (activeUpdate) activeUpdate.abort();
       if (updatePollTimer !== null) clearTimeout(updatePollTimer);
@@ -1645,7 +1869,11 @@ STATUS_JS = r"""
       text("update-observed", "");
       updateMessage(updateLoaded ? "Update monitoring is paused while this page is hidden. Any server-side job continues independently." : "Unlock backend details to enable software updates.");
       updateControls();
-    } else if (pageActive && authRequired && apiKey && updateLoaded) updateRequest("GET");
+    } else {
+      if (pageActive && authRequired && apiKey && inferenceAttempted) inferenceRequest("GET");
+      inferenceControls();
+      if (pageActive && authRequired && apiKey && updateLoaded) updateRequest("GET");
+    }
   });
   window.addEventListener("hashchange", () => {
     // Same-page fragment navigation does not rerun this script. Scrub a newly
