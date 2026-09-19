@@ -49,16 +49,23 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
   };
   const requests = [];
   const hostRequests = [];
+  const updateRequests = [];
   const allRequests = [];
   const historyCalls = [];
   const timeline = [];
   const location = new URL(options.url || "http://router.example:8088/status");
   const intervals = new Map();
   const timeouts = new Map();
+  const timeoutDelays = new Map();
   const windowEvents = {};
+  const documentEvents = {};
+  let currentTime = Date.now();
+  class ClockDate extends Date { static now() { return currentTime; } }
   let timerId = 0;
   const context = {
     document: {
+      hidden: false,
+      addEventListener: (name, callback) => { documentEvents[name] = callback; },
       body: {dataset: {authRequired: String(authRequired)}},
       getElementById: element,
       createElement: tag => new Element(tag),
@@ -78,15 +85,23 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
     URL,
     URLSearchParams,
     AbortController,
-    setTimeout: callback => { const id = ++timerId; timeouts.set(id, callback); return id; },
-    clearTimeout: id => timeouts.delete(id),
+    Date: ClockDate,
+    setTimeout: (callback, delay) => { const id = ++timerId; timeouts.set(id, callback); timeoutDelays.set(id, delay); return id; },
+    clearTimeout: id => { timeouts.delete(id); timeoutDelays.delete(id); },
     setInterval: (callback, delay) => { const id = ++timerId; intervals.set(id, {callback, delay}); return id; },
     clearInterval: id => intervals.delete(id),
     fetch: (url, options) => new Promise((resolve, reject) => {
       timeline.push("fetch");
       const hostRequest = /^\/status\/hosts(?:\/[^/?#]+)?$/.test(url);
-      assert.ok(["/healthz", "/status/data", "/status/self-test"].includes(url) || hostRequest, "Only same-origin status endpoints may be fetched");
-      if (!hostRequest) assert.equal(options.method, url === "/status/self-test" ? "POST" : "GET");
+      const updateRequest = url === "/status/update";
+      assert.ok(["/healthz", "/status/data", "/status/self-test"].includes(url) || hostRequest || updateRequest, "Only same-origin status endpoints may be fetched");
+      if (!hostRequest && !updateRequest) assert.equal(options.method, url === "/status/self-test" ? "POST" : "GET");
+      if (updateRequest) {
+        assert.match(options.headers.Authorization, /^Bearer .+/);
+        assert.equal(options.body, undefined, "Update requests may not supply a URL, revision, path or other body");
+        if (options.method === "POST") assert.equal(options.headers["X-LLM-Router-Update"], "1");
+        else assert.equal(options.method, "GET");
+      }
       if (hostRequest) {
         assert.match(options.headers.Authorization, /^Bearer .+/);
         if (options.method !== "GET") {
@@ -103,13 +118,24 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
       assert.equal(options.redirect, "error");
       const pending = {url, options, resolve, reject};
       allRequests.push(pending);
-      (hostRequest ? hostRequests : requests).push(pending);
+      (hostRequest ? hostRequests : updateRequest ? updateRequests : requests).push(pending);
       if (hostRequest && autoLoadHosts && options.method === "GET") resolve({status: 200, ok: true, json: async () => ({hosts: [], limit: 16})});
+      if (updateRequest && context.autoLoadUpdates && options.method === "GET") resolve({status: 200, ok: true, json: async () => updateSnapshot()});
     }),
   };
+  context.autoLoadUpdates = options.autoLoadUpdates !== false;
   vm.runInNewContext(script, context);
   return {
-    element, requests, hostRequests, allRequests, timeouts, historyCalls, timeline, location,
+    element, requests, hostRequests, updateRequests, allRequests, timeouts, historyCalls, timeline, location,
+    advanceTime: milliseconds => { currentTime += milliseconds; },
+    expire: delay => {
+      for (const [id, callback] of Array.from(timeouts.entries())) if (timeoutDelays.get(id) === delay) {
+        timeouts.delete(id); timeoutDelays.delete(id); callback();
+      }
+    },
+    visibility: hidden => { context.document.hidden = hidden; documentEvents.visibilitychange(); },
+    update: () => element("update-button").events.click(),
+    readUpdate: () => element("update-refresh-button").events.click(),
     tick: (delay = 10000) => { for (const timer of Array.from(intervals.values())) if (timer.delay === delay) timer.callback(); },
     enterKey: key => {
       element("api-key").value = key;
@@ -138,13 +164,17 @@ async function reply(request, status, data) {
 
 function snapshot() {
   return {
-    ready: true, status: "ready", version: "0.3.1", uptime_seconds: 65,
+    ready: true, status: "ready", version: "0.3.2", uptime_seconds: 65,
     checked_at: "2026-09-16T12:00:00Z", last_discovery: null,
     counts: {endpoints: 1, online: 1, models: 1, available_models: 1, aliases: 1},
     endpoints: [{name: "backend", machine: "laptop", address: "http://private-backend:1234", state: "online", model_count: 1, available_models: 1}],
     models: [{name: '<img src=x onerror="alert(1)">', deployment: "qwen-copy", machine: "laptop", state: "available", active_requests: 0, successes: 5, failures: 1}],
     aliases: [{name: "qwen-ha", kind: "ha", available: true, deployments: 1}],
   };
+}
+
+function updateSnapshot(overrides = {}) {
+  return {available: true, busy: false, state: "idle", stage: "idle", message: "Ready", run_id: null, updated_at: null, current_version: "0.3.2", ...overrides};
 }
 
 function selfTestResult(status = "pass") {
@@ -174,11 +204,11 @@ async function publicReadiness() {
     assert.equal(app.requests[0].url, "/healthz");
     assert.equal(app.requests[0].options.headers.Authorization, undefined);
     // The real public endpoint deliberately contains no ready field.
-    await reply(app.requests[0], httpStatus, {status, version: "0.3.1"});
+    await reply(app.requests[0], httpStatus, {status, version: "0.3.2"});
     assert.equal(app.element("health-panel").className, `health-panel tone-${tone}`);
     assert.equal(app.element("gateway-state").textContent, "Responding");
     assert.equal(app.element("model-readiness").textContent, readiness);
-    assert.equal(app.element("version").textContent, "Version 0.3.1", "Version should remain visible while details are locked");
+    assert.equal(app.element("version").textContent, "Version 0.3.2", "Version should remain visible while details are locked");
     assert.equal(app.element("details").hidden, true);
     assert.equal(app.element("refresh-button").disabled, false);
   }
@@ -192,10 +222,10 @@ async function topbarVersionTracksCurrentSnapshot() {
   assert.ok(header && /\bid="version"/.test(header[1]), "Version belongs at the top of the page, before locked details");
   assert.equal(Array.from(markup.matchAll(/\bid="version"/g)).length, 1);
   const app = harness();
-  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.1"});
+  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.2"});
   assert.equal(app.element("details").hidden, true);
   assert.equal(app.element("version").hidden, false);
-  assert.equal(app.element("version").textContent, "Version 0.3.1", "Even an unavailable public gateway identifies its version");
+  assert.equal(app.element("version").textContent, "Version 0.3.2", "Even an unavailable public gateway identifies its version");
   app.enterKey("secret-key");
   await reply(app.requests.at(-1), 200, {...snapshot(), version: "0.4.0"});
   assert.equal(app.element("version").textContent, "Version 0.4.0");
@@ -219,7 +249,7 @@ async function nonoverlapAndNetworkFailure() {
   app.tick();
   app.element("refresh-button").events.click();
   assert.equal(app.requests.length, 1, "In-flight requests must not overlap");
-  await reply(app.requests[0], 200, {status: "ready", version: "0.3.1"});
+  await reply(app.requests[0], 200, {status: "ready", version: "0.3.2"});
   app.tick();
   assert.equal(app.requests.length, 2);
   app.requests[1].reject(new Error("network offline"));
@@ -234,7 +264,7 @@ async function nonoverlapAndNetworkFailure() {
 
 async function authenticationAndSafeRendering() {
   const app = harness();
-  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.1"});
+  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.2"});
   app.enterKey("secret-key");
   assert.equal(app.requests[1].url, "/status/data");
   assert.equal(app.requests[1].options.headers.Authorization, "Bearer secret-key");
@@ -265,9 +295,9 @@ async function lockLateResponsesAndRejectedKeys() {
   assert.equal(app.requests[3].url, "/healthz");
   await reply(app.requests[2], 200, snapshot());
   assert.equal(app.element("details").hidden, true, "A late authenticated result must not unlock details");
-  await reply(app.requests[0], 200, {status: "ready", version: "0.3.1"});
+  await reply(app.requests[0], 200, {status: "ready", version: "0.3.2"});
   assert.equal(app.element("health-panel").className, "health-panel tone-pending", "A cancelled old public request must not overwrite pending state");
-  await reply(app.requests[3], 503, {status: "unavailable", version: "0.3.1"});
+  await reply(app.requests[3], 503, {status: "unavailable", version: "0.3.2"});
   app.enterKey("rejected-key");
   await reply(app.requests[4], 401, {});
   assert.equal(app.element("details").hidden, true);
@@ -1405,8 +1435,275 @@ async function savedHostEnrollmentMutationRaceGuards() {
   assert.equal(deferred.element("hosts-body").textContent, "", "Late save JSON may not expose enrollment under a different key");
 }
 
+async function unlockedUpdates(status = updateSnapshot()) {
+  const app = harness(true, true, {autoLoadUpdates: false});
+  app.enterKey("secret-key");
+  await reply(app.requests.at(-1), 200, snapshot());
+  assert.equal(app.updateRequests.length, 1);
+  assert.equal(app.updateRequests[0].options.method, "GET");
+  await reply(app.updateRequests[0], 200, status);
+  return app;
+}
+
+async function updatesRequireExplicitAuthenticatedClick() {
+  assert.match(markup.match(/<header[\s\S]*?<\/header>/)[0], /id="update-button"/);
+  assert.match(markup, /automatically installs a newer commit/);
+  assert.match(markup, /restarts the router and can interrupt requests/);
+  const progressTag = markup.match(/<progress\b[^>]*id="update-progress"[^>]*>/)[0];
+  assert.doesNotMatch(progressTag, /\bvalue=/, "Progress must be indeterminate, never simulated percent");
+  const locked = harness();
+  locked.update();
+  locked.readUpdate();
+  assert.equal(locked.updateRequests.length, 0);
+  const noKey = await unlocked(false);
+  noKey.update();
+  noKey.readUpdate();
+  assert.equal(noKey.updateRequests.length, 0);
+  assert.equal(noKey.element("update-button").disabled, true);
+  assert.match(noKey.element("update-message").textContent, /LLM_ROUTER_GATEWAY_API_KEY/);
+  const app = await unlockedUpdates();
+  assert.equal(app.element("update-button").disabled, false);
+  app.tick();
+  await reply(app.requests.at(-1), 200, snapshot());
+  assert.equal(app.updateRequests.length, 1, "Routine dashboard refresh must not start or recheck remote updates");
+  app.update();
+  const post = app.updateRequests.at(-1);
+  assert.equal(post.options.method, "POST");
+  assert.equal(post.options.body, undefined);
+  assert.equal(post.options.headers.Authorization, "Bearer secret-key");
+  assert.equal(post.options.headers["X-LLM-Router-Update"], "1");
+  app.update();
+  app.readUpdate();
+  assert.equal(app.updateRequests.length, 2, "Duplicate clicks must not duplicate requests");
+  assert.equal(app.element("update-button").disabled, true);
+  await reply(post, 202, updateSnapshot({busy: true, state: "queued", stage: "queued", run_id: null}));
+  assert.match(app.element("update-message").textContent, /Waiting for a new update job/);
+  app.expire(2000);
+  assert.equal(app.updateRequests.at(-1).options.method, "GET");
+  await reply(app.updateRequests.at(-1), 200, updateSnapshot({busy: true, state: "running", stage: "checking", run_id: "run-one"}));
+  assert.equal(app.element("update-stage").textContent, "Checking official main");
+  for (const [stage, label] of [["downloading", "Downloading update"], ["validating", "Validating installation"], ["restarting", "Restarting router"]]) {
+    app.expire(2000);
+    await reply(app.updateRequests.at(-1), 200, updateSnapshot({busy: true, state: "running", stage, run_id: "run-one"}));
+    assert.equal(app.element("update-stage").textContent, label);
+    assert.equal(app.element("update-progress").hidden, false);
+    assert.equal(app.element("update-progress").attributes.value, undefined);
+    assert.doesNotMatch(app.element("update-message").textContent, /\d+%/);
+  }
+  app.expire(2000);
+  await reply(app.updateRequests.at(-1), 200, updateSnapshot({state: "succeeded", stage: "complete", run_id: "run-one", current_version: "0.3.3", updated_at: "2026-09-19T12:00:00Z"}));
+  assert.equal(app.element("update-progress").hidden, true);
+  assert.match(app.element("update-message").textContent, /Update completed successfully/);
+  assert.match(app.element("update-observed").textContent, /0\.3\.3/);
+  assert.equal(app.requests.at(-1).url, "/status/data", "Confirmed completion refreshes installed version and router state");
+  const count = app.updateRequests.length;
+  app.expire(2000);
+  assert.equal(app.updateRequests.length, count, "Terminal jobs stop polling");
+  assert.equal(app.updateRequests.filter(request => request.options.method === "POST").length, 1);
+}
+
+async function updatesReconnectWithoutRepostingOrOldSuccess() {
+  const old = updateSnapshot({state: "succeeded", stage: "complete", run_id: "old-job"});
+  const app = await unlockedUpdates(old);
+  assert.match(app.element("update-message").textContent, /last saved update job/);
+  app.update();
+  app.updateRequests.at(-1).reject(new Error("restart before response"));
+  await flush();
+  assert.match(app.element("update-message").textContent, /Waiting for the router to restart or reconnect/);
+  app.expire(2000);
+  await reply(app.updateRequests.at(-1), 200, old);
+  assert.match(app.element("update-message").textContent, /previous saved result does not confirm/);
+  assert.equal(app.element("update-progress").hidden, false);
+  app.expire(2000);
+  await reply(app.updateRequests.at(-1), 200, updateSnapshot({busy: true, state: "running", stage: "restarting", run_id: "new-job"}));
+  app.tick();
+  app.requests.at(-1).reject(new Error("router disconnected"));
+  await flush();
+  assert.equal(app.element("details").hidden, true);
+  assert.equal(app.element("update-details").hidden, false, "Expected restart does not discard the update monitor");
+  app.expire(2000);
+  app.updateRequests.at(-1).reject(new Error("still restarting"));
+  await flush();
+  assert.match(app.element("update-message").textContent, /outcome is not confirmed/);
+  app.expire(2000);
+  await reply(app.updateRequests.at(-1), 200, updateSnapshot({available: false, state: "unavailable", run_id: null}));
+  assert.match(app.element("update-message").textContent, /temporarily unavailable/);
+  assert.equal(app.element("update-progress").hidden, false, "Temporary installation identity unavailability is not terminal during restart");
+  assert.equal(app.element("update-button").disabled, true);
+  app.expire(2000);
+  await reply(app.updateRequests.at(-1), 200, updateSnapshot({state: "succeeded", stage: "complete", run_id: "wrong-job"}));
+  assert.match(app.element("update-message").textContent, /not the requested update job/);
+  app.expire(2000);
+  await reply(app.updateRequests.at(-1), 200, updateSnapshot({state: "current", stage: "complete", run_id: "new-job"}));
+  assert.match(app.element("update-message").textContent, /Already up to date/);
+  assert.equal(app.updateRequests.filter(request => request.options.method === "POST").length, 1);
+}
+
+async function updatesBusyFailuresAndBoundedWaiting() {
+  const app = await unlockedUpdates();
+  app.update();
+  await reply(app.updateRequests.at(-1), 409, {error: "busy", message: "internal-secret"});
+  assert.doesNotMatch(app.element("update-message").textContent, /internal-secret/);
+  app.expire(2000);
+  await reply(app.updateRequests.at(-1), 200, updateSnapshot({busy: true, state: "running", stage: "validating", run_id: "other-actor-job"}));
+  assert.equal(app.element("update-stage").textContent, "Validating installation");
+  app.advanceTime(50 * 60 * 1000 + 1);
+  const before = app.updateRequests.length;
+  app.expire(2000);
+  assert.equal(app.updateRequests.length, before);
+  assert.match(app.element("update-message").textContent, /Stopped waiting after 50 minutes/);
+  assert.equal(app.element("update-progress").hidden, true);
+  assert.equal(app.element("update-button").disabled, true);
+  app.readUpdate();
+  assert.equal(app.updateRequests.at(-1).options.method, "GET");
+  await reply(app.updateRequests.at(-1), 200, updateSnapshot({state: "failed", stage: "failed", run_id: "other-actor-job", message: "secret path"}));
+  assert.match(app.element("update-message").textContent, /update job failed/);
+  assert.doesNotMatch(app.element("update-message").textContent, /secret path/);
+  assert.equal(app.updateRequests.filter(request => request.options.method === "POST").length, 1);
+  for (const state of ["failed", "interrupted"]) {
+    const terminal = await unlockedUpdates();
+    terminal.update();
+    await reply(terminal.updateRequests.at(-1), 202, updateSnapshot({busy: true, state: "running", stage: "checking", run_id: state}));
+    terminal.expire(2000);
+    await reply(terminal.updateRequests.at(-1), 200, updateSnapshot({state, stage: "failed", run_id: state}));
+    assert.equal(terminal.element("update-progress").hidden, true);
+    assert.equal(terminal.element("update-message").className, "muted result-fail");
+  }
+  const unsupported = await unlockedUpdates(updateSnapshot({available: false, state: "unavailable", message: "Install the managed updater unit to enable dashboard updates."}));
+  unsupported.update();
+  assert.equal(unsupported.updateRequests.length, 1);
+  assert.match(unsupported.element("update-message").textContent, /unavailable/);
+  assert.match(unsupported.element("update-message").textContent, /Install the managed updater unit/);
+  const rejected = await unlockedUpdates();
+  rejected.update();
+  await reply(rejected.updateRequests.at(-1), 503, {error: "unsafe-internal-detail"});
+  assert.match(rejected.element("update-message").textContent, /outcome is not confirmed/);
+  assert.doesNotMatch(rejected.element("update-message").textContent, /unsafe-internal-detail/);
+  const rejectedCount = rejected.updateRequests.length;
+  rejected.expire(2000);
+  assert.equal(rejected.updateRequests.length, rejectedCount + 1, "503 may follow an already-queued job and must recover using local GET");
+  assert.equal(rejected.updateRequests.at(-1).options.method, "GET");
+  await reply(rejected.updateRequests.at(-1), 200, updateSnapshot({busy: true, state: "running", stage: "checking", run_id: "queued-before-timeout"}));
+  assert.equal(rejected.element("update-stage").textContent, "Checking official main");
+  assert.equal(rejected.updateRequests.filter(request => request.options.method === "POST").length, 1);
+}
+
+async function updateAuthenticationAndRacePrivacy() {
+  for (const action of ["lock", "key", "pagehide", "auth-reject"]) {
+    const app = await unlockedUpdates();
+    app.update();
+    const pending = app.updateRequests.at(-1);
+    if (action === "lock") app.lock();
+    if (action === "key") app.enterKey("new-key");
+    if (action === "pagehide") app.event("pagehide");
+    if (action === "auth-reject") {
+      app.tick();
+      await reply(app.requests.at(-1), 401, {});
+    }
+    assert.equal(pending.options.signal.aborted, true);
+    await reply(pending, 202, updateSnapshot({busy: true, state: "running", stage: "downloading", run_id: "old-key-job"}));
+    assert.equal(app.element("update-details").hidden, true);
+    assert.equal(app.element("update-observed").textContent, "");
+    assert.equal(app.element("update-stage").textContent, "");
+    const count = app.updateRequests.length;
+    app.expire(2000);
+    assert.equal(app.updateRequests.length, count);
+  }
+  for (const code of [401, 403]) {
+    const app = await unlockedUpdates();
+    app.update();
+    const post = app.updateRequests.at(-1);
+    app.tick();
+    const oldStatus = app.requests.at(-1);
+    await reply(post, code, {});
+    assert.equal(oldStatus.options.signal.aborted, true);
+    assert.equal(app.element("details").hidden, true);
+    assert.equal(app.element("update-details").hidden, true);
+    assert.equal(app.element("key-form").hidden, false);
+    await reply(oldStatus, 200, snapshot());
+    assert.equal(app.element("details").hidden, true);
+  }
+  const late = await unlockedUpdates();
+  late.update();
+  let resolveBody;
+  late.updateRequests.at(-1).resolve({status: 202, ok: true, json: () => new Promise(resolve => { resolveBody = resolve; })});
+  await flush();
+  late.lock();
+  resolveBody(updateSnapshot({busy: true, state: "running", stage: "checking", run_id: "private-job"}));
+  await flush();
+  assert.equal(late.element("update-details").hidden, true);
+}
+
+async function updatesVisibilityAndReloadAreReadOnly() {
+  const app = await unlockedUpdates();
+  app.update();
+  const post = app.updateRequests.at(-1);
+  app.visibility(true);
+  assert.equal(post.options.signal.aborted, true);
+  assert.equal(app.element("update-details").hidden, true);
+  const count = app.updateRequests.length;
+  app.expire(2000);
+  assert.equal(app.updateRequests.length, count);
+  app.visibility(false);
+  assert.equal(app.updateRequests.at(-1).options.method, "GET");
+  await reply(app.updateRequests.at(-1), 200, updateSnapshot({busy: true, state: "running", stage: "downloading", run_id: "surviving-job"}));
+  await reply(post, 202, updateSnapshot({busy: true, state: "queued", stage: "queued", run_id: "stale-job"}));
+  assert.equal(app.element("update-stage").textContent, "Downloading update");
+  app.event("pagehide");
+  app.event("pageshow", {persisted: true});
+  app.expire(2000);
+  assert.equal(app.element("update-details").hidden, true);
+  assert.equal(app.updateRequests.filter(request => request.options.method === "POST").length, 1);
+  const restored = await unlockedUpdates(updateSnapshot({busy: true, state: "running", stage: "validating", run_id: "surviving-job"}));
+  assert.equal(restored.element("update-progress").hidden, false);
+  restored.expire(2000);
+  assert.ok(restored.updateRequests.every(request => request.options.method === "GET"), "Reloading an active job may only resume local polling");
+  restored.visibility(true);
+  restored.advanceTime(50 * 60 * 1000 + 1);
+  restored.visibility(false);
+  assert.match(restored.element("update-message").textContent, /Stopped waiting after 50 minutes/);
+  assert.equal(restored.element("update-details").hidden, false, "After a long-hidden timeout, the local status recovery button must be visible");
+  assert.equal(restored.element("update-refresh-button").disabled, false);
+}
+
+async function updateStatusValidationAndSafeRendering() {
+  const app = await unlockedUpdates();
+  for (const data of [{}, updateSnapshot({state: "constructor"}), updateSnapshot({stage: "imaginary"}), updateSnapshot({run_id: {bad: true}}), updateSnapshot({current_version: "x".repeat(65)})]) {
+    app.readUpdate();
+    await reply(app.updateRequests.at(-1), 200, data);
+    assert.match(app.element("update-message").textContent, /could not be confirmed/);
+    assert.equal(app.element("update-button").disabled, true);
+  }
+  app.readUpdate();
+  await reply(app.updateRequests.at(-1), 200, updateSnapshot({state: "current", stage: "complete", run_id: "saved", current_version: '<img src=x onerror="alert(1)">', message: "private-key-value"}));
+  assert.ok(app.element("update-observed")._text.includes('<img src=x onerror="alert(1)">'));
+  assert.equal(app.element("update-observed").children.length, 0);
+  assert.doesNotMatch(app.element("update-message").textContent, /private-key-value/);
+  assert.match(app.element("update-message").textContent, /last recorded check/);
+  app.update();
+  const timed = app.updateRequests.at(-1);
+  app.expire(30000);
+  assert.equal(timed.options.signal.aborted, true);
+  await reply(timed, 202, updateSnapshot({state: "succeeded", stage: "complete", run_id: "too-late"}));
+  assert.match(app.element("update-message").textContent, /outcome is not confirmed/);
+  assert.equal(app.updateRequests.filter(request => request.options.method === "POST").length, 1);
+  const unsupported = await unlockedUpdates(updateSnapshot({available: false, state: "unavailable", message: '<img src=x onerror="alert(1)"> Updater unit missing.'}));
+  assert.ok(unsupported.element("update-message")._text.includes('<img src=x onerror="alert(1)"> Updater unit missing.'));
+  assert.equal(unsupported.element("update-message").children.length, 0, "Unsupported-install reason must render as inert text");
+  for (const message of ["x".repeat(1025), {bad: true}, null]) {
+    unsupported.readUpdate();
+    await reply(unsupported.updateRequests.at(-1), 200, updateSnapshot({available: false, state: "unavailable", message}));
+    assert.match(unsupported.element("update-message").textContent, /Use the supported installer or update service/);
+    assert.ok(unsupported.element("update-message").textContent.length < 200);
+  }
+}
+
 (async () => {
   for (const test of [publicReadiness, topbarVersionTracksCurrentSnapshot, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession, performanceIsPassiveAndPerDeployment, performanceUnknownZeroAndMissingTimings, performanceEmptyOlderAndUnavailableStorage, performanceEscapingAndPrivateStateClearing, performanceLateBodyAndNewSessionGuards, savedHostRoutingStatesAndSafeDetails, savedHostSaveEnrollmentAndRouterRefresh, savedHostSnapshotPollingIsAuthenticatedAndReadOnly, savedHostEnrollmentMutationRaceGuards]) {
+    await test();
+    console.log(`PASS ${test.name}`);
+  }
+  for (const test of [updatesRequireExplicitAuthenticatedClick, updatesReconnectWithoutRepostingOrOldSuccess, updatesBusyFailuresAndBoundedWaiting, updateAuthenticationAndRacePrivacy, updatesVisibilityAndReloadAreReadOnly, updateStatusValidationAndSafeRendering]) {
     await test();
     console.log(`PASS ${test.name}`);
   }

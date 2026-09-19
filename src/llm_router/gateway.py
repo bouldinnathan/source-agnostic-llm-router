@@ -38,8 +38,9 @@ from .saved_hosts import SavedHostStore, check_saved_host
 from .saved_discovery import is_saved_endpoint, merge_saved_discovery, saved_hosts_report
 from .self_test import run_backend_checks
 from .status_page import STATUS_CSS, STATUS_JS, render_status_html
+from .update_control import UpdateController, UpdateRequestError
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 SAVED_HOST_REFRESH_SECONDS = 30.0
 SAVED_HOST_CHECK_COOLDOWN_SECONDS = 3.0
 VIRTUAL_MODELS: dict[str, str] = {
@@ -596,6 +597,7 @@ def create_app(
     provisioner: OllamaProvisioner | None = None,
     gateway: RouterGateway | None = None,
     saved_host_store: SavedHostStore | None = None,
+    update_controller: UpdateController | None = None,
 ) -> Starlette:
     service = gateway or RouterGateway(
         config_path=config_path,
@@ -604,6 +606,7 @@ def create_app(
         provisioning_settings=provisioning_settings,
         provisioner=provisioner,
     )
+    updates = update_controller if update_controller is not None else UpdateController()
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
@@ -844,6 +847,45 @@ def create_app(
             render_status_html(api_key_required=bool(os.environ.get("LLM_ROUTER_GATEWAY_API_KEY"))),
             headers=page_headers,
         )
+
+    async def status_update(request: Request) -> Response:
+        """One authenticated action may install code; passive reads never do."""
+        def reply(payload: Mapping[str, Any], code: int = 200) -> Response:
+            return JSONResponse(payload, status_code=code, headers=page_headers)
+
+        if not os.environ.get("LLM_ROUTER_GATEWAY_API_KEY", "").strip():
+            return reply({"error": "Set LLM_ROUTER_GATEWAY_API_KEY to manage updates."}, 403)
+        denied = _authorize(request, openai=True)
+        if denied is not None:
+            denied.headers.update(page_headers)
+            return denied
+        if request.url.query:
+            return reply({"error": "Update endpoints do not accept query parameters."}, 400)
+        if request.method == "POST":
+            origin = request.headers.get("origin")
+            if request.headers.get("x-llm-router-update") != "1" or origin is not None and origin != str(request.base_url).rstrip("/"):
+                return reply({"error": "Use the update button on this router's status page."}, 403)
+
+            async def empty_body() -> bool:
+                async for chunk in request.stream():
+                    if chunk:
+                        return False
+                return True
+
+            try:
+                if not await asyncio.wait_for(empty_body(), timeout=3.0):
+                    return reply({"error": "Update requests must have an empty body; custom update targets are not accepted."}, 400)
+            except (asyncio.TimeoutError, RuntimeError):
+                return reply({"error": "Send an empty update request."}, 400)
+        try:
+            operation = updates.start if request.method == "POST" else updates.status
+            payload = await asyncio.to_thread(operation)
+            return reply(payload, 202 if request.method == "POST" else 200)
+        except UpdateRequestError as exc:
+            return reply({"error": str(exc), "message": str(exc)}, exc.status_code)
+        except Exception:
+            message = "Update status could not be confirmed. Check the updater service before retrying."
+            return reply({"error": message, "message": message}, 503)
 
     async def status_css(request: Request) -> Response:
         return Response(STATUS_CSS, media_type="text/css", headers=page_headers)
@@ -1148,6 +1190,7 @@ def create_app(
         Route("/", root, methods=["GET"]),
         Route("/status", status_page, methods=["GET"]),
         Route("/status/data", status_data, methods=["GET"]),
+        Route("/status/update", status_update, methods=["GET", "POST"]),
         Route("/status/self-test", status_self_test, methods=["POST"]),
         Route("/status/hosts", saved_hosts, methods=["GET", "POST"]),
         Route("/status/hosts/check", check_saved_hosts, methods=["POST"]),

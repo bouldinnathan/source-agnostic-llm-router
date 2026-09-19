@@ -380,6 +380,43 @@ user service. Existing installations do not acquire this behavior until you opt
 in. This updates the router software and its Python dependencies, not Ollama,
 LM Studio, your operating system, or backend model files.
 
+#### Check and install from the status page
+
+Starting with **0.3.2**, `/status` has a **Check for updates** button at the top.
+Unlock the page with the router API key first. Clicking the button checks the
+official `main` branch and **automatically installs a newer commit**, if one is
+available; it is not a check-only button. A running router restarts briefly after
+the new runtime passes validation. An unchanged commit does not reinstall or
+restart anything. Anyone with the router API key can request this action, so
+keep that key private and use a trusted LAN/VPN or HTTPS connection.
+
+The progress indicator shows actual stages: checking, downloading, validating,
+and restarting. It is indeterminate rather than an estimated download percentage.
+The update runs in the separate `llm-router-update.service`, so it continues
+while the gateway restarts or the browser closes. The page reconnects and reads
+the saved result; a returning server alone is not treated as update success.
+If a request's result is uncertain, the page checks status rather than silently
+starting another update. Reloading the page requires unlocking it again.
+
+This requires the official-main, non-root systemd user-service installation and
+its updater unit, normally installed with `sh install.sh --service --auto-update`.
+The timer may be disabled while the manual button remains available. Pinned,
+fork, editable, manual-process and unsupported installations show an explanation
+instead of being switched to a different source. Settings, keys, saved backend
+addresses and performance history are preserved; checks never invoke models.
+Older servers need one command-line update to acquire this button.
+
+Protected JSON endpoints are `GET /status/update` (local progress only) and
+`POST /status/update` (check and install). Both require the router Bearer key,
+even for otherwise keyless gateways. POST additionally requires
+`X-LLM-Router-Update: 1`, an empty body, and a same-origin browser request.
+Neither endpoint accepts query parameters, repositories, revisions or paths.
+Progress is kept privately in `.update-status.json` under the managed installation
+directory, outside the replaced virtual environment. Raw package output, paths,
+credentials and exception details are not returned by this API.
+
+#### Scheduled updates and recovery
+
 The timer checks daily around midnight in the server's local timezone, with up to
 one hour of randomized delay. Missed checks are caught up after downtime. An
 unchanged commit causes no reinstall or restart. Network/download failures leave
@@ -464,7 +501,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.3.1-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.3.2-py3-none-any.whl
 llm-router --json discover
 ```
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from contextvars import ContextVar
 import fcntl
 import json
 import os
@@ -15,17 +16,21 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 from typing import Iterator, Sequence
 
+from .update_progress import UpdateProgress
+
 REPOSITORY = "https://github.com/bouldinnathan/source-agnostic-llm-router.git"
 BRANCH = "main"
 SERVICE_NAME = "llm-router.service"
 PROVENANCE_FILE = ".llm-router-update.json"
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+_PROGRESS: ContextVar[UpdateProgress | None] = ContextVar("router_update_progress", default=None)
 _METADATA_CODE = (
     "import importlib.metadata; "
     "print(importlib.metadata.distribution('source-agnostic-llm-router')"
@@ -34,25 +39,61 @@ _METADATA_CODE = (
 _SMOKE_CODE = """
 import asyncio
 import httpx
+import os
+from pathlib import Path
+import tempfile
 from llm_router import bootstrap
 from llm_router.discovery import DiscoverySettings
 from llm_router.gateway import create_app
 from llm_router.provisioning import ProvisioningSettings
 
 async def smoke():
-    # A user's default ~/.config router file must not enter an isolated test.
-    bootstrap.DEFAULT_CONFIG_LOCATIONS = ()
-    app = create_app(discovery=False,
-        settings=DiscoverySettings(enabled=False, include_loopback=False, include_cloud=False),
-        provisioning_settings=ProvisioningSettings(enabled=False))
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                                    base_url='http://router.invalid') as client:
-            response = await client.get('/')
-            if response.status_code != 200 or response.text != 'LLM Router is running':
-                raise RuntimeError('Router liveness smoke test failed')
+    # Gateway startup now checks saved addresses independently of discovery.
+    # Give every persisted-state reader an empty private temporary location.
+    with tempfile.TemporaryDirectory(prefix='llm-router-update-smoke-') as temporary:
+        root = Path(temporary)
+        config = root / 'config'
+        state = root / 'state'
+        config.mkdir(mode=0o700)
+        state.mkdir(mode=0o700)
+        isolated = {
+            'XDG_CONFIG_HOME': str(config), 'XDG_STATE_HOME': str(state),
+            'LLM_ROUTER_SAVED_HOSTS_FILE': str(config / 'llm-router' / 'saved-hosts.json'),
+            'LLM_ROUTER_METRICS_FILE': str(state / 'llm-router' / 'metrics.sqlite3'),
+            'LLM_ROUTER_CONFIG': None,
+            'LLM_ROUTER_DISCOVERY': '0', 'LLM_ROUTER_AUTO_PROVISION': '0',
+        }
+        previous = {name: os.environ.get(name) for name in isolated}
+        previous_locations = bootstrap.DEFAULT_CONFIG_LOCATIONS
+        try:
+            for name, value in isolated.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            bootstrap.DEFAULT_CONFIG_LOCATIONS = ()
+            app = create_app(discovery=False,
+                settings=DiscoverySettings(enabled=False, include_loopback=False, include_cloud=False),
+                provisioning_settings=ProvisioningSettings(enabled=False))
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                            base_url='http://router.invalid') as client:
+                    response = await client.get('/')
+                    if response.status_code != 200 or response.text != 'LLM Router is running':
+                        raise RuntimeError('Router liveness smoke test failed')
+        finally:
+            bootstrap.DEFAULT_CONFIG_LOCATIONS = previous_locations
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 asyncio.run(smoke())
 """
+
+
+class _RollbackFailure(RuntimeError):
+    """Activation failed and the active revision could not be confirmed."""
 
 
 def _environment(*, smoke: bool = False) -> dict[str, str]:
@@ -81,11 +122,11 @@ def _run(arguments: list[str], *, timeout: float = 60, cwd: Path | None = None,
         raise RuntimeError(f"Update command failed ({Path(arguments[0]).name}; {type(exc).__name__})") from exc
 
 
-def _metadata(runtime: Path) -> dict[str, object]:
+def _metadata(runtime: Path, *, timeout: float = 60) -> dict[str, object]:
     python = runtime / "bin" / "python"
     if not python.is_file():
         raise RuntimeError("Installed router virtual environment was not found")
-    result = _run([str(python), "-I", "-c", _METADATA_CODE])
+    result = _run([str(python), "-I", "-c", _METADATA_CODE], timeout=timeout)
     try:
         metadata = json.loads(result.stdout)
     except (ValueError, TypeError) as exc:
@@ -107,7 +148,7 @@ def _revision(metadata: dict[str, object]) -> tuple[str, str]:
     return commit, revision
 
 
-def installed_revision(install_dir: Path) -> str:
+def installed_revision(install_dir: Path, *, timeout: float | None = None) -> str:
     """Validate the official moving-main source and return its installed commit.
 
     Exact commits installed by this updater retain a matching provenance marker
@@ -115,7 +156,8 @@ def installed_revision(install_dir: Path) -> str:
     deliberately rejected instead of silently switching the user's source.
     """
     runtime = install_dir.expanduser().resolve() / "venv"
-    commit, requested = _revision(_metadata(runtime))
+    metadata = _metadata(runtime) if timeout is None else _metadata(runtime, timeout=timeout)
+    commit, requested = _revision(metadata)
     if requested == BRANCH:
         return commit
     try:
@@ -159,6 +201,9 @@ def _populate_release(install_dir: Path, release: Path, commit: str) -> Path:
     python = str(runtime / "bin/python")
     _run([python, "-I", "-m", "pip", "install", "--no-input", "--disable-pip-version-check",
           f"git+{REPOSITORY}@{commit}"], timeout=1800)
+    progress = _PROGRESS.get()
+    if progress is not None:
+        progress.advance("validating")
     staged_commit, staged_requested = _revision(_metadata(runtime))
     if (staged_commit, staged_requested) != (commit, commit):
         raise RuntimeError("Downloaded runtime does not match the requested official commit")
@@ -252,7 +297,7 @@ def _activate(install_dir: Path, runtime: Path, was_active: bool) -> None:
             if was_active and (changed or stopped):
                 _restart_and_verify()
         except BaseException as rollback_error:
-            raise RuntimeError("Update activation and rollback failed; prior runtime is retained on disk; inspect the service") from rollback_error
+            raise _RollbackFailure("Update activation and rollback failed; prior runtime is retained on disk; inspect the service") from rollback_error
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         raise RuntimeError("Update activation failed; previous runtime was restored") from exc
@@ -279,26 +324,55 @@ def run_update(install_dir: Path) -> None:
     install_dir = install_dir.expanduser().resolve()
     if not install_dir.is_dir():
         raise RuntimeError("Router installation directory does not exist")
-    with _termination_guard(), (install_dir / ".update.lock").open("a", encoding="utf-8") as lock:
+    descriptor = os.open(install_dir / ".update.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as lock, _termination_guard():
+        info = os.fstat(lock.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+            raise RuntimeError("Router update lock is unsafe")
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             print("Another router installation or update is running; skipping this check.")
             return
-        current = installed_revision(install_dir)
-        commit = _remote_revision()
-        if current == commit:
-            print(f"Router is already current ({current[:12]}).")
-            return
-        print(f"Preparing router update {current[:12]} -> {commit[:12]}.")
-        runtime = _stage(install_dir, commit)
-        # Read the service state after staging so a deliberate stop made during
-        # the download is honored. Never turn a stopped service on automatically.
-        was_active = _service_active()
-        _activate(install_dir, runtime, was_active)
-        print(f"Router updated to {commit[:12]}; previous runtime retained for rollback.")
-        if not was_active:
-            print("Router service was stopped and remains stopped.")
+        os.fchmod(lock.fileno(), 0o600)
+        progress = UpdateProgress(install_dir)
+        token = _PROGRESS.set(progress)
+        actual_current = None
+        try:
+            current = installed_revision(install_dir)
+            actual_current = current
+            progress.advance("checking", current_commit=current)
+            commit = _remote_revision()
+            progress.advance("checking", target_commit=commit)
+            if current == commit:
+                progress.advance("complete", state="current")
+                print(f"Router is already current ({current[:12]}).")
+                return
+            print(f"Preparing router update {current[:12]} -> {commit[:12]}.")
+            progress.advance("downloading")
+            runtime = _stage(install_dir, commit)
+            if progress.payload["stage"] != "validating":
+                progress.advance("validating")
+            # Read the service state after staging so a deliberate stop made during
+            # the download is honored. Never turn a stopped service on automatically.
+            was_active = _service_active()
+            progress.advance("restarting")
+            _activate(install_dir, runtime, was_active)
+            actual_current = commit
+            progress.advance("complete", state="succeeded", current_commit=commit)
+            print(f"Router updated to {commit[:12]}; previous runtime retained for rollback.")
+            if not was_active:
+                print("Router service was stopped and remains stopped.")
+        except BaseException as exc:
+            if isinstance(exc, _RollbackFailure):
+                actual_current = None
+            try:
+                progress.advance("failed", state="failed", current_commit=actual_current)
+            except (OSError, RuntimeError):
+                pass
+            raise
+        finally:
+            _PROGRESS.reset(token)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

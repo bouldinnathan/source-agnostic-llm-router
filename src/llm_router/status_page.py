@@ -26,6 +26,7 @@ _STATUS_HTML = """<!doctype html>
     </div>
     <div class="topbar-meta">
       <span id="version" class="version-badge" aria-label="Router version" aria-live="polite"></span>
+      <button id="update-button" type="button" disabled aria-describedby="update-warning">Check for updates</button>
       <span class="readonly">Status &amp; connection checks</span>
     </div>
   </header>
@@ -36,6 +37,19 @@ _STATUS_HTML = """<!doctype html>
         <p class="muted">A quick check that your gateway and model backends are available.</p>
       </div>
       <button id="refresh-button" type="button">Refresh status</button>
+    </section>
+
+    <section id="update-panel" class="card update-panel" aria-labelledby="update-title">
+      <h2 id="update-title">Router software updates</h2>
+      <p id="update-warning" class="muted">Check for updates checks official main and automatically installs a newer commit. Installation briefly restarts the router and can interrupt requests. Your API key is required.</p>
+      <p id="update-message" class="muted" role="status">Unlock backend details to enable software updates.</p>
+      <div id="update-details" hidden>
+        <p class="update-stage">Stage: <strong id="update-stage"></strong></p>
+        <progress id="update-progress" aria-label="Router update in progress" hidden></progress>
+        <p id="update-observed" class="muted"></p>
+        <button id="update-refresh-button" type="button">Refresh update status</button>
+        <p class="muted">Status refresh reads the local update job only; it never starts another update.</p>
+      </div>
     </section>
 
     <section id="health-panel" class="health-panel tone-pending" aria-labelledby="health-title" aria-live="polite" aria-atomic="true">
@@ -200,6 +214,7 @@ main{max-width:1208px;margin:auto;padding:38px 24px 24px}.heading,.section-headi
 .public-summary-counts{display:grid;grid-template-columns:1fr 1fr 1.6fr;gap:18px;padding:0 22px 16px}.public-summary-counts strong{display:block;font-size:20px;line-height:1.5;overflow-wrap:anywhere}.public-summary-counts>div:last-child strong{font-size:15px}.public-summary>p{padding:0 22px 19px}
 .performance-message{padding:0 22px 19px}.performance-message.result-warning{color:var(--amber)}.performance-note{padding:16px 22px;border-top:1px solid var(--line)}.metric-value{display:block;font-weight:650;white-space:nowrap}.metric-detail{display:block;min-width:130px;color:var(--muted);font-size:11px;margin-top:4px}.performance-identity{min-width:180px}.performance-identity .badge{margin-top:7px}.performance-identity code{display:block;margin-top:5px}.slow-load-count{margin-top:9px;font-size:12px}
 .host-routing{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:12px;margin-top:10px}.host-routing .secondary{margin-top:6px}
+.update-panel{padding:18px 22px}.update-panel p{margin-top:7px}.update-panel progress{display:block;width:min(100%,480px);height:14px;margin:12px 0}.update-panel button{margin-top:12px}.update-panel .result-fail{color:var(--red)}.update-panel .result-pass{color:var(--green)}.update-stage{font-size:14px}
 @media(max-width:800px){.self-test-heading{align-items:flex-start;flex-direction:column}}
 @media(max-width:600px){.hosts-toolbar{align-items:flex-start;flex-direction:column}.host-form .key-controls{flex-direction:column}}
 @media(max-width:600px){.public-summary-counts{grid-template-columns:1fr 1fr}.public-summary-counts>div:last-child{grid-column:1/-1}}
@@ -222,6 +237,18 @@ STATUS_JS = r"""
   let hostsLoaded = false;
   let savedHosts = [];
   let hostsLimit = 16;
+  let updateGeneration = 0;
+  let activeUpdate = null;
+  let updatePollTimer = null;
+  let updateLoaded = false;
+  let updateAvailable = false;
+  let updateWatching = false;
+  let updateDeadline = 0;
+  let updateRunId = null;
+  let updateStartRunId = null;
+  let updateAwaitingRun = false;
+  let updateLastStage = "";
+  let updateLastRunId = null;
   const text = (id, value) => { el(id).textContent = String(value); };
   const count = (value) => Number.isFinite(value) && value >= 0 ? String(value) : "—";
   const date = (value) => {
@@ -274,6 +301,7 @@ STATUS_JS = r"""
     el("lock-button").hidden = !apiKey;
     text("auth-title", apiKey ? "Backend details unlocked" : "Unlock backend details");
     text("auth-message", message || (apiKey ? "Your key is held only in this page’s memory." : "Backend addresses and model details are locked."));
+    updateControls();
   }
   function consumeURLKey() {
     const query = new URLSearchParams(window.location.search || "");
@@ -308,10 +336,11 @@ STATUS_JS = r"""
     if (queryKeys.length) warn("The URL key was removed from the address bar and will be held only in this page’s memory." + logWarning);
     return keys[0].trim();
   }
-  function clearDetails() {
+  function clearDetails(keepUpdate = false) {
     clearSelfTest();
     clearHosts();
     clearPerformance();
+    if (!keepUpdate) clearUpdate();
     el("details").hidden = true;
     for (const id of ["endpoints-body", "models-body", "aliases-body"]) el(id).replaceChildren();
     for (const id of ["count-endpoints", "count-online", "count-models", "count-aliases", "uptime", "last-discovery"]) text(id, "—");
@@ -326,7 +355,7 @@ STATUS_JS = r"""
     text("model-readiness", models);
   }
   function unavailable(message) {
-    clearDetails();
+    clearDetails(Boolean(apiKey) && updateWatching);
     clearSummary();
     text("checked-at", "No current snapshot");
     health("error", "Status could not be confirmed", message, "Unconfirmed", "Unknown");
@@ -806,6 +835,194 @@ STATUS_JS = r"""
     hostControls();
     if (authRequired && apiKey && !hostsLoaded && !activeHosts) hostOperation("load");
     if (!authRequired) hostMessage("Address management is disabled. Set LLM_ROUTER_GATEWAY_API_KEY in router.env and restart the router to enable it.");
+    updateControls();
+    if (authRequired && apiKey && !updateLoaded && !activeUpdate) updateRequest("GET");
+    if (!authRequired) clearUpdate();
+  }
+  function updateControls() {
+    const authorized = authRequired && Boolean(apiKey) && pageActive && !document.hidden;
+    el("update-button").disabled = !authorized || !updateAvailable || updateWatching || Boolean(activeUpdate) || el("details").hidden;
+    el("update-refresh-button").disabled = !authorized || Boolean(activeUpdate);
+  }
+  function updateMessage(message, tone = "") {
+    el("update-message").className = tone ? `muted result-${tone}` : "muted";
+    text("update-message", message);
+  }
+  function clearUpdate() {
+    updateGeneration += 1;
+    if (activeUpdate) activeUpdate.abort();
+    if (updatePollTimer !== null) clearTimeout(updatePollTimer);
+    activeUpdate = null;
+    updatePollTimer = null;
+    updateLoaded = false;
+    updateAvailable = false;
+    updateWatching = false;
+    updateDeadline = 0;
+    updateRunId = null;
+    updateStartRunId = null;
+    updateAwaitingRun = false;
+    updateLastStage = "";
+    updateLastRunId = null;
+    el("update-details").hidden = true;
+    el("update-progress").hidden = true;
+    text("update-stage", "");
+    text("update-observed", "");
+    updateMessage(authRequired ? "Unlock backend details to enable software updates." : "Software updates are disabled without a router API key. Set LLM_ROUTER_GATEWAY_API_KEY and restart the router.");
+    updateControls();
+  }
+  function updateTimedOut() {
+    if (!updateWatching || Date.now() < updateDeadline) return false;
+    updateWatching = false;
+    updateAvailable = false;
+    updateDeadline = 0;
+    el("update-details").hidden = false;
+    el("update-progress").hidden = true;
+    text("update-stage", "Outcome unknown");
+    updateMessage("Stopped waiting after 50 minutes. The update outcome is unknown; it may still be running. Refresh update status to read the local job. No update will be started again automatically.", "fail");
+    return true;
+  }
+  function pollUpdate() {
+    if (updatePollTimer !== null) clearTimeout(updatePollTimer);
+    updatePollTimer = null;
+    if (!updateWatching || !apiKey || !pageActive || document.hidden || updateTimedOut()) { updateControls(); return; }
+    updatePollTimer = setTimeout(() => { updatePollTimer = null; updateRequest("GET"); }, 2000);
+  }
+  function validUpdate(data) {
+    return data && typeof data.available === "boolean" && typeof data.busy === "boolean" &&
+      ["idle", "queued", "running", "current", "succeeded", "failed", "unavailable", "interrupted"].includes(data.state) &&
+      ["checking", "downloading", "validating", "restarting", "complete", "failed", "queued", "idle"].includes(data.stage) &&
+      (data.run_id === null || typeof data.run_id === "string" && data.run_id.length > 0 && data.run_id.length <= 128) &&
+      (data.updated_at === null || typeof data.updated_at === "string") && typeof data.current_version === "string" && data.current_version.length <= 64;
+  }
+  function renderUpdate(data) {
+    const wasWatching = updateWatching;
+    updateAvailable = data.available;
+    el("update-details").hidden = false;
+    if (wasWatching && (!data.available || data.state === "unavailable")) {
+      el("update-progress").hidden = false;
+      text("update-stage", updateLastStage || "Waiting for updater availability");
+      updateMessage("Waiting for the router to restart or reconnect. Local updater verification is temporarily unavailable; the update outcome is not confirmed. Only saved status will be retried.");
+      return;
+    }
+    if (updateAwaitingRun) {
+      if (data.run_id && data.run_id !== updateStartRunId) { updateRunId = data.run_id; updateAwaitingRun = false; }
+      else {
+        el("update-progress").hidden = false;
+        text("update-stage", "Awaiting job confirmation");
+        updateMessage("Waiting for a new update job to be confirmed. A previous saved result does not confirm this request completed. No second update request will be sent.");
+        return;
+      }
+    }
+    if (updateRunId && data.run_id !== updateRunId) {
+      updateWatching = true;
+      if (!updateDeadline) updateDeadline = Date.now() + 50 * 60 * 1000;
+      el("update-progress").hidden = false;
+      text("update-stage", "Awaiting matching job result");
+      updateMessage("The router is responding, but this is not the requested update job’s result. Completion is not confirmed; only local status will be polled.");
+      return;
+    }
+    updateLastRunId = data.run_id;
+    const stages = {checking: "Checking official main", downloading: "Downloading update", validating: "Validating installation", restarting: "Restarting router", complete: "Complete", failed: "Failed", queued: "Queued", idle: "Idle"};
+    updateLastStage = stages[data.stage];
+    text("update-stage", updateLastStage);
+    text("update-observed", `Installed version: ${data.current_version || "Unknown"} · Job status recorded: ${data.updated_at ? date(data.updated_at) : "Not yet recorded"}`);
+    if (data.busy || ["queued", "running"].includes(data.state)) {
+      updateWatching = true;
+      if (!updateDeadline) updateDeadline = Date.now() + 50 * 60 * 1000;
+      updateRunId = data.run_id;
+      el("update-progress").hidden = false;
+      updateMessage("Update in progress. The stage comes from the updater; no completion percentage is estimated. The router may briefly disconnect while restarting.");
+      return;
+    }
+    if (wasWatching && (data.state === "idle" || !data.run_id)) {
+      el("update-progress").hidden = false;
+      text("update-stage", "Outcome not confirmed");
+      updateMessage("The router is responding, but no terminal result for this update is available yet. Waiting for the local job record; no update will be retried automatically.");
+      return;
+    }
+    updateWatching = false;
+    updateDeadline = 0;
+    updateRunId = null;
+    updateStartRunId = null;
+    updateAwaitingRun = false;
+    el("update-progress").hidden = true;
+    const messages = {
+      idle: "Ready. Check for updates will check official main and install a newer commit, briefly restarting the router.",
+      current: "Already up to date. The updater confirmed that no newer official-main commit needed installing.",
+      succeeded: "Update completed successfully, as confirmed by the saved update job result.",
+      failed: "The update job failed. Review the router update service logs before trying again. No update was retried automatically.",
+      interrupted: "The update job was interrupted. Successful installation is not confirmed; inspect the update service logs before trying again.",
+      unavailable: "Software updates are unavailable for this installation. " + (typeof data.message === "string" && data.message.length > 0 && data.message.length <= 1024 ? data.message : "Use the supported installer or update service."),
+    };
+    const message = !wasWatching && data.state === "current" ? "The last recorded check found no newer official-main commit. Reading this saved status does not check for new updates."
+      : !wasWatching && data.state === "succeeded" ? "The last saved update job completed successfully. Reading this status does not check for new updates." : messages[data.state];
+    updateMessage(message, ["current", "succeeded"].includes(data.state) ? "pass" : ["failed", "interrupted"].includes(data.state) ? "fail" : "");
+    if (wasWatching) { cancelRefresh(); refresh(); }
+  }
+  async function updateRequest(method) {
+    if (activeUpdate || !authRequired || !apiKey || !pageActive || document.hidden) return;
+    if (method === "POST" && (!updateAvailable || updateWatching || el("details").hidden)) return;
+    if (method === "GET" && updateTimedOut()) { updateControls(); return; }
+    if (updatePollTimer !== null) clearTimeout(updatePollTimer);
+    updatePollTimer = null;
+    const currentGeneration = ++updateGeneration;
+    const controller = new AbortController();
+    activeUpdate = controller;
+    updateLoaded = true;
+    if (method === "POST") {
+      updateWatching = true;
+      updateDeadline = Date.now() + 50 * 60 * 1000;
+      updateStartRunId = updateLastRunId;
+      updateRunId = null;
+      updateAwaitingRun = true;
+      text("update-stage", "Submitting update request");
+      text("update-observed", "");
+      el("update-details").hidden = false;
+      el("update-progress").hidden = false;
+      updateMessage("Requesting one official-main check and installation if newer. The router may restart; waiting for the update job record.");
+    } else if (!updateWatching) {
+      el("update-details").hidden = false;
+      text("update-stage", "Reading local status");
+      updateMessage("Reading the saved local update job; no remote update check is being started.");
+    }
+    updateControls();
+    const headers = {Accept: "application/json", Authorization: `Bearer ${apiKey}`};
+    if (method === "POST") headers["X-LLM-Router-Update"] = "1";
+    const timeout = setTimeout(() => controller.abort(), method === "POST" ? 30000 : 15000);
+    try {
+      const response = await fetch("/status/update", {method, headers, credentials: "omit", cache: "no-store", redirect: "error", signal: controller.signal});
+      if (currentGeneration !== updateGeneration) return;
+      if (controller.signal.aborted) throw new Error("update-request-aborted");
+      if (response.status === 401 || response.status === 403) {
+        cancelRefresh();
+        apiKey = "";
+        el("api-key").value = "";
+        authControls("The key was rejected. Enter the router’s client API key to try again.");
+        unavailable("Authentication failed. Backend and update details have been cleared.");
+        return;
+      }
+      if (!response.ok && ![409, 503].includes(response.status)) throw new Error("update-response");
+      const data = await response.json();
+      if (currentGeneration !== updateGeneration) return;
+      if (controller.signal.aborted) throw new Error("update-request-aborted");
+      if (!validUpdate(data)) throw new Error("invalid-update-status");
+      renderUpdate(data);
+    } catch (error) {
+      if (currentGeneration !== updateGeneration) return;
+      el("update-details").hidden = false;
+      if (updateWatching) {
+        el("update-progress").hidden = false;
+        text("update-stage", updateLastStage || "Awaiting job confirmation");
+        updateMessage("Waiting for the router to restart or reconnect. The update outcome is not confirmed. This page will read local status only and will not submit another update request.");
+      } else {
+        updateAvailable = false;
+        text("update-stage", "Status unavailable");
+        updateMessage("Local update status could not be confirmed. Refresh update status to try reading it again; this does not start an update.", "fail");
+      }
+    } finally {
+      clearTimeout(timeout);
+      if (currentGeneration === updateGeneration) { activeUpdate = null; updateControls(); pollUpdate(); }
+    }
   }
   function cancelRefresh() {
     generation += 1;
@@ -952,6 +1169,8 @@ STATUS_JS = r"""
   });
   el("refresh-button").addEventListener("click", refresh);
   el("self-test-button").addEventListener("click", runSelfTest);
+  el("update-button").addEventListener("click", () => updateRequest("POST"));
+  el("update-refresh-button").addEventListener("click", () => updateRequest("GET"));
   el("host-form").addEventListener("submit", (event) => { event.preventDefault(); hostOperation("save"); });
   el("hosts-reload-button").addEventListener("click", () => hostOperation("load"));
   el("hosts-check-button").addEventListener("click", () => hostOperation("check"));
@@ -962,6 +1181,21 @@ STATUS_JS = r"""
   let timer = setInterval(refresh, 10000);
   const reloadSavedSnapshot = () => { if (!el("host-address").value.trim()) hostOperation("load"); };
   let hostsTimer = setInterval(reloadSavedSnapshot, 30000);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      updateGeneration += 1;
+      if (activeUpdate) activeUpdate.abort();
+      if (updatePollTimer !== null) clearTimeout(updatePollTimer);
+      activeUpdate = null;
+      updatePollTimer = null;
+      el("update-details").hidden = true;
+      el("update-progress").hidden = true;
+      text("update-stage", "");
+      text("update-observed", "");
+      updateMessage(updateLoaded ? "Update monitoring is paused while this page is hidden. Any server-side job continues independently." : "Unlock backend details to enable software updates.");
+      updateControls();
+    } else if (pageActive && authRequired && apiKey && updateLoaded) updateRequest("GET");
+  });
   window.addEventListener("hashchange", () => {
     // Same-page fragment navigation does not rerun this script. Scrub a newly
     // supplied key before deciding whether to unlock; ordinary anchors are inert.

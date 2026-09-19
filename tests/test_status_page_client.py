@@ -53,3 +53,9 @@ def test_status_page_client_flows() -> None:
     assert "PASS savedHostSaveEnrollmentAndRouterRefresh" in result.stdout
     assert "PASS savedHostSnapshotPollingIsAuthenticatedAndReadOnly" in result.stdout
     assert "PASS savedHostEnrollmentMutationRaceGuards" in result.stdout
+    assert "PASS updatesRequireExplicitAuthenticatedClick" in result.stdout
+    assert "PASS updatesReconnectWithoutRepostingOrOldSuccess" in result.stdout
+    assert "PASS updatesBusyFailuresAndBoundedWaiting" in result.stdout
+    assert "PASS updateAuthenticationAndRacePrivacy" in result.stdout
+    assert "PASS updatesVisibilityAndReloadAreReadOnly" in result.stdout
+    assert "PASS updateStatusValidationAndSafeRendering" in result.stdout
