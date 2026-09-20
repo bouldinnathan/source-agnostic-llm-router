@@ -186,13 +186,14 @@ async function reply(request, status, data) {
 
 function snapshot() {
   return {
-    ready: true, status: "ready", version: "0.3.10", uptime_seconds: 65,
+    ready: true, status: "ready", version: "0.3.11", uptime_seconds: 65,
     checked_at: "2026-09-16T12:00:00Z", last_discovery: null,
     counts: {endpoints: 1, online: 1, models: 1, available_models: 1, aliases: 1},
     endpoints: [{name: "backend", machine: "laptop", address: "http://private-backend:1234", state: "online", model_count: 1, available_models: 1}],
     models: [{name: '<img src=x onerror="alert(1)">', deployment: "qwen-copy", machine: "laptop", state: "available", active_requests: 0, successes: 5, failures: 1}],
     aliases: [{name: "qwen-ha", kind: "ha", available: true, deployments: 1}],
     routing: routingSnapshot(),
+    recent_failures: [],
   };
 }
 
@@ -205,7 +206,7 @@ function routingSnapshot(overrides = {}) {
 }
 
 function updateSnapshot(overrides = {}) {
-  return {available: true, busy: false, state: "idle", stage: "idle", message: "Ready", run_id: null, updated_at: null, current_version: "0.3.10", ...overrides};
+  return {available: true, busy: false, state: "idle", stage: "idle", message: "Ready", run_id: null, updated_at: null, current_version: "0.3.11", ...overrides};
 }
 
 function inferenceSnapshot(overrides = {}) {
@@ -470,11 +471,11 @@ async function publicReadiness() {
     assert.equal(app.requests[0].url, "/healthz");
     assert.equal(app.requests[0].options.headers.Authorization, undefined);
     // The real public endpoint deliberately contains no ready field.
-    await reply(app.requests[0], httpStatus, {status, version: "0.3.10"});
+    await reply(app.requests[0], httpStatus, {status, version: "0.3.11"});
     assert.equal(app.element("health-panel").className, `health-panel tone-${tone}`);
     assert.equal(app.element("gateway-state").textContent, "Responding");
     assert.equal(app.element("model-readiness").textContent, readiness);
-    assert.equal(app.element("version").textContent, "Version 0.3.10", "Version should remain visible while details are locked");
+    assert.equal(app.element("version").textContent, "Version 0.3.11", "Version should remain visible while details are locked");
     assert.equal(app.element("details").hidden, true);
     assert.equal(app.element("refresh-button").disabled, false);
   }
@@ -488,10 +489,10 @@ async function topbarVersionTracksCurrentSnapshot() {
   assert.ok(header && /\bid="version"/.test(header[1]), "Version belongs at the top of the page, before locked details");
   assert.equal(Array.from(markup.matchAll(/\bid="version"/g)).length, 1);
   const app = harness();
-  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.10"});
+  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.11"});
   assert.equal(app.element("details").hidden, true);
   assert.equal(app.element("version").hidden, false);
-  assert.equal(app.element("version").textContent, "Version 0.3.10", "Even an unavailable public gateway identifies its version");
+  assert.equal(app.element("version").textContent, "Version 0.3.11", "Even an unavailable public gateway identifies its version");
   app.enterKey("secret-key");
   await reply(app.requests.at(-1), 200, {...snapshot(), version: "0.4.0"});
   assert.equal(app.element("version").textContent, "Version 0.4.0");
@@ -515,7 +516,7 @@ async function nonoverlapAndNetworkFailure() {
   app.tick();
   app.element("refresh-button").events.click();
   assert.equal(app.requests.length, 1, "In-flight requests must not overlap");
-  await reply(app.requests[0], 200, {status: "ready", version: "0.3.10"});
+  await reply(app.requests[0], 200, {status: "ready", version: "0.3.11"});
   app.tick();
   assert.equal(app.requests.length, 2);
   app.requests[1].reject(new Error("network offline"));
@@ -530,7 +531,7 @@ async function nonoverlapAndNetworkFailure() {
 
 async function authenticationAndSafeRendering() {
   const app = harness();
-  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.10"});
+  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.11"});
   app.enterKey("secret-key");
   assert.equal(app.requests[1].url, "/status/data");
   assert.equal(app.requests[1].options.headers.Authorization, "Bearer secret-key");
@@ -561,9 +562,9 @@ async function lockLateResponsesAndRejectedKeys() {
   assert.equal(app.requests[3].url, "/healthz");
   await reply(app.requests[2], 200, snapshot());
   assert.equal(app.element("details").hidden, true, "A late authenticated result must not unlock details");
-  await reply(app.requests[0], 200, {status: "ready", version: "0.3.10"});
+  await reply(app.requests[0], 200, {status: "ready", version: "0.3.11"});
   assert.equal(app.element("health-panel").className, "health-panel tone-pending", "A cancelled old public request must not overwrite pending state");
-  await reply(app.requests[3], 503, {status: "unavailable", version: "0.3.10"});
+  await reply(app.requests[3], 503, {status: "unavailable", version: "0.3.11"});
   app.enterKey("rejected-key");
   await reply(app.requests[4], 401, {});
   assert.equal(app.element("details").hidden, true);
@@ -1473,6 +1474,41 @@ async function aliasConflictsAreExplained() {
   assert.equal(app.element("alias-conflicts").textContent, "");
 }
 
+async function recentFailuresShowTheRouterDiagnosis() {
+  const app = await unlocked();
+  assert.equal(app.element("failures-panel").hidden, true, "Nothing to show until a request fails");
+  const failures = [
+    {at: "2026-09-20T23:24:59+00:00", api: "ollama", model: "nemotron-3-5-lightning-30b-ha", status: 503, kind: "no_eligible_model",
+     detail: "3 candidate deployments excluded: missing required capability 'tool_use' (3)."},
+    {at: "2026-09-20T23:20:00+00:00", api: "openai", model: '<img src=x onerror="alert(1)">', status: 400, kind: "rejected", detail: "messages must be a non-empty array"},
+    {at: "2026-09-20T23:10:00+00:00", api: "ollama", model: "auto", status: 503, kind: "all_attempts_failed", detail: "2 attempts failed, timeout (2): a: Upstream network failure: ReadTimeout; b: Upstream network failure: ReadTimeout"},
+    {at: "bad", api: "ollama", model: "x", status: "503", kind: "no_eligible_model", detail: "invalid entry"},
+    {at: "2026-09-20T23:00:00+00:00", api: "other", model: "x", status: 503, kind: "no_eligible_model", detail: "invalid api"},
+  ];
+  app.tick();
+  await reply(app.requests.at(-1), 200, {...snapshot(), recent_failures: failures});
+  assert.equal(app.element("failures-panel").hidden, false);
+  assert.match(app.element("failures-hint").textContent, /3 since the router started/);
+  const rows = app.element("failures-body").children;
+  assert.equal(rows.length, 3, "Malformed entries are dropped");
+  assert.match(rows[0].textContent, /nemotron-3-5-lightning-30b-ha/);
+  assert.match(rows[0].textContent, /Ollama API/);
+  assert.match(rows[0].textContent, /No eligible model/);
+  assert.match(rows[0].textContent, /HTTP 503/);
+  assert.match(rows[0].textContent, /missing required capability 'tool_use' \(3\)/);
+  assert.equal(rows[1].children[1]._text, '<img src=x onerror="alert(1)">', "Model names stay inert text");
+  assert.match(rows[1].textContent, /Rejected/);
+  assert.match(rows[2].textContent, /All attempts failed/);
+  app.tick();
+  await reply(app.requests.at(-1), 200, {...snapshot(), recent_failures: "nope"});
+  assert.equal(app.element("failures-panel").hidden, true);
+  app.tick();
+  await reply(app.requests.at(-1), 200, {...snapshot(), recent_failures: failures});
+  app.lock();
+  assert.equal(app.element("failures-panel").hidden, true);
+  assert.equal(app.element("failures-body").children.length, 0, "Locking clears the private failure list");
+}
+
 async function publicCachedSummary() {
   assert.ok(markup.indexOf('id="public-summary-title"') < markup.indexOf('id="details"'), "Public summary must be outside the locked detail section");
   const app = harness();
@@ -2072,10 +2108,10 @@ async function updatesRequireExplicitAuthenticatedClick() {
     assert.doesNotMatch(app.element("update-message").textContent, /\d+%/);
   }
   app.expire(2000);
-  await reply(app.updateRequests.at(-1), 200, updateSnapshot({state: "succeeded", stage: "complete", run_id: "run-one", current_version: "0.3.10", updated_at: "2026-09-19T12:00:00Z"}));
+  await reply(app.updateRequests.at(-1), 200, updateSnapshot({state: "succeeded", stage: "complete", run_id: "run-one", current_version: "0.3.11", updated_at: "2026-09-19T12:00:00Z"}));
   assert.equal(app.element("update-progress").hidden, true);
   assert.match(app.element("update-message").textContent, /Update completed successfully/);
-  assert.match(app.element("update-observed").textContent, /0\.3\.10/);
+  assert.match(app.element("update-observed").textContent, /0\.3\.11/);
   assert.equal(app.requests.at(-1).url, "/status/data", "Confirmed completion refreshes installed version and router state");
   const count = app.updateRequests.length;
   app.expire(2000);
@@ -2280,7 +2316,7 @@ async function updateStatusValidationAndSafeRendering() {
 }
 
 (async () => {
-  for (const test of [publicReadiness, topbarVersionTracksCurrentSnapshot, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession, performanceIsPassiveAndPerDeployment, performanceUnknownZeroAndMissingTimings, performanceEmptyOlderAndUnavailableStorage, performanceEscapingAndPrivateStateClearing, performanceLateBodyAndNewSessionGuards, savedHostRoutingStatesAndSafeDetails, savedHostSaveEnrollmentAndRouterRefresh, savedHostSnapshotPollingIsAuthenticatedAndReadOnly, savedHostEnrollmentMutationRaceGuards, collapsiblePanelsAndSavedHostResults, trafficTilesChartAndWindows, routingSettingsCheckboxesAndRaces, aliasConflictsAreExplained]) {
+  for (const test of [publicReadiness, topbarVersionTracksCurrentSnapshot, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession, performanceIsPassiveAndPerDeployment, performanceUnknownZeroAndMissingTimings, performanceEmptyOlderAndUnavailableStorage, performanceEscapingAndPrivateStateClearing, performanceLateBodyAndNewSessionGuards, savedHostRoutingStatesAndSafeDetails, savedHostSaveEnrollmentAndRouterRefresh, savedHostSnapshotPollingIsAuthenticatedAndReadOnly, savedHostEnrollmentMutationRaceGuards, collapsiblePanelsAndSavedHostResults, trafficTilesChartAndWindows, routingSettingsCheckboxesAndRaces, aliasConflictsAreExplained, recentFailuresShowTheRouterDiagnosis]) {
     await test();
     console.log(`PASS ${test.name}`);
   }

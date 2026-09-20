@@ -292,6 +292,15 @@ diagnostics. Requests rejected before any backend was tried, because no
 configured deployment satisfied the request constraints, count as failed requests
 of kind `no_eligible_model`. Cancelled requests are not counted.
 
+Under the tiles, **Recent failed requests** lists the router's own diagnosis for
+the last 25 client requests that failed: the model name the client asked for,
+the API it used, the HTTP status it received, and the reason, such as
+`3 candidate deployments excluded: missing required capability 'tool_use' (3)` or
+`2 attempts failed, timeout (2)`. No prompt text is kept and the list lives in
+memory only, so it resets when the router restarts. Read it before the client's
+own log: Home Assistant, for example, groups repeated failures under the first
+traceback it recorded, so its log can show a message from days ago.
+
 Traffic lives in the same private SQLite database as performance history, as
 hourly buckets kept for **30 days** plus an all-time totals row. The `traffic`
 object in `GET /router/metrics` and in detailed `/status/data` under
@@ -605,7 +614,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.3.10-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.3.11-py3-none-any.whl
 llm-router --json discover
 ```
 

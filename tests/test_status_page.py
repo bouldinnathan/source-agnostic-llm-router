@@ -539,3 +539,33 @@ def test_dashboard_reports_omitted_ambiguous_aliases() -> None:
     assert payload["alias_conflicts"] == ["qwen3-14b-work-station", "qwen3-14b-work-station-nofailover"]
     assert "qwen3-14b-ha" in names, "A machine-name collision keeps the HA name"
     assert not any(name.startswith("qwen3-14b-work-station") for name in names)
+
+
+def test_dashboard_records_why_client_requests_failed_without_prompts(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.delenv("LLM_ROUTER_GATEWAY_API_KEY", raising=False)
+    gateway, router = gateway_with_router()
+    app = create_app(gateway=gateway)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router.test") as client:
+            too_big = await client.post("/api/chat", json={
+                "model": "qwen-ha", "stream": False, "messages": [{"role": "user", "content": "private user prompt"}],
+                "options": {"num_ctx": 10**9},
+            })
+            rejected = await client.post("/v1/chat/completions", json={"model": "auto", "messages": "private not a list"})
+            unknown = await client.post("/api/chat", json={"model": "no-such-model", "messages": [{"role": "user", "content": "private"}]})
+            page = await client.get("/status/data")
+            return too_big, rejected, unknown, page.json()
+
+    too_big, rejected, unknown, page = asyncio.run(scenario())
+    assert too_big.status_code == 503 and rejected.status_code == 400 and unknown.status_code == 400
+    failures = page["recent_failures"]
+    assert [item["kind"] for item in failures] == ["rejected", "rejected", "no_eligible_model"], failures
+    assert failures[2]["model"] == "qwen-ha" and failures[2]["api"] == "ollama" and failures[2]["status"] == 503
+    assert "context window" in failures[2]["detail"] and "(2)" in failures[2]["detail"], failures[2]
+    assert "outside selected model alias" not in failures[2]["detail"], "Alias scoping is not a reason worth listing"
+    assert failures[1]["model"] == "auto" and failures[1]["api"] == "openai" and failures[1]["status"] == 400
+    assert failures[0]["model"] == "no-such-model"
+    for item in failures:
+        assert set(item) == {"at", "api", "model", "status", "kind", "detail"}
+    assert "private" not in json.dumps(failures)

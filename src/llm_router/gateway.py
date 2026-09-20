@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import Counter, deque
 import hashlib
 import hmac
 import json
@@ -44,7 +45,7 @@ from .self_test import run_backend_checks
 from .status_page import STATUS_CSS, STATUS_JS, render_status_html
 from .update_control import UpdateController, UpdateRequestError
 
-VERSION = "0.3.10"
+VERSION = "0.3.11"
 SAVED_HOST_REFRESH_SECONDS = 30.0
 SAVED_HOST_CHECK_COOLDOWN_SECONDS = 3.0
 VIRTUAL_MODELS: dict[str, str] = {
@@ -133,6 +134,7 @@ class RouterGateway:
         self._started_at = time.monotonic()
         self.metrics = metrics_store if metrics_store is not None else MetricsStore()
         self.routing_settings_store = routing_settings_store if routing_settings_store is not None else RoutingSettingsStore()
+        self._recent_failures: deque[dict[str, Any]] = deque(maxlen=25)
         self.routing_settings = RoutingSettings()
         self._routing_settings_error: str | None = None
         self.reload_routing_settings()
@@ -160,6 +162,16 @@ class RouterGateway:
         if router is not None:
             router.settings = saved
         return saved
+
+    def record_request_failure(self, *, api: str, model: str, status: int, kind: str, detail: str) -> None:
+        """Remember why a client request failed: name, status and diagnosis, never prompt text."""
+        self._recent_failures.appendleft({
+            "at": _timestamp(), "api": api, "model": model[:128], "status": int(status),
+            "kind": kind, "detail": detail[:512],
+        })
+
+    def recent_failures(self) -> list[dict[str, Any]]:
+        return [dict(item) for item in self._recent_failures]
 
     def routing_status(self) -> dict[str, Any]:
         router = self._router
@@ -468,6 +480,7 @@ class RouterGateway:
             "aliases": aliases,
             "alias_conflicts": [] if router is None else list(alias_conflicts(router.config)),
             "routing": self.routing_status(),
+            "recent_failures": self.recent_failures(),
         }
 
     def metrics_status(self) -> dict[str, Any]:
@@ -1226,6 +1239,7 @@ def create_app(
         denied = _authorize(request)
         if denied:
             return denied
+        model = "unknown"
         try:
             body = await _json_body(request)
             model = str(body.get("model", "auto"))
@@ -1252,12 +1266,16 @@ def create_app(
             combined["message"] = first["message"]
             return JSONResponse(combined)
         except (ValueError, RequestError) as exc:
+            _record_failure(service, "ollama", model, exc, 400)
             return _ollama_error(str(exc), 400)
         except (GatewayUnavailable, AllModelsFailed, NoEligibleModel) as exc:
+            _record_failure(service, "ollama", model, exc, 503)
             return _ollama_error(str(exc), 503)
         except RouterError as exc:
+            _record_failure(service, "ollama", model, exc, 502)
             return _ollama_error(str(exc), 502)
         except Exception as exc:
+            _record_failure(service, "ollama", model, exc, 500)
             return _ollama_error(_safe_exception(exc), 500)
 
     async def openai_models(request: Request) -> Response:
@@ -1288,6 +1306,7 @@ def create_app(
         denied = _authorize(request, openai=True)
         if denied:
             return denied
+        model = "unknown"
         try:
             body = await _json_body(request)
             model = str(body.get("model", "auto"))
@@ -1310,12 +1329,16 @@ def create_app(
                 )
             return JSONResponse(payload)
         except (ValueError, RequestError) as exc:
+            _record_failure(service, "openai", model, exc, 400)
             return _openai_error(str(exc), 400, "invalid_request_error")
         except (GatewayUnavailable, AllModelsFailed, NoEligibleModel) as exc:
+            _record_failure(service, "openai", model, exc, 503)
             return _openai_error(str(exc), 503, "router_unavailable")
         except RouterError as exc:
+            _record_failure(service, "openai", model, exc, 502)
             return _openai_error(str(exc), 502, "upstream_error")
         except Exception as exc:
+            _record_failure(service, "openai", model, exc, 500)
             return _openai_error(_safe_exception(exc), 500, "internal_error")
 
     routes = [
@@ -1793,6 +1816,44 @@ def _openai_error(message: str, status: int, error_type: str) -> JSONResponse:
         {"error": {"message": message, "type": error_type, "param": None, "code": error_type}},
         status_code=status,
     )
+
+
+_SCOPE_REASONS = {"outside selected model alias", "explicitly excluded deployment", "explicitly excluded endpoint"}
+
+
+def _failure_summary(exc: Exception) -> tuple[str, str]:
+    """Classify a failed client request and describe it without client content."""
+    if isinstance(exc, NoEligibleModel):
+        counts: Counter[str] = Counter()
+        considered = 0
+        for reasons in exc.excluded.values():
+            relevant = [reason for reason in reasons if reason not in _SCOPE_REASONS]
+            if relevant:
+                considered += 1
+                counts.update(relevant)
+        if not considered:
+            return "no_eligible_model", "No deployment matches the requested model name."
+        top = ", ".join(f"{reason} ({count})" for reason, count in counts.most_common(4))
+        return "no_eligible_model", f"{considered} candidate deployment{'s' if considered != 1 else ''} excluded: {top}."
+    if isinstance(exc, AllModelsFailed):
+        kinds = ", ".join(f"{kind} ({count})" for kind, count in Counter(item.kind for item in exc.failures).most_common())
+        attempts = "; ".join(f"{item.deployment}: {item.reason}" for item in exc.failures[:4])
+        return "all_attempts_failed", f"{len(exc.failures)} attempt{'s' if len(exc.failures) != 1 else ''} failed, {kinds}: {attempts}"
+    if isinstance(exc, GatewayUnavailable):
+        return "router_unavailable", str(exc)
+    if isinstance(exc, (ValueError, RequestError)):
+        return "rejected", str(exc)
+    if isinstance(exc, RouterError):
+        return "router_error", str(exc)
+    return "internal_error", _safe_exception(exc)
+
+
+def _record_failure(service: Any, api: str, model: str, exc: Exception, status: int) -> None:
+    recorder = getattr(service, "record_request_failure", None)
+    if recorder is None:
+        return
+    kind, detail = _failure_summary(exc)
+    recorder(api=api, model=model, status=status, kind=kind, detail=detail)
 
 
 def _safe_exception(exc: Exception) -> str:
