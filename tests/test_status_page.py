@@ -498,7 +498,7 @@ def test_browser_never_persists_api_keys_and_bootstraps_url_keys_into_headers() 
         assert forbidden not in script.text
 
 
-def test_dashboard_reports_omitted_ambiguous_aliases() -> None:
+def test_ollama_and_lm_studio_spellings_share_one_ha_name() -> None:
     config = config_from_mapping({
         "endpoints": {
             "ollama-a": {"adapter": "ollama-chat", "base_url": "http://a.invalid:11434", "machine_id": "golemframe"},
@@ -513,8 +513,29 @@ def test_dashboard_reports_omitted_ambiguous_aliases() -> None:
     gateway._router = LLMRouter(config)
     payload = asyncio.run(request(create_app(gateway=gateway), "/status/data")).json()
 
+    rows = {row["name"]: row for row in payload["aliases"]}
+    assert payload["alias_conflicts"] == []
+    assert rows["nemotron-3-5-lightning-30b-ha"]["deployments"] == 2
+    assert {"nemotron-3-5-lightning-30b-golemframe-nofailover", "nemotron-3-5-lightning-30b-pantheon-nofailover"} <= set(rows)
+    assert payload["counts"]["models"] == 2
+
+
+def test_dashboard_reports_omitted_ambiguous_aliases() -> None:
+    config = config_from_mapping({
+        "endpoints": {
+            "ollama-a": {"adapter": "ollama-chat", "base_url": "http://a.invalid:11434", "machine_id": "work.station"},
+            "studio-b": {"adapter": "openai-compatible", "base_url": "http://b.invalid:1234/v1", "machine_id": "work-station"},
+        },
+        "models": [
+            {"id": "qwen-a", "endpoint": "ollama-a", "upstream_model": "qwen3:14b"},
+            {"id": "qwen-b", "endpoint": "studio-b", "upstream_model": "qwen3-14b"},
+        ],
+    })
+    gateway = RouterGateway(discovery=False)
+    gateway._router = LLMRouter(config)
+    payload = asyncio.run(request(create_app(gateway=gateway), "/status/data")).json()
+
     names = {row["name"] for row in payload["aliases"]}
-    assert payload["alias_conflicts"] == ["nemotron-3-5-lightning-30b-ha"]
-    assert "nemotron-3-5-lightning-30b-ha" not in names, "The shared HA name is dropped for both sides"
-    assert {"nemotron-3-5-lightning-30b-golemframe-nofailover", "nemotron-3-5-lightning-30b-pantheon-nofailover"} <= names
-    assert payload["counts"]["models"] == 2, "Both deployments still exist and route through auto"
+    assert payload["alias_conflicts"] == ["qwen3-14b-work-station", "qwen3-14b-work-station-nofailover"]
+    assert "qwen3-14b-ha" in names, "A machine-name collision keeps the HA name"
+    assert not any(name.startswith("qwen3-14b-work-station") for name in names)

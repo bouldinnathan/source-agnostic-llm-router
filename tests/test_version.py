@@ -18,7 +18,7 @@ def test_project_package_and_gateway_versions_match():
     project = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with project.open("rb") as stream:
         version = tomllib.load(stream)["project"]["version"]
-    assert version == __version__ == VERSION == "0.3.9"
+    assert version == __version__ == VERSION == "0.3.10"
 
 
 def test_public_status_and_ollama_api_report_release_version(monkeypatch):

@@ -1,8 +1,9 @@
 """Client-visible model replicas and machine-preference aliases.
 
-Replica membership is based on an exact upstream name unless an operator sets
-``replica_group``. Slugging is only for display names: a slug collision never
-combines groups or silently changes which machine a name prefers.
+Replica membership is based on the upstream name with punctuation and case
+folded away, unless an operator sets ``replica_group``. Ollama's ``qwen3:14b``
+and LM Studio's ``qwen3-14b`` therefore share one HA name. A machine-name
+collision never silently changes which machine a name prefers.
 """
 
 from __future__ import annotations
@@ -61,8 +62,7 @@ def _catalog(config: RouterConfig) -> tuple[dict[str, ModelAlias], tuple[str, ..
     groups: dict[str, list[ModelConfig]] = {}
     for model in config.models:
         if model.enabled:
-            group = model.replica_group or model.upstream_model
-            groups.setdefault(group, []).append(model)
+            groups.setdefault(replica_group_key(model), []).append(model)
 
     aliases: dict[str, ModelAlias] = {}
     conflicts: set[str] = set()
@@ -88,8 +88,7 @@ def _catalog(config: RouterConfig) -> tuple[dict[str, ModelAlias], tuple[str, ..
                 kind=kind,
             )
 
-    for group, members in sorted(groups.items()):
-        group_name = _slug(group, fallback="model")
+    for group_name, members in sorted(groups.items()):
         models = tuple(sorted(members, key=lambda model: model.id))
         add(f"{group_name}-ha", models)
 
@@ -106,6 +105,17 @@ def _catalog(config: RouterConfig) -> tuple[dict[str, ModelAlias], tuple[str, ..
             add(f"{name}-nofailover", machine_models, preferred_endpoints, kind="pinned")
 
     return dict(sorted(aliases.items())), tuple(sorted(conflicts))
+
+
+def replica_group_key(model: ModelConfig) -> str:
+    """The replica group a model belongs to: its declared group or its own name.
+
+    Names that differ only in punctuation or case, such as Ollama's ``qwen3:14b``
+    and LM Studio's ``qwen3-14b``, are the same model published two ways, so
+    they form one group. Quantization and variant tags are part of the name and
+    keep their own groups.
+    """
+    return _slug(model.replica_group or model.upstream_model, fallback="model")
 
 
 def _slug(value: str, *, fallback: str) -> str:

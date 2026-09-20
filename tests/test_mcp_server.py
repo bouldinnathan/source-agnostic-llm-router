@@ -46,7 +46,7 @@ def test_create_server_registers_five_annotated_tools(monkeypatch) -> None:  # t
     server = mcp_server.create_server("unused.toml")
 
     assert server.name == "llm-router"
-    assert server.options["version"] == "0.3.9"
+    assert server.options["version"] == "0.3.10"
     assert set(server.registered) == {
         "route_llm_query",
         "ask_best_llm",

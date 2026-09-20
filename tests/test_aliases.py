@@ -170,7 +170,8 @@ def test_machine_identity_falls_back_to_endpoint_name_and_ignores_ip_changes() -
     assert build_aliases(moved) == initial
 
 
-def test_group_slug_collisions_are_omitted_without_merging_or_renaming() -> None:
+def test_names_differing_only_in_punctuation_form_one_replica_group() -> None:
+    # Ollama publishes qwen3:14b, LM Studio publishes qwen3-14b: the same model.
     config = fleet()
     original = replace(config.models[0], replica_group="qwen:14b")
     newcomer = replace(config.models[1], replica_group="qwen-14b")
@@ -179,12 +180,14 @@ def test_group_slug_collisions_are_omitted_without_merging_or_renaming() -> None
     expanded = replace(config, models=(*config.models, newcomer))
     after = build_aliases(expanded)
 
-    assert "qwen-14b-ha" in before
-    assert "qwen-14b-ha" not in after
-    assert alias_conflicts(expanded) == ("qwen-14b-ha",)
-    assert after["qwen-14b-golemframe"] == before["qwen-14b-golemframe"]
-    assert after["qwen-14b-pantheon"].deployment_ids == ("qwen-pantheon",)
+    assert before["qwen-14b-ha"].deployment_ids == ("qwen-golemframe",)
+    assert after["qwen-14b-ha"].deployment_ids == ("qwen-golemframe", "qwen-pantheon"), "Both spellings share the HA name"
+    assert alias_conflicts(expanded) == ()
+    assert after["qwen-14b-golemframe"].deployment_ids == ("qwen-golemframe", "qwen-pantheon")
+    assert after["qwen-14b-pantheon-nofailover"].deployment_ids == ("qwen-pantheon",)
     assert after["other-model-ha"] == before["other-model-ha"]
+    distinct = replace(expanded, models=(*expanded.models[:2], replace(newcomer, id="qwen-quant", replica_group="qwen-14b-q4_K_M")))
+    assert "qwen-14b-q4-k-m-ha" in build_aliases(distinct), "A quantization tag is a different name and keeps its own group"
 
 
 def test_machine_slug_collision_hides_preference_and_nofailover_but_keeps_ha() -> None:

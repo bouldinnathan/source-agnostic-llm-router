@@ -605,7 +605,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.3.9-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.3.10-py3-none-any.whl
 llm-router --json discover
 ```
 
@@ -786,6 +786,19 @@ so the value you set in Home Assistant is the context the model actually runs
 with, exactly as when Home Assistant talks to Ollama directly. Before that it
 only restricted routing to models whose configured context was large enough.
 
+Assist sends its tools with every request, so only tool-capable deployments are
+eligible. Since 0.3.10 a locally hosted chat model is assumed tool-capable unless
+its family is known not to support tool calls (for example `gemma3`, `phi3`,
+`mixtral`, `deepseek-r1`, `llava`, and OCR or translation models); a backend that
+rejects tools answers with an error and the request fails over. For a voice
+assistant, pick a fast model's `…-ha` name or `auto:latency`; plain `auto` ranks
+quality first and will happily choose a large, slow model that times out.
+
+When something fails, read the router's **Client traffic** panel rather than the
+Home Assistant system log: Home Assistant groups repeated failures under the
+first traceback it recorded, so an old `min_context_window` message can stay on
+screen for days while the current failures are `No eligible model` or timeouts.
+
 Home Assistant sees virtual models: the `auto` presets plus model-specific HA, preferred-machine, and machine-only aliases described below. It does not need to know whether an answer came from Ollama, another LAN host, or a cloud provider. Response `router` metadata identifies the actual deployment for diagnostics. Use the Ollama path because Home Assistant's [official OpenAI integration](https://www.home-assistant.io/integrations/openai_conversation) intentionally accepts only the official OpenAI endpoint.
 
 The gateway also serves OpenAI-compatible `GET /v1/models` and `POST /v1/chat/completions`, plus health and diagnostics at `/healthz` and authenticated `/router/status`.
@@ -813,19 +826,14 @@ hides the `…-machine` and `…-machine-nofailover` names from `/api/tags` and
 still resolves when a client requests it, so existing Home Assistant entries keep
 working; the dashboard's Client model names table marks hidden names.
 
-The default group is the exact upstream model name, including its version/size tag.
-For example, `qwen3:14b` produces `qwen3-14b-ha`. Names are lowercased with punctuation
-converted to hyphens. Distinct names are never merged just because their aliases
-look alike: ambiguous aliases are omitted and reported under `alias_conflicts` in
-`/router/status` and `/status/data`, and the status page's Client model names panel
-explains which names were left out. This is the usual reason a model that appears
-under Model deployments has no client name: for example `nemotron-3.5-lightning:30b`
-on Ollama and `nemotron-3.5-lightning-30b` on LM Studio both shorten to
-`nemotron-3-5-lightning-30b`, so the shared `nemotron-3-5-lightning-30b-ha` name is
-dropped for both. Their per-machine names survive, but those are exactly the names
-that **Advertise per-machine model names** hides when it is off, so the model can
-vanish from client pickers entirely. Give one side a `replica_group` to declare the
-two equivalent, or change one name, and the HA name returns.
+The default group is the upstream model name with case and punctuation folded
+away, so `qwen3:14b` produces `qwen3-14b-ha`, and the same model published by
+Ollama as `qwen3:14b` and by LM Studio as `qwen3-14b` shares that one HA name and
+fails over between them. Quantization and variant tags are part of the name, so
+`qwen3.5:9b` and `qwen3.5:9b-q4_K_M` stay separate groups. Genuinely ambiguous
+names, such as two machines whose identifiers fold to the same text, are omitted
+and reported under `alias_conflicts` in `/router/status` and `/status/data`; the
+status page's Client model names panel explains which names were left out.
 
 Set `replica_group = "qwen"` on explicit model entries to use a short group name or
 map equivalent models that Ollama and LM Studio advertise under different names.

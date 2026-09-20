@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from .aliases import replica_group_key
 from .analyze import infer_capabilities, normalize_capabilities
 from .errors import ConfigError, NoEligibleModel
 from .runtime import RuntimeRegistry
@@ -200,7 +201,7 @@ def _inverse_utilities(values: dict[str, float | None]) -> dict[str, float]:
 
 
 def replica_group(model: ModelConfig) -> str:
-    return model.replica_group or model.upstream_model
+    return replica_group_key(model)
 
 
 def _prefer_fastest_replicas(candidates: list[RouteCandidate]) -> list[RouteCandidate]:

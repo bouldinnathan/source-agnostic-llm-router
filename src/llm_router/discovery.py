@@ -386,6 +386,15 @@ def merge_router_configs(
     )
 
 
+# Local families whose chat templates do not support tool calls, or that are
+# not general chat models at all. Anything else local is assumed tool-capable.
+_NO_TOOL_FAMILIES = (
+    "gemma2", "gemma3", "phi3", "phi-3", "mixtral", "llava", "deepseek-r1", "deepseek-v2",
+    "ocr", "reader-lm", "translategemma", "minicheck", "llama3:", "llama3-", "llama-3-",
+    "llama2", "llama-2", "codellama", "tinyllama", "vicuna", "orca", "wizard", "zephyr", "starcoder",
+)
+
+
 def infer_model_profile(
     model_name: str,
     *,
@@ -464,6 +473,13 @@ def infer_model_profile(
         )
     ):
         tools = 0.72
+    elif not any(token in lowered for token in _NO_TOOL_FAMILIES):
+        # Current local chat models overwhelmingly support tool calling on both
+        # Ollama and LM Studio. Assume it unless the family is known not to, so
+        # a tool-bearing request (Home Assistant's Assist always sends tools)
+        # is not refused with "no eligible model". A backend that rejects tools
+        # answers with an error, which fails over like any other attempt.
+        tools = 0.6
 
     capabilities = {
         "general": min(1.0, quality + 0.02),
