@@ -45,7 +45,7 @@ from .self_test import run_backend_checks
 from .status_page import STATUS_CSS, STATUS_JS, render_status_html
 from .update_control import UpdateController, UpdateRequestError
 
-VERSION = "0.3.11"
+VERSION = "0.3.12"
 SAVED_HOST_REFRESH_SECONDS = 30.0
 SAVED_HOST_CHECK_COOLDOWN_SECONDS = 3.0
 VIRTUAL_MODELS: dict[str, str] = {
@@ -1501,10 +1501,13 @@ def _query_request(
     # Optional tuning values are corrected, never fatal: a client such as Home
     # Assistant cannot always control how it stores them, and a conversation is
     # worth more than a knob. Unusable values fall back to the defaults below.
-    max_tokens = _usable_whole_number(
-        options.get("num_predict") if ollama else body.get("max_completion_tokens", body.get("max_tokens")),
-        default=2048,
-    )
+    requested_limit = options.get("num_predict") if ollama else body.get("max_completion_tokens", body.get("max_tokens"))
+    max_tokens = _usable_whole_number(requested_limit, default=2048)
+    # Only a limit the client actually set is forwarded upstream; the default
+    # exists for context budgeting, not to cap a backend whose own default is
+    # unlimited. A thinking model can spend 2048 tokens reasoning and then have
+    # nothing left to answer with.
+    max_tokens_specified = _usable_whole_number(requested_limit, default=None) is not None
     temperature = _usable_temperature(options.get("temperature") if ollama else body.get("temperature"))
     response_format: Mapping[str, Any] | None = None
     format_value = body.get("format") if ollama else body.get("response_format")
@@ -1538,6 +1541,7 @@ def _query_request(
         strategy=strategy,
         min_context_window=min_context_window,
         max_tokens=max_tokens,
+        max_tokens_specified=max_tokens_specified,
         temperature=temperature,
         tools=tuple(dict(tool) for tool in tools),
         response_format=response_format,

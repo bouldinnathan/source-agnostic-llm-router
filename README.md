@@ -614,7 +614,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.3.11-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.3.12-py3-none-any.whl
 llm-router --json discover
 ```
 
@@ -802,6 +802,14 @@ its family is known not to support tool calls (for example `gemma3`, `phi3`,
 rejects tools answers with an error and the request fails over. For a voice
 assistant, pick a fast model's `…-ha` name or `auto:latency`; plain `auto` ranks
 quality first and will happily choose a large, slow model that times out.
+
+Home Assistant also sends no output-token limit. Routers before 0.3.12 filled in
+2048 for the backend, which a thinking model such as Nemotron 3.5 Lightning can
+spend entirely on reasoning before answering, so the reply came back empty and
+the router reported "neither text nor tool calls". Since 0.3.12 a request without
+a limit is forwarded without one, exactly as Ollama or LM Studio would see it
+directly; a limit the client does set is forwarded as before. A reasoning-only
+reply is now diagnosed as such in Recent failed requests.
 
 When something fails, read the router's **Client traffic** panel rather than the
 Home Assistant system log: Home Assistant groups repeated failures under the

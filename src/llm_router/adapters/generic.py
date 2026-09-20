@@ -36,7 +36,8 @@ class GenericJSONAdapter(BaseHTTPAdapter):
             raise UpstreamError(
                 "generic-json request_mode must be 'messages' or 'prompt'", retryable=False
             )
-        _set_path(body, str(options.get("max_tokens_field", "max_tokens")), request.max_tokens)
+        if request.max_tokens_specified:
+            _set_path(body, str(options.get("max_tokens_field", "max_tokens")), request.max_tokens)
         if request.temperature is not None:
             _set_path(
                 body,

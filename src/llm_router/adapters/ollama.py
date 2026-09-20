@@ -18,7 +18,9 @@ class OllamaChatAdapter(BaseHTTPAdapter):
         model: ModelConfig,
         request: QueryRequest,
     ) -> UpstreamResult:
-        options: dict[str, Any] = {"num_predict": request.max_tokens}
+        options: dict[str, Any] = {}
+        if request.max_tokens_specified:
+            options["num_predict"] = request.max_tokens
         if request.temperature is not None:
             options["temperature"] = request.temperature
         if request.min_context_window is not None:
@@ -81,6 +83,12 @@ class OllamaChatAdapter(BaseHTTPAdapter):
         tool_calls = tuple(neutral_tool_calls(message))
         text = message_text(message.get("content"))
         if not text and not tool_calls:
+            if data.get("done_reason") == "length" or message.get("thinking"):
+                raise UpstreamError(
+                    "Ollama response ended before any answer text: the model used its whole output "
+                    "budget on reasoning; raise or remove the output token limit (num_predict)",
+                    retryable=False,
+                )
             raise UpstreamError("Ollama response has neither text nor tool calls", retryable=False)
         usage = {
             key: data[key]

@@ -66,7 +66,7 @@ class StaticGateway:
     def status(self):  # type: ignore[no-untyped-def]
         return {
             "status": "ready" if self._router else "unavailable",
-            "version": "0.3.11",
+            "version": "0.3.12",
         }
 
 
@@ -426,3 +426,22 @@ def test_unavailable_gateway_returns_503_instead_of_crashing() -> None:
 
     assert response.status_code == 503
     assert response.json() == {"error": "No models are currently available"}
+
+
+def test_client_output_limit_is_only_forwarded_when_set() -> None:
+    # Home Assistant sends no num_predict; Ollama's own default is unlimited and
+    # a 2048-token cap can leave a thinking model with nothing to answer with.
+    router, adapter = make_gateway_router()
+    app = create_app(gateway=StaticGateway(router))
+    base = {"model": "auto", "stream": False, "messages": [{"role": "user", "content": "hi"}]}
+    assert asyncio.run(request(app, "POST", "/api/chat", json=base)).status_code == 200
+    assert adapter.requests[-1].max_tokens == 2048 and adapter.requests[-1].max_tokens_specified is False
+    assert asyncio.run(request(app, "POST", "/api/chat", json={**base, "options": {"num_predict": 64}})).status_code == 200
+    assert adapter.requests[-1].max_tokens == 64 and adapter.requests[-1].max_tokens_specified is True
+    assert asyncio.run(request(app, "POST", "/api/chat", json={**base, "options": {"num_predict": "lots"}})).status_code == 200
+    assert adapter.requests[-1].max_tokens_specified is False, "An unusable limit is treated as no limit"
+    openai = {"model": "auto", "messages": [{"role": "user", "content": "hi"}]}
+    assert asyncio.run(request(app, "POST", "/v1/chat/completions", json=openai)).status_code == 200
+    assert adapter.requests[-1].max_tokens_specified is False
+    assert asyncio.run(request(app, "POST", "/v1/chat/completions", json={**openai, "max_completion_tokens": 32})).status_code == 200
+    assert adapter.requests[-1].max_tokens == 32 and adapter.requests[-1].max_tokens_specified is True

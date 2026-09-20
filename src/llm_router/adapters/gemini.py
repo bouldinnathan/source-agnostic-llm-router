@@ -61,7 +61,9 @@ class GeminiGenerateContentAdapter(BaseHTTPAdapter):
                 contents.append(
                     {"role": "model" if role == "assistant" else "user", "parts": parts}
                 )
-        generation_config: dict[str, Any] = {"maxOutputTokens": request.max_tokens}
+        generation_config: dict[str, Any] = {}
+        if request.max_tokens_specified:
+            generation_config["maxOutputTokens"] = request.max_tokens
         if request.temperature is not None:
             generation_config["temperature"] = request.temperature
         if request.response_format is not None:

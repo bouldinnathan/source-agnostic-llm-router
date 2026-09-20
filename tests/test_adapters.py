@@ -339,3 +339,50 @@ def test_ollama_adapter_forwards_requested_context_window() -> None:
     assert type(adapter.payload["options"]["num_ctx"]) is int
     asyncio.run(adapter.complete(endpoint, MODEL, QueryRequest.from_prompt("hi", max_tokens=32)))
     assert "num_ctx" not in adapter.payload["options"], "No context request means Ollama keeps its own default"
+
+
+def test_output_limit_is_forwarded_only_when_the_client_set_one() -> None:
+    ollama = _PayloadOllama()
+    endpoint = EndpointConfig(name="source", adapter="ollama-chat", base_url="http://source.invalid")
+    asyncio.run(ollama.complete(endpoint, MODEL, QueryRequest.from_prompt("hi", max_tokens=2048, max_tokens_specified=False)))
+    assert "num_predict" not in ollama.payload["options"], "No client limit means Ollama's own (unlimited) default"
+    asyncio.run(ollama.complete(endpoint, MODEL, QueryRequest.from_prompt("hi", max_tokens=64)))
+    assert ollama.payload["options"]["num_predict"] == 64
+    openai = CapturingOpenAI()
+    openai_endpoint = EndpointConfig(name="source", adapter="openai-chat")
+    asyncio.run(openai.complete(openai_endpoint, MODEL, QueryRequest.from_prompt("hi", max_tokens=2048, max_tokens_specified=False)))
+    assert "max_tokens" not in openai.payload
+    asyncio.run(openai.complete(openai_endpoint, MODEL, QueryRequest.from_prompt("hi", max_tokens=64)))
+    assert openai.payload["max_tokens"] == 64
+
+
+class _ReasoningOnlyOpenAI(OpenAIChatAdapter):
+    def __init__(self, response: dict) -> None:
+        self.response = response
+
+    async def post_json(self, endpoint, path, payload, **kwargs):  # type: ignore[no-untyped-def]
+        return self.response
+
+
+@pytest.mark.parametrize("response", [
+    {"choices": [{"message": {"role": "assistant", "content": "", "reasoning_content": "private thoughts"}, "finish_reason": "length"}]},
+    {"choices": [{"message": {"role": "assistant", "content": "", "reasoning": "private thoughts"}, "finish_reason": "stop"}]},
+    {"choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "length"}]},
+])
+def test_reasoning_only_openai_responses_are_diagnosed(response) -> None:
+    adapter = _ReasoningOnlyOpenAI(response)
+    with pytest.raises(UpstreamError) as captured:
+        asyncio.run(adapter.complete(EndpointConfig(name="source", adapter="openai-chat"), MODEL, QueryRequest.from_prompt("hi")))
+    assert "output budget on reasoning" in str(captured.value)
+    assert "private thoughts" not in str(captured.value)
+    assert captured.value.kind == "invalid_response"
+
+
+def test_reasoning_only_ollama_response_is_diagnosed() -> None:
+    class ThinkingOllama(OllamaChatAdapter):
+        async def post_json(self, endpoint, path, payload, **kwargs):  # type: ignore[no-untyped-def]
+            return {"message": {"role": "assistant", "content": "", "thinking": "private thoughts"}, "done_reason": "length"}
+
+    with pytest.raises(UpstreamError) as captured:
+        asyncio.run(ThinkingOllama().complete(EndpointConfig(name="source", adapter="ollama-chat", base_url="http://s.invalid"), MODEL, QueryRequest.from_prompt("hi")))
+    assert "output budget on reasoning" in str(captured.value) and "private thoughts" not in str(captured.value)

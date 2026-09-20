@@ -81,7 +81,9 @@ class AnthropicMessagesAdapter(BaseHTTPAdapter):
         body: dict[str, Any] = {
             "model": model.upstream_model,
             "messages": messages,
-            "max_tokens": request.max_tokens,
+            # The Messages API requires a limit; without a client limit, allow
+            # the model's full configured output rather than the routing budget.
+            "max_tokens": request.max_tokens if request.max_tokens_specified else max(request.max_tokens, model.max_output_tokens),
         }
         if request.response_format is not None:
             system_chunks.append(

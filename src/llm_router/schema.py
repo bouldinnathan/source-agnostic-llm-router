@@ -163,6 +163,9 @@ class QueryRequest:
     max_input_cost_per_million: float | None = None
     max_output_cost_per_million: float | None = None
     max_tokens: int = 1_024
+    # False when the client set no output limit; adapters then send none upstream
+    # (Ollama's own default is unlimited) while ranking still budgets max_tokens.
+    max_tokens_specified: bool = True
     temperature: float | None = None
     tools: tuple[Mapping[str, Any], ...] = ()
     response_format: Mapping[str, Any] | None = None
@@ -187,6 +190,8 @@ class QueryRequest:
             object.__setattr__(self, name, whole_number(name, getattr(self, name)))
         if self.max_tokens is None:
             raise RequestError("max_tokens must be a whole number")
+        if not isinstance(self.max_tokens_specified, bool):
+            raise RequestError("max_tokens_specified must be true or false")
         if self.max_tokens <= 0:
             raise RequestError("max_tokens must be greater than zero")
         if self.min_context_window is not None and self.min_context_window <= 0:

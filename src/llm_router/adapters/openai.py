@@ -27,8 +27,9 @@ class OpenAIChatAdapter(BaseHTTPAdapter):
         body: dict[str, Any] = {
             "model": model.upstream_model,
             "messages": openai_messages(request.messages),
-            str(endpoint.options.get("max_tokens_field", "max_tokens")): request.max_tokens,
         }
+        if request.max_tokens_specified:
+            body[str(endpoint.options.get("max_tokens_field", "max_tokens"))] = request.max_tokens
         if request.temperature is not None:
             body["temperature"] = request.temperature
         if request.tools:
@@ -52,6 +53,12 @@ class OpenAIChatAdapter(BaseHTTPAdapter):
         tool_calls = tuple(neutral_tool_calls(message))
         text = message_text(message.get("content"))
         if not text and not tool_calls:
+            if choice.get("finish_reason") == "length" or message.get("reasoning_content") or message.get("reasoning"):
+                raise UpstreamError(
+                    "OpenAI-compatible response ended before any answer text: the model used its whole "
+                    "output budget on reasoning; raise or remove the output token limit (max_tokens)",
+                    retryable=False,
+                )
             raise UpstreamError(
                 "OpenAI-compatible response has neither text nor tool calls", retryable=False
             )
@@ -74,8 +81,9 @@ class OpenAIResponsesAdapter(BaseHTTPAdapter):
         body: dict[str, Any] = {
             "model": model.upstream_model,
             "input": [dict(message) for message in request.messages],
-            "max_output_tokens": request.max_tokens,
         }
+        if request.max_tokens_specified:
+            body["max_output_tokens"] = request.max_tokens
         if request.temperature is not None:
             body["temperature"] = request.temperature
         if request.tools:
