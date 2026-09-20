@@ -605,7 +605,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.3.6-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.3.7-py3-none-any.whl
 llm-router --json discover
 ```
 
@@ -772,7 +772,11 @@ A **Context window size** set in the Ollama integration arrives as a float such 
 The router treats integral floats in `num_ctx`, `num_predict`, and `max_tokens` as
 the integers they denote; fractional or non-finite values are still rejected with
 HTTP 400. Routers before 0.3.5 rejected the float outright, which Home Assistant
-logged as `min_context_window must be an integer (status code: 400)`.
+logged as `min_context_window must be an integer (status code: 400)`. Since 0.3.7
+the requested context window is also forwarded to Ollama backends as `num_ctx`,
+so the value you set in Home Assistant is the context the model actually runs
+with, exactly as when Home Assistant talks to Ollama directly. Before that it
+only restricted routing to models whose configured context was large enough.
 
 Home Assistant sees virtual models: the `auto` presets plus model-specific HA, preferred-machine, and machine-only aliases described below. It does not need to know whether an answer came from Ollama, another LAN host, or a cloud provider. Response `router` metadata identifies the actual deployment for diagnostics. Use the Ollama path because Home Assistant's [official OpenAI integration](https://www.home-assistant.io/integrations/openai_conversation) intentionally accepts only the official OpenAI endpoint.
 

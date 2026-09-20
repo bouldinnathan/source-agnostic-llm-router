@@ -320,3 +320,22 @@ def test_configuration_problems_are_configuration_failures(monkeypatch) -> None:
     assert UpstreamError("unknown", status_code=429).kind == "http_4xx"
     assert UpstreamError("unknown").kind == "other"
     assert UpstreamError("unknown", kind="not-a-kind").kind == "other"
+
+
+class _PayloadOllama(OllamaChatAdapter):
+    def __init__(self) -> None:
+        self.payload: dict = {}
+
+    async def post_json(self, endpoint, path, payload, **kwargs):  # type: ignore[no-untyped-def]
+        self.payload = dict(payload)
+        return {"message": {"role": "assistant", "content": "OK"}, "done_reason": "stop"}
+
+
+def test_ollama_adapter_forwards_requested_context_window() -> None:
+    adapter = _PayloadOllama()
+    endpoint = EndpointConfig(name="source", adapter="ollama-chat", base_url="http://source.invalid")
+    asyncio.run(adapter.complete(endpoint, MODEL, QueryRequest.from_prompt("hi", min_context_window=8192.0, max_tokens=32)))
+    assert adapter.payload["options"] == {"num_predict": 32, "num_ctx": 8192}
+    assert type(adapter.payload["options"]["num_ctx"]) is int
+    asyncio.run(adapter.complete(endpoint, MODEL, QueryRequest.from_prompt("hi", max_tokens=32)))
+    assert "num_ctx" not in adapter.payload["options"], "No context request means Ollama keeps its own default"

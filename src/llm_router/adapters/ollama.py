@@ -21,6 +21,10 @@ class OllamaChatAdapter(BaseHTTPAdapter):
         options: dict[str, Any] = {"num_predict": request.max_tokens}
         if request.temperature is not None:
             options["temperature"] = request.temperature
+        if request.min_context_window is not None:
+            # A client's context-window request (Home Assistant's num_ctx) is
+            # both a routing constraint and what Ollama should actually use.
+            options["num_ctx"] = request.min_context_window
         messages: list[dict[str, Any]] = []
         pending_names: list[str] = []
         for raw in request.messages:
