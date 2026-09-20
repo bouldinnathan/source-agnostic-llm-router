@@ -127,6 +127,22 @@ _STATUS_HTML = """<!doctype html>
         You can also explicitly configure backends using <code>LLM_ROUTER_DISCOVERY_URLS</code> in <code>router.env</code> and restart the router.
         If a backend is offline, check its address, firewall, and VPN connection.</p>
       </div>
+      <details id="settings-panel" class="card settings-panel" open>
+        <summary class="card-summary"><h2 id="settings-title">Routing settings <span class="card-summary-meta" id="settings-meta"></span></h2></summary>
+        <div class="card-body">
+          <p id="settings-message" class="muted" role="status">Unlock backend details to change routing settings.</p>
+          <form id="settings-form" class="settings-form" autocomplete="off">
+            <label class="setting"><input id="setting-advertise-machine" type="checkbox" disabled>
+              <span><strong>Advertise per-machine model names</strong><span class="muted">Lists the <code>…-machine</code> and <code>…-machine-nofailover</code> names, whose machine part can be an IP address, in /api/tags and /v1/models. Off leaves clients only the <code>auto</code> presets and the <code>…-ha</code> names; a hidden name still works for clients already using it.</span></span></label>
+            <label class="setting"><input id="setting-prefer-fastest" type="checkbox" disabled>
+              <span><strong>Prefer the fastest replica</strong><span class="muted">When the chosen model runs on several machines, try the one with the lowest observed latency first. Quality and capability still decide which model is chosen.</span></span></label>
+            <label class="setting"><input id="setting-race" type="checkbox" disabled>
+              <span><strong>Occasionally race all replicas</strong><span class="muted">Every Nth request for a model with several available replicas is sent to all of them at once. The first answer is returned and the others finish in the background, so every replica’s latency is re-measured. Those requests run once per replica.</span></span></label>
+            <label class="setting setting-number"><span><strong>Race every</strong></span><input id="setting-race-every" type="number" min="2" max="1000" step="1" inputmode="numeric" disabled><span class="muted">requests per model (2 to 1000)</span></label>
+          </form>
+          <div id="settings-races" class="settings-races" hidden><h3>Recent races</h3><ul id="settings-races-list"></ul></div>
+        </div>
+      </details>
       <details id="hosts-panel" class="card" open>
         <summary class="card-summary"><h2 id="hosts-title">Saved backend addresses <span class="card-summary-meta" id="hosts-meta"></span></h2></summary>
         <div class="card-intro">
@@ -299,6 +315,8 @@ main{max-width:1400px;margin:auto;padding:38px 24px 24px}.heading,.section-headi
 .traffic-chart-wrap{padding:0 22px 18px}.traffic-chart-heading{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:8px 16px;margin-bottom:8px}.traffic-chart-heading h3{font-size:13px;margin:0}.chart-legend{display:flex;gap:16px;list-style:none;margin:0;padding:0;font-size:12px;color:var(--muted)}.chart-legend li{display:flex;align-items:center;gap:6px}.swatch{width:10px;height:10px;border-radius:2px;display:inline-block}.swatch-ok{background:var(--chart-ok)}.swatch-failed{background:var(--chart-failed)}
 .traffic-chart svg{display:block;width:100%;height:auto}.traffic-chart .bar-ok{fill:var(--chart-ok)}.traffic-chart .bar-failed{fill:var(--chart-failed)}.traffic-chart .axis{stroke:#cbd5e1;stroke-width:1}.traffic-chart .grid{stroke:var(--track);stroke-width:1}.traffic-chart text{font-size:11px;fill:var(--muted);font-family:inherit}.traffic-chart .hit{fill:transparent}.traffic-chart g:hover .hit{fill:rgba(20,37,61,.06)}.traffic-chart .chart-empty{font-size:12px}
 .traffic-table{margin-top:10px}.traffic-table .table-scroll{margin-top:8px}.traffic-table th,.traffic-table td{padding:8px 12px}.traffic-table td{font-variant-numeric:tabular-nums}
+.settings-form{display:grid;gap:12px;margin-top:12px}.setting{display:grid;grid-template-columns:auto 1fr;gap:10px 12px;align-items:start;font-size:14px;cursor:pointer}.setting input[type="checkbox"]{width:18px;height:18px;margin:2px 0 0}.setting strong{display:block;font-weight:600}.setting .muted{display:block;margin-top:2px}.setting-number{grid-template-columns:auto auto 1fr;align-items:center}.setting-number input{width:96px;padding:6px 10px}.settings-races{margin-top:16px;padding-top:12px;border-top:1px solid var(--line)}.settings-races h3{font-size:13px;margin-bottom:6px}.settings-races ul{margin:0;padding-left:18px;font-size:13px;display:grid;gap:6px}#settings-message.result-fail{color:var(--red)}#settings-message.result-pass{color:var(--green)}#settings-message.result-warning{color:var(--amber)}
+@media(max-width:500px){.setting-number{grid-template-columns:1fr}}
 .about-body dl{margin:0;display:grid;grid-template-columns:minmax(140px,190px) 1fr;gap:10px 18px;font-size:13px}.about-body dt{font-weight:600}.about-body dd{margin:0;color:var(--muted)}
 @media(max-width:900px){.traffic-tiles{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:600px){.about-body dl{grid-template-columns:1fr;gap:4px}.about-body dd{margin-bottom:8px}}
@@ -346,9 +364,13 @@ STATUS_JS = r"""
   // is forgotten with the rest of the private details on lock or navigation.
   const collapsedHosts = new Set();
   const collapsedCatalogs = new Set();
-  const panels = ["traffic-panel", "summary-panel", "hosts-panel", "backends-panel", "models-panel", "aliases-panel", "performance-panel", "self-test-panel", "inference-panel", "update-panel", "links-panel", "about-panel"];
+  const panels = ["traffic-panel", "summary-panel", "settings-panel", "hosts-panel", "backends-panel", "models-panel", "aliases-panel", "performance-panel", "self-test-panel", "inference-panel", "update-panel", "links-panel", "about-panel"];
   const trafficKinds = {timeout: "Timeouts", connection: "Connection errors", http_5xx: "Backend 5xx errors", http_4xx: "Backend 4xx errors", invalid_response: "Invalid responses", configuration: "Configuration", adapter: "Adapter crashes", no_eligible_model: "No eligible model", other: "Other"};
   const trafficWindows = {"24h": ["Last 24 hours", 24], "7d": ["Last 7 days", 168], all: ["All time", 168]};
+  let settingsGeneration = 0;
+  let activeSettings = null;
+  let routingSettings = null;
+  const settingFields = {advertise_machine_aliases: "setting-advertise-machine", prefer_fastest_replica: "setting-prefer-fastest", race_replicas: "setting-race"};
   let trafficWindow = "24h";
   let trafficData = null;
   let trafficCheckedAt = 0;
@@ -457,6 +479,7 @@ STATUS_JS = r"""
   function clearDetails(keepUpdate = false, keepInference = false) {
     clearSelfTest();
     clearHosts();
+    clearSettings();
     clearPerformance();
     clearTraffic();
     if (!keepUpdate) clearUpdate();
@@ -992,6 +1015,142 @@ STATUS_JS = r"""
       cell(row, item.last_seen_at ? date(item.last_seen_at) : "Not recorded");
     });
   }
+  function validSettings(settings) {
+    return Boolean(settings) && typeof settings === "object" &&
+      Object.keys(settingFields).every(name => typeof settings[name] === "boolean") &&
+      Number.isSafeInteger(settings.race_every) && settings.race_every >= 2 && settings.race_every <= 1000;
+  }
+  function validRoutingState(routing) {
+    return Boolean(routing) && typeof routing === "object" && validSettings(routing.settings) &&
+      Boolean(routing.storage) && typeof routing.storage === "object" && typeof routing.storage.available === "boolean" &&
+      (routing.storage.error === null || typeof routing.storage.error === "string") &&
+      Array.isArray(routing.races) && routing.races.length <= 5;
+  }
+  function settingsControls() {
+    const enabled = authRequired && Boolean(apiKey) && !el("details").hidden && routingSettings !== null && !activeSettings;
+    for (const id of [...Object.values(settingFields), "setting-race-every"]) el(id).disabled = !enabled;
+  }
+  function settingsMessage(message, tone = "") {
+    el("settings-message").className = tone ? `muted result-${tone}` : "muted";
+    text("settings-message", message);
+  }
+  function restoreSettingInputs() {
+    if (!routingSettings) return;
+    for (const [name, id] of Object.entries(settingFields)) el(id).checked = routingSettings[name];
+    el("setting-race-every").value = String(routingSettings.race_every);
+  }
+  function clearSettings() {
+    settingsGeneration += 1;
+    if (activeSettings) activeSettings.abort();
+    activeSettings = null;
+    routingSettings = null;
+    for (const id of Object.values(settingFields)) el(id).checked = false;
+    el("setting-race-every").value = "";
+    el("settings-races").hidden = true;
+    el("settings-races-list").replaceChildren();
+    meta("settings-meta", "");
+    settingsMessage(authRequired ? "Unlock backend details to change routing settings." : "Routing settings are disabled. Set LLM_ROUTER_GATEWAY_API_KEY in router.env and restart the router to enable them.");
+    settingsControls();
+  }
+  function renderRaces(races) {
+    const list = el("settings-races-list");
+    list.replaceChildren();
+    const valid = races.filter(race => race && typeof race === "object" && typeof race.group === "string" &&
+      (race.winner === null || typeof race.winner === "string") && Boolean(race.participants) && typeof race.participants === "object" && !Array.isArray(race.participants));
+    el("settings-races").hidden = valid.length === 0;
+    for (const race of valid) {
+      const item = document.createElement("li");
+      const head = document.createElement("strong");
+      head.textContent = `${race.group} · ${typeof race.started_at === "string" ? date(race.started_at) : "Unknown time"}`;
+      const detail = document.createElement("span");
+      detail.className = "secondary";
+      const parts = Object.entries(race.participants)
+        .filter(([, result]) => result && typeof result === "object")
+        .map(([name, result]) => `${name}${name === race.winner ? " (winner)" : ""}: ${result.success === true
+          ? (Number.isFinite(result.latency_ms) ? `${Math.round(result.latency_ms)} ms` : "succeeded")
+          : `failed${typeof result.kind === "string" ? ` (${result.kind})` : ""}`}`);
+      detail.textContent = `${race.winner === null ? "No replica answered. " : ""}${parts.length ? parts.join(" · ") : "Waiting for results"}`;
+      item.append(head, detail);
+      list.append(item);
+    }
+  }
+  function renderRouting(routing) {
+    if (!validRoutingState(routing)) {
+      routingSettings = null;
+      settingsMessage("This router version does not report routing settings, or the snapshot was invalid. Update the router to change them here.", "warning");
+      meta("settings-meta", "Unavailable");
+      settingsControls();
+      return;
+    }
+    routingSettings = routing.settings;
+    restoreSettingInputs();
+    meta("settings-meta", [
+      routing.settings.advertise_machine_aliases ? "machine names shown" : "machine names hidden",
+      routing.settings.prefer_fastest_replica ? "fastest first" : "",
+      routing.settings.race_replicas ? `race every ${routing.settings.race_every}` : "",
+    ].filter(Boolean).join(" · "));
+    if (!authRequired) {
+      settingsMessage("Routing settings can be viewed here, but changing them requires LLM_ROUTER_GATEWAY_API_KEY in router.env and a router restart.");
+    } else if (!activeSettings) {
+      settingsMessage(routing.storage.available
+        ? "Settings are saved on the router and apply to new requests immediately; no restart is needed."
+        : routing.storage.error, routing.storage.available ? "" : "warning");
+    }
+    renderRaces(routing.races);
+    settingsControls();
+  }
+  async function saveSettings(changes) {
+    if (activeSettings || el("details").hidden || !authRequired || !apiKey || routingSettings === null) return;
+    const currentGeneration = ++settingsGeneration;
+    const controller = new AbortController();
+    activeSettings = controller;
+    settingsControls();
+    settingsMessage("Saving routing settings…");
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch("/status/settings", {
+        method: "POST", credentials: "omit", cache: "no-store", redirect: "error", signal: controller.signal,
+        headers: {Accept: "application/json", Authorization: `Bearer ${apiKey}`, "X-LLM-Router-Settings": "1", "Content-Type": "application/json"},
+        body: JSON.stringify(changes),
+      });
+      if (currentGeneration !== settingsGeneration) return;
+      if (response.status === 401 || response.status === 403) {
+        cancelRefresh();
+        apiKey = "";
+        el("api-key").value = "";
+        authControls("The key was rejected. Enter the router’s client API key to try again.");
+        unavailable("Authentication failed. Backend details have been cleared.");
+        return;
+      }
+      const data = await response.json();
+      if (currentGeneration !== settingsGeneration) return;
+      if (!response.ok) {
+        const messages = {
+          400: "That value was rejected; nothing changed.",
+          503: "Settings could not be saved on the router; nothing changed. Check the service account’s configuration directory and routing-settings file.",
+        };
+        restoreSettingInputs();
+        settingsMessage(messages[response.status] || "The request failed; nothing changed.", "fail");
+        return;
+      }
+      if (!validRoutingState(data)) throw new Error("invalid-settings-response");
+      activeSettings = null;
+      renderRouting(data);
+      settingsMessage("Saved. Changes apply to new requests immediately.", "pass");
+      cancelRefresh();
+      refresh();
+    } catch (error) {
+      if (currentGeneration !== settingsGeneration) return;
+      restoreSettingInputs();
+      settingsMessage("The request timed out, the connection failed, or the response was invalid. Reload the page to confirm the saved settings.", "fail");
+    } finally {
+      clearTimeout(timeout);
+      if (currentGeneration === settingsGeneration) {
+        activeSettings = null;
+        settingsControls();
+      }
+    }
+  }
   function validBucket(bucket) {
     return Boolean(bucket) && typeof bucket === "object" && !Array.isArray(bucket) &&
       ["requests_ok", "requests_failed", "reroutes_ok", "reroutes_failed"].every(name => Number.isSafeInteger(bucket[name]) && bucket[name] >= 0) &&
@@ -1288,13 +1447,14 @@ STATUS_JS = r"""
     });
     const kinds = {ha: "High availability", preferred: "Preferred + failover", pinned: "Pinned · no failover"};
     rows("aliases-body", data.aliases, 4, "No HA or machine aliases are available yet.", (row, item) => {
-      cell(row, item.name);
+      cell(row, item.name, item.advertised === false ? "Hidden from client model lists" : null);
       cell(row, Object.prototype.hasOwnProperty.call(kinds, item.kind) ? kinds[item.kind] : "Unknown");
       cell(row, item.available ? badge("Available", "ready") : badge("Unavailable", "warning"));
       cell(row, count(item.deployments));
     });
     el("details").hidden = false;
     el("self-test-panel").hidden = false;
+    renderRouting(data.routing);
     el("inference-panel").hidden = !authRequired || !apiKey;
     inferenceControls();
     hostControls();
@@ -1828,6 +1988,16 @@ STATUS_JS = r"""
   el("host-form").addEventListener("submit", (event) => { event.preventDefault(); hostOperation("save"); });
   el("hosts-reload-button").addEventListener("click", () => hostOperation("load"));
   el("hosts-check-button").addEventListener("click", () => hostOperation("check"));
+  el("settings-form").addEventListener("submit", (event) => { event.preventDefault(); });
+  for (const [name, id] of Object.entries(settingFields)) el(id).addEventListener("change", () => saveSettings({[name]: el(id).checked}));
+  el("setting-race-every").addEventListener("change", () => {
+    const value = Number(el("setting-race-every").value);
+    if (Number.isSafeInteger(value) && value >= 2 && value <= 1000) saveSettings({race_every: value});
+    else {
+      restoreSettingInputs();
+      settingsMessage("Race every must be a whole number from 2 to 1000.", "fail");
+    }
+  });
   const setPanels = open => { for (const id of panels) el(id).open = open; };
   el("collapse-all-button").addEventListener("click", () => setPanels(false));
   el("expand-all-button").addEventListener("click", () => setPanels(true));

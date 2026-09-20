@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import os
 import re
 import time
@@ -11,12 +13,25 @@ from typing import Any, Sequence
 from .adapters import AdapterRegistry
 from .errors import AllModelsFailed, NoEligibleModel, UpstreamError, UpstreamFailure
 from .metrics import MetricsStore
-from .ranking import Ranker
+from .ranking import Ranker, replica_group
+from .routing_settings import RoutingSettings
 from .runtime import RuntimeRegistry
-from .schema import EndpointConfig, ModelConfig, QueryRequest, RoutedCompletion, RouterConfig, RoutingDecision, UpstreamResult
+from .schema import (
+    EndpointConfig, ModelConfig, QueryRequest, RouteCandidate, RoutedCompletion, RouterConfig,
+    RoutingDecision, UpstreamResult,
+)
 from .telemetry import extract_observation
 
 _ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+@dataclass(slots=True)
+class _AttemptOutcome:
+    candidate: RouteCandidate
+    result: UpstreamResult | None
+    observation: dict[str, Any]
+    failure: UpstreamFailure | None
+    attempt: dict[str, Any]
 
 
 class LLMRouter:
@@ -29,12 +44,23 @@ class LLMRouter:
         adapters: AdapterRegistry | None = None,
         runtime: RuntimeRegistry | None = None,
         metrics: MetricsStore | None = None,
+        settings: RoutingSettings | None = None,
     ) -> None:
         self.config = config
         self.adapters = adapters or AdapterRegistry()
         self.runtime = runtime or RuntimeRegistry(config.policy)
         self.metrics = metrics if metrics is not None else MetricsStore()
         self.ranker = Ranker(config, self.runtime)
+        self.settings = settings if settings is not None else RoutingSettings()
+
+    @property
+    def settings(self) -> RoutingSettings:
+        return self._settings
+
+    @settings.setter
+    def settings(self, value: RoutingSettings) -> None:
+        self._settings = value
+        self.ranker.prefer_fastest = value.prefer_fastest_replica
 
     def route(self, request: QueryRequest) -> RoutingDecision:
         """Rank deployments without contacting an upstream model."""
@@ -42,7 +68,13 @@ class LLMRouter:
         return self.ranker.rank(request)
 
     async def complete(self, request: QueryRequest) -> RoutedCompletion:
-        """Call the highest-ranked deployment and fail over across sources."""
+        """Call the highest-ranked deployment and fail over across sources.
+
+        With replica racing enabled, every Nth request whose best candidate has
+        other available replicas is sent to all of them at once. The first
+        successful answer is returned; the rest finish in the background so each
+        replica's observed latency stays current.
+        """
 
         try:
             decision = self.route(request)
@@ -53,93 +85,152 @@ class LLMRouter:
         failures: list[UpstreamFailure] = []
         attempts: list[dict[str, Any]] = []
         failure_kinds: list[str] = []
+        remaining = list(decision.candidates[:limit])
 
-        for candidate in decision.candidates[:limit]:
-            model = candidate.model
-            endpoint = self.config.endpoints[model.endpoint]
-            self.runtime.begin(model.id)
-            started = time.perf_counter()
-            try:
-                adapter = self.adapters.get(endpoint.adapter)
-                result = await adapter.complete(endpoint, model, request)
-            except asyncio.CancelledError:
-                self.runtime.end_without_result(model.id)
-                raise
-            except UpstreamError as exc:
-                latency_ms = (time.perf_counter() - started) * 1_000
-                self.runtime.record_failure(model.id, exc.reason)
-                failure = UpstreamFailure(
-                    deployment=model.id,
-                    endpoint=model.endpoint,
-                    reason=exc.reason,
-                    retryable=exc.retryable,
-                    status_code=exc.status_code,
-                    kind=exc.kind,
-                )
-                failures.append(failure)
-                failure_kinds.append(exc.kind)
-                attempts.append(
-                    {
-                        **failure.to_dict(),
-                        "latency_ms": round(latency_ms, 2),
-                        "success": False,
-                    }
-                )
-                await self._record_metrics(endpoint, model, latency_ms, success=False)
-                continue
-            except Exception as exc:  # Custom adapters must not crash the MCP process.
-                latency_ms = (time.perf_counter() - started) * 1_000
-                reason = f"Adapter failure: {type(exc).__name__}"
-                self.runtime.record_failure(model.id, reason)
-                failure = UpstreamFailure(
-                    deployment=model.id,
-                    endpoint=model.endpoint,
-                    reason=reason,
-                    retryable=False,
-                    kind="adapter",
-                )
-                failures.append(failure)
-                failure_kinds.append("adapter")
-                attempts.append(
-                    {
-                        **failure.to_dict(),
-                        "latency_ms": round(latency_ms, 2),
-                        "success": False,
-                    }
-                )
-                await self._record_metrics(endpoint, model, latency_ms, success=False)
-                continue
+        participants = self._race_participants(request, decision)
+        if participants:
+            outcome = await self._race(request, participants, failures, attempts, failure_kinds)
+            if outcome is not None:
+                return await self._finish(outcome, decision, failures, attempts, failure_kinds)
+            raced = {candidate.model.id for candidate in participants}
+            remaining = [candidate for candidate in decision.candidates if candidate.model.id not in raced][:limit]
 
-            latency_ms = (time.perf_counter() - started) * 1_000
-            self.runtime.record_success(model.id, latency_ms)
-            observation = await self._record_metrics(endpoint, model, latency_ms, success=True, result=result)
-            await self._record_request(
-                success=True, rerouted=bool(failures), failure_kinds=failure_kinds,
-                input_tokens=observation.get("input_tokens"), output_tokens=observation.get("output_tokens"),
-            )
-            attempts.append(
-                {
-                    "deployment": model.id,
-                    "endpoint": model.endpoint,
-                    "latency_ms": round(latency_ms, 2),
-                    "success": True,
-                }
-            )
-            return RoutedCompletion(
-                text=result.text,
-                deployment=model.id,
-                endpoint=model.endpoint,
-                upstream_model=model.upstream_model,
-                score=candidate.score,
-                usage=result.usage,
-                finish_reason=result.finish_reason,
-                attempts=tuple(attempts),
-                inferred_capabilities=decision.inferred_capabilities,
-                tool_calls=result.tool_calls,
-            )
+        for candidate in remaining:
+            outcome = await self._attempt(candidate, request)
+            if outcome.failure is None:
+                return await self._finish(outcome, decision, failures, attempts, failure_kinds)
+            failures.append(outcome.failure)
+            attempts.append(outcome.attempt)
+            failure_kinds.append(outcome.failure.kind)
 
         await self._record_request(success=False, rerouted=len(failures) > 1, failure_kinds=failure_kinds)
         raise AllModelsFailed(failures)
+
+    async def _finish(
+        self, outcome: _AttemptOutcome, decision: RoutingDecision,
+        failures: list[UpstreamFailure], attempts: list[dict[str, Any]], failure_kinds: list[str],
+    ) -> RoutedCompletion:
+        assert outcome.result is not None
+        attempts.append(outcome.attempt)
+        await self._record_request(
+            success=True, rerouted=bool(failures), failure_kinds=failure_kinds,
+            input_tokens=outcome.observation.get("input_tokens"), output_tokens=outcome.observation.get("output_tokens"),
+        )
+        candidate = outcome.candidate
+        return RoutedCompletion(
+            text=outcome.result.text,
+            deployment=candidate.model.id,
+            endpoint=candidate.model.endpoint,
+            upstream_model=candidate.model.upstream_model,
+            score=candidate.score,
+            usage=outcome.result.usage,
+            finish_reason=outcome.result.finish_reason,
+            attempts=tuple(attempts),
+            inferred_capabilities=decision.inferred_capabilities,
+            tool_calls=outcome.result.tool_calls,
+        )
+
+    async def _attempt(
+        self, candidate: RouteCandidate, request: QueryRequest, *, race: dict[str, Any] | None = None,
+    ) -> _AttemptOutcome:
+        """Run one upstream attempt and record it; never raises except on cancellation."""
+        model = candidate.model
+        endpoint = self.config.endpoints[model.endpoint]
+        self.runtime.begin(model.id)
+        started = time.perf_counter()
+        try:
+            adapter = self.adapters.get(endpoint.adapter)
+            result = await adapter.complete(endpoint, model, request)
+        except asyncio.CancelledError:
+            self.runtime.end_without_result(model.id)
+            raise
+        except UpstreamError as exc:
+            latency_ms = (time.perf_counter() - started) * 1_000
+            failure = UpstreamFailure(
+                deployment=model.id, endpoint=model.endpoint, reason=exc.reason,
+                retryable=exc.retryable, status_code=exc.status_code, kind=exc.kind,
+            )
+        except Exception as exc:  # Custom adapters must not crash the MCP process.
+            latency_ms = (time.perf_counter() - started) * 1_000
+            failure = UpstreamFailure(
+                deployment=model.id, endpoint=model.endpoint,
+                reason=f"Adapter failure: {type(exc).__name__}", retryable=False, kind="adapter",
+            )
+        else:
+            latency_ms = (time.perf_counter() - started) * 1_000
+            self.runtime.record_success(model.id, latency_ms)
+            observation = await self._record_metrics(endpoint, model, latency_ms, success=True, result=result)
+            attempt = {
+                "deployment": model.id, "endpoint": model.endpoint,
+                "latency_ms": round(latency_ms, 2), "success": True,
+            }
+            if race is not None:
+                attempt["race"] = True
+                race["participants"][model.id] = {
+                    "endpoint": model.endpoint, "success": True, "latency_ms": round(latency_ms, 2), "kind": None,
+                }
+            return _AttemptOutcome(candidate, result, observation, None, attempt)
+        self.runtime.record_failure(model.id, failure.reason)
+        await self._record_metrics(endpoint, model, latency_ms, success=False)
+        attempt = {**failure.to_dict(), "latency_ms": round(latency_ms, 2), "success": False}
+        if race is not None:
+            attempt["race"] = True
+            race["participants"][model.id] = {
+                "endpoint": model.endpoint, "success": False, "latency_ms": round(latency_ms, 2), "kind": failure.kind,
+            }
+        return _AttemptOutcome(candidate, None, {"request_duration_ms": latency_ms}, failure, attempt)
+
+    def _race_participants(self, request: QueryRequest, decision: RoutingDecision) -> tuple[RouteCandidate, ...]:
+        """Decide whether this request is one of the periodic all-replica races."""
+        settings = self._settings
+        if not settings.race_replicas or request.preferred_endpoints:
+            return ()
+        group = replica_group(decision.candidates[0].model)
+        members = tuple(
+            candidate for candidate in decision.candidates if replica_group(candidate.model) == group
+        )
+        if len(members) < 2:
+            return ()
+        count = self.runtime.race_counters.get(group, 0) + 1
+        self.runtime.race_counters[group] = count
+        if count % settings.race_every != 0:
+            return ()
+        return members
+
+    async def _race(
+        self, request: QueryRequest, participants: tuple[RouteCandidate, ...],
+        failures: list[UpstreamFailure], attempts: list[dict[str, Any]], failure_kinds: list[str],
+    ) -> _AttemptOutcome | None:
+        """Send the request to every replica; return the first success, if any."""
+        record: dict[str, Any] = {
+            "group": replica_group(participants[0].model),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "winner": None,
+            "participants": {},
+        }
+        self.runtime.last_races.appendleft(record)
+        tasks = {asyncio.create_task(self._attempt(candidate, request, race=record)) for candidate in participants}
+        pending = set(tasks)
+        try:
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    outcome = task.result()
+                    if outcome.failure is None:
+                        record["winner"] = outcome.candidate.model.id
+                        # Losers keep running so their latency is measured too.
+                        for other in pending:
+                            self.runtime.race_tasks.add(other)
+                            other.add_done_callback(self.runtime.race_tasks.discard)
+                        return outcome
+                    failures.append(outcome.failure)
+                    attempts.append(outcome.attempt)
+                    failure_kinds.append(outcome.failure.kind)
+        except asyncio.CancelledError:
+            for task in pending:
+                task.cancel()
+            raise
+        return None
 
     async def _record_request(
         self, *, success: bool, rerouted: bool, failure_kinds: Sequence[str] = (),

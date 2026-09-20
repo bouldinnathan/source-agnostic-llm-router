@@ -36,6 +36,7 @@ def isolated_passive_metrics(monkeypatch, tmp_path):  # type: ignore[no-untyped-
     """Tests must never read or append to an operator's real metrics database."""
     monkeypatch.setenv("LLM_ROUTER_METRICS_FILE", str(tmp_path / "performance" / "metrics.sqlite3"))
     monkeypatch.setenv("LLM_ROUTER_SAVED_HOSTS_FILE", str(tmp_path / "saved-hosts" / "saved-hosts.json"))
+    monkeypatch.setenv("LLM_ROUTER_ROUTING_SETTINGS_FILE", str(tmp_path / "routing-settings" / "routing-settings.json"))
     monkeypatch.delenv("LLM_ROUTER_CONFIG", raising=False)
     monkeypatch.setattr("llm_router.bootstrap.DEFAULT_CONFIG_LOCATIONS", ())
 

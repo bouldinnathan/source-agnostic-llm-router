@@ -32,6 +32,7 @@ from .health import probe_endpoints
 from .inference_jobs import InferenceJobError, InferenceJobs, Runner
 from .inference_test import run_inference_checks
 from .metrics import MetricsStore
+from .routing_settings import FIELDS as ROUTING_SETTING_FIELDS, RoutingSettings, RoutingSettingsStore, validate_settings
 from .provisioning import OllamaProvisioner, ProvisioningReport, ProvisioningSettings
 from .public_status import public_summary
 from .router import LLMRouter
@@ -42,7 +43,7 @@ from .self_test import run_backend_checks
 from .status_page import STATUS_CSS, STATUS_JS, render_status_html
 from .update_control import UpdateController, UpdateRequestError
 
-VERSION = "0.3.5"
+VERSION = "0.3.6"
 SAVED_HOST_REFRESH_SECONDS = 30.0
 SAVED_HOST_CHECK_COOLDOWN_SECONDS = 3.0
 VIRTUAL_MODELS: dict[str, str] = {
@@ -104,6 +105,7 @@ class RouterGateway:
         provisioning_settings: ProvisioningSettings | None = None,
         provisioner: OllamaProvisioner | None = None,
         metrics_store: MetricsStore | None = None,
+        routing_settings_store: RoutingSettingsStore | None = None,
     ) -> None:
         self.config_path = config_path
         self.discovery_enabled = discovery
@@ -129,6 +131,46 @@ class RouterGateway:
         self._last_refresh: float | None = None
         self._started_at = time.monotonic()
         self.metrics = metrics_store if metrics_store is not None else MetricsStore()
+        self.routing_settings_store = routing_settings_store if routing_settings_store is not None else RoutingSettingsStore()
+        self.routing_settings = RoutingSettings()
+        self._routing_settings_error: str | None = None
+        self.reload_routing_settings()
+
+    def reload_routing_settings(self) -> RoutingSettings:
+        """Read saved dashboard settings; an unreadable file keeps defaults and is reported."""
+        try:
+            self.routing_settings = self.routing_settings_store.load()
+            self._routing_settings_error = None
+        except RuntimeError:
+            self.routing_settings = RoutingSettings()
+            self._routing_settings_error = "Saved routing settings could not be read; defaults are in effect until the file is repaired."
+        router = self._router
+        if router is not None:
+            router.settings = self.routing_settings
+        return self.routing_settings
+
+    def update_routing_settings(self, changes: Mapping[str, Any]) -> RoutingSettings:
+        """Validate, persist, then apply to the live router; nothing applies unless saved."""
+        settings = validate_settings(changes, base=self.routing_settings)
+        saved = self.routing_settings_store.save(settings)
+        self._routing_settings_error = None
+        self.routing_settings = saved
+        router = self._router
+        if router is not None:
+            router.settings = saved
+        return saved
+
+    def routing_status(self) -> dict[str, Any]:
+        router = self._router
+        races = [] if router is None else [
+            {**record, "participants": {name: dict(item) for name, item in record["participants"].items()}}
+            for record in router.runtime.last_races
+        ]
+        return {
+            "settings": self.routing_settings.to_dict(),
+            "storage": {"available": self._routing_settings_error is None, "error": self._routing_settings_error},
+            "races": races,
+        }
 
     async def start(self) -> None:
         await self.refresh()
@@ -185,6 +227,7 @@ class RouterGateway:
                 self._last_refresh = time.time()
                 return False
             result.router.metrics = self.metrics
+            result.router.settings = self.routing_settings
             self._router = result.router
             self._discovery = result.discovery
             self._base_discovery = result.base_discovery or result.discovery
@@ -205,10 +248,11 @@ class RouterGateway:
             merged = merge_router_configs(self._configured, report.config)
             previous = self._router
             runtime = previous.runtime if previous and previous.config.policy == merged.policy else None
-            router = LLMRouter(merged, runtime=runtime, metrics=self.metrics)
+            router = LLMRouter(merged, runtime=runtime, metrics=self.metrics, settings=self.routing_settings)
             result = self._retain_failed_sources(BootstrapResult(router, report, self._configured), previous)
             router = result.router
             router.metrics = self.metrics
+            router.settings = self.routing_settings
             # Cached ordinary discovery must not reset newer health failures.
             for probe in report.probes:
                 name = _probe_endpoint_name(probe, router.config.endpoints)
@@ -384,12 +428,14 @@ class RouterGateway:
                     ),
                 })
             available = {model["deployment"] for model in models if model["state"] == "available"}
+            advertised = set(_advertised_aliases(router))
             for name, alias in build_aliases(router.config).items():
                 aliases.append({
                     "name": name,
                     "kind": alias.kind,
                     "available": bool(available.intersection(alias.deployment_ids)),
                     "deployments": len(alias.deployment_ids),
+                    "advertised": name in advertised,
                 })
         if status["ready"]:
             notice = (
@@ -419,6 +465,7 @@ class RouterGateway:
             "endpoints": sorted(endpoints, key=lambda endpoint: (endpoint["machine"], endpoint["name"])),
             "models": sorted(models, key=lambda model: (model["name"], model["machine"], model["deployment"])),
             "aliases": aliases,
+            "routing": self.routing_status(),
         }
 
     def metrics_status(self) -> dict[str, Any]:
@@ -564,7 +611,7 @@ class RouterGateway:
             policy=result.router.config.policy,
             source_path=result.router.config.source_path,
         )
-        router = LLMRouter(merged, runtime=result.router.runtime)
+        router = LLMRouter(merged, runtime=result.router.runtime, metrics=result.router.metrics, settings=result.router.settings)
         return replace(result, router=router)
 
 
@@ -601,10 +648,12 @@ def create_app(
     saved_host_store: SavedHostStore | None = None,
     update_controller: UpdateController | None = None,
     inference_test_runner: Runner | None = None,
+    routing_settings_store: RoutingSettingsStore | None = None,
 ) -> Starlette:
     service = gateway or RouterGateway(
         config_path=config_path,
         discovery=discovery,
+        routing_settings_store=routing_settings_store,
         settings=settings,
         provisioning_settings=provisioning_settings,
         provisioner=provisioner,
@@ -734,7 +783,7 @@ def create_app(
                 return hosts_reply({"error": "Use the saved-address controls on this router's status page."}, 403)
         return None
 
-    async def hosts_body(request: Request, fields: set[str]) -> dict[str, Any]:
+    async def hosts_body(request: Request, fields: set[str], *, what: str = "Saved-address") -> dict[str, Any]:
         if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
             raise ValueError("Send a JSON object with Content-Type application/json.")
 
@@ -742,7 +791,7 @@ def create_app(
             body = bytearray()
             async for chunk in request.stream():
                 if len(body) + len(chunk) > 4096:
-                    raise ValueError("Saved-address request is too large.")
+                    raise ValueError(f"{what} request is too large.")
                 body.extend(chunk)
             return bytes(body)
 
@@ -751,8 +800,45 @@ def create_app(
         except (UnicodeError, json.JSONDecodeError, RecursionError, asyncio.TimeoutError) as exc:
             raise ValueError("Send a valid, small JSON object.") from exc
         if not isinstance(payload, dict) or set(payload) - fields:
-            raise ValueError("Unexpected saved-address request fields.")
+            raise ValueError(f"Unexpected {what.lower()} request fields.")
         return payload
+
+    def settings_reply(payload: Mapping[str, Any], code: int = 200) -> Response:
+        return JSONResponse(payload, status_code=code, headers=page_headers)
+
+    def settings_authorize(request: Request) -> Response | None:
+        # Routing switches change what every client sees, so they need the
+        # configured key even on gateways that otherwise allow keyless use.
+        if not os.environ.get("LLM_ROUTER_GATEWAY_API_KEY", "").strip():
+            return settings_reply({"error": "Set LLM_ROUTER_GATEWAY_API_KEY to change routing settings."}, 403)
+        denied = _authorize(request, openai=True)
+        if denied is not None:
+            denied.headers.update(page_headers)
+            return denied
+        if request.url.query:
+            return settings_reply({"error": "Routing settings endpoints do not accept query parameters."}, 400)
+        if request.method != "GET":
+            origin = request.headers.get("origin")
+            if (
+                request.headers.get("x-llm-router-settings") != "1"
+                or origin is not None and origin != str(request.base_url).rstrip("/")
+            ):
+                return settings_reply({"error": "Use the routing settings controls on this router's status page."}, 403)
+        return None
+
+    async def routing_settings(request: Request) -> Response:
+        denied = settings_authorize(request)
+        if denied is not None:
+            return denied
+        if request.method == "POST":
+            try:
+                body = await hosts_body(request, set(ROUTING_SETTING_FIELDS), what="Routing settings")
+                service.update_routing_settings(body)
+            except ValueError as exc:
+                return settings_reply({"error": str(exc)}, 400)
+            except RuntimeError:
+                return settings_reply({"error": "Routing settings could not be saved. Check the router's storage permissions and routing-settings file; nothing was changed."}, 503)
+        return settings_reply(service.routing_status())
 
     def host_snapshot(entry: Mapping[str, Any]) -> dict[str, Any]:
         cached = host_results.get(entry["id"])
@@ -1191,7 +1277,7 @@ def create_app(
                         "created": now,
                         "owned_by": "llm-router",
                     }
-                    for model in (*VIRTUAL_MODELS, *build_aliases(router.config))
+                    for model in (*VIRTUAL_MODELS, *_advertised_aliases(router))
                 ],
             }
         )
@@ -1237,6 +1323,7 @@ def create_app(
         Route("/status/update", status_update, methods=["GET", "POST"]),
         Route("/status/self-test", status_self_test, methods=["POST"]),
         Route("/status/inference-test", status_inference_test, methods=["GET", "POST"]),
+        Route("/status/settings", routing_settings, methods=["GET", "POST"]),
         Route("/status/hosts", saved_hosts, methods=["GET", "POST"]),
         Route("/status/hosts/check", check_saved_hosts, methods=["POST"]),
         Route("/status/hosts/{host_id}", remove_saved_host, methods=["DELETE"]),
@@ -1426,9 +1513,17 @@ def _messages_have_images(messages: list[Any]) -> bool:
     return False
 
 
+def _advertised_aliases(router: LLMRouter) -> dict[str, ModelAlias]:
+    """Names shown to clients; every generated alias still resolves when requested."""
+    aliases = build_aliases(router.config)
+    if router.settings.advertise_machine_aliases:
+        return aliases
+    return {name: alias for name, alias in aliases.items() if alias.kind == "ha"}
+
+
 def _ollama_models(router: LLMRouter) -> list[dict[str, Any]]:
     now = _timestamp()
-    aliases = build_aliases(router.config)
+    aliases = _advertised_aliases(router)
     def largest_context(name: str) -> int:
         members = aliases[name].models if name in aliases else router.config.models
         return max((model.context_window for model in members if model.enabled), default=8192)

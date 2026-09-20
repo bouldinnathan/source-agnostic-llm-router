@@ -52,6 +52,7 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
   const hostRequests = [];
   const updateRequests = [];
   const inferenceRequests = [];
+  const settingsRequests = [];
   const confirmations = [];
   const allRequests = [];
   const historyCalls = [];
@@ -100,8 +101,15 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
       const hostRequest = /^\/status\/hosts(?:\/[^/?#]+)?$/.test(url);
       const updateRequest = url === "/status/update";
       const inferenceRequest = url === "/status/inference-test";
-      assert.ok(["/healthz", "/status/data", "/status/self-test"].includes(url) || hostRequest || updateRequest || inferenceRequest, "Only same-origin status endpoints may be fetched");
-      if (!hostRequest && !updateRequest && !inferenceRequest) assert.equal(options.method, url === "/status/self-test" ? "POST" : "GET");
+      const settingsRequest = url === "/status/settings";
+      assert.ok(["/healthz", "/status/data", "/status/self-test"].includes(url) || hostRequest || updateRequest || inferenceRequest || settingsRequest, "Only same-origin status endpoints may be fetched");
+      if (!hostRequest && !updateRequest && !inferenceRequest && !settingsRequest) assert.equal(options.method, url === "/status/self-test" ? "POST" : "GET");
+      if (settingsRequest) {
+        assert.match(options.headers.Authorization, /^Bearer .+/);
+        assert.equal(options.method, "POST", "The page reads settings from the status snapshot and only posts changes");
+        assert.equal(options.headers["X-LLM-Router-Settings"], "1");
+        assert.equal(options.headers["Content-Type"], "application/json");
+      }
       if (inferenceRequest) {
         assert.match(options.headers.Authorization, /^Bearer .+/);
         assert.equal(options.body, undefined, "Inference jobs never accept a backend, prompt, model, URL, or body");
@@ -130,7 +138,7 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
       assert.equal(options.redirect, "error");
       const pending = {url, options, resolve, reject};
       allRequests.push(pending);
-      (hostRequest ? hostRequests : updateRequest ? updateRequests : inferenceRequest ? inferenceRequests : requests).push(pending);
+      (hostRequest ? hostRequests : updateRequest ? updateRequests : inferenceRequest ? inferenceRequests : settingsRequest ? settingsRequests : requests).push(pending);
       if (hostRequest && autoLoadHosts && options.method === "GET") resolve({status: 200, ok: true, json: async () => ({hosts: [], limit: 16})});
       if (updateRequest && context.autoLoadUpdates && options.method === "GET") resolve({status: 200, ok: true, json: async () => updateSnapshot()});
     }),
@@ -138,7 +146,7 @@ function harness(authRequired = true, autoLoadHosts = true, options = {}) {
   context.autoLoadUpdates = options.autoLoadUpdates !== false;
   vm.runInNewContext(script, context);
   return {
-    element, requests, hostRequests, updateRequests, inferenceRequests, confirmations, allRequests, timeouts, historyCalls, timeline, location,
+    element, requests, hostRequests, updateRequests, inferenceRequests, settingsRequests, confirmations, allRequests, timeouts, historyCalls, timeline, location,
     advanceTime: milliseconds => { currentTime += milliseconds; },
     expire: delay => {
       for (const [id, callback] of Array.from(timeouts.entries())) if (timeoutDelays.get(id) === delay) {
@@ -178,17 +186,26 @@ async function reply(request, status, data) {
 
 function snapshot() {
   return {
-    ready: true, status: "ready", version: "0.3.5", uptime_seconds: 65,
+    ready: true, status: "ready", version: "0.3.6", uptime_seconds: 65,
     checked_at: "2026-09-16T12:00:00Z", last_discovery: null,
     counts: {endpoints: 1, online: 1, models: 1, available_models: 1, aliases: 1},
     endpoints: [{name: "backend", machine: "laptop", address: "http://private-backend:1234", state: "online", model_count: 1, available_models: 1}],
     models: [{name: '<img src=x onerror="alert(1)">', deployment: "qwen-copy", machine: "laptop", state: "available", active_requests: 0, successes: 5, failures: 1}],
     aliases: [{name: "qwen-ha", kind: "ha", available: true, deployments: 1}],
+    routing: routingSnapshot(),
+  };
+}
+
+function routingSnapshot(overrides = {}) {
+  return {
+    settings: {advertise_machine_aliases: true, prefer_fastest_replica: false, race_replicas: false, race_every: 20, ...(overrides.settings || {})},
+    storage: overrides.storage || {available: true, error: null},
+    races: overrides.races || [],
   };
 }
 
 function updateSnapshot(overrides = {}) {
-  return {available: true, busy: false, state: "idle", stage: "idle", message: "Ready", run_id: null, updated_at: null, current_version: "0.3.5", ...overrides};
+  return {available: true, busy: false, state: "idle", stage: "idle", message: "Ready", run_id: null, updated_at: null, current_version: "0.3.6", ...overrides};
 }
 
 function inferenceSnapshot(overrides = {}) {
@@ -453,11 +470,11 @@ async function publicReadiness() {
     assert.equal(app.requests[0].url, "/healthz");
     assert.equal(app.requests[0].options.headers.Authorization, undefined);
     // The real public endpoint deliberately contains no ready field.
-    await reply(app.requests[0], httpStatus, {status, version: "0.3.5"});
+    await reply(app.requests[0], httpStatus, {status, version: "0.3.6"});
     assert.equal(app.element("health-panel").className, `health-panel tone-${tone}`);
     assert.equal(app.element("gateway-state").textContent, "Responding");
     assert.equal(app.element("model-readiness").textContent, readiness);
-    assert.equal(app.element("version").textContent, "Version 0.3.5", "Version should remain visible while details are locked");
+    assert.equal(app.element("version").textContent, "Version 0.3.6", "Version should remain visible while details are locked");
     assert.equal(app.element("details").hidden, true);
     assert.equal(app.element("refresh-button").disabled, false);
   }
@@ -471,10 +488,10 @@ async function topbarVersionTracksCurrentSnapshot() {
   assert.ok(header && /\bid="version"/.test(header[1]), "Version belongs at the top of the page, before locked details");
   assert.equal(Array.from(markup.matchAll(/\bid="version"/g)).length, 1);
   const app = harness();
-  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.5"});
+  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.6"});
   assert.equal(app.element("details").hidden, true);
   assert.equal(app.element("version").hidden, false);
-  assert.equal(app.element("version").textContent, "Version 0.3.5", "Even an unavailable public gateway identifies its version");
+  assert.equal(app.element("version").textContent, "Version 0.3.6", "Even an unavailable public gateway identifies its version");
   app.enterKey("secret-key");
   await reply(app.requests.at(-1), 200, {...snapshot(), version: "0.4.0"});
   assert.equal(app.element("version").textContent, "Version 0.4.0");
@@ -498,7 +515,7 @@ async function nonoverlapAndNetworkFailure() {
   app.tick();
   app.element("refresh-button").events.click();
   assert.equal(app.requests.length, 1, "In-flight requests must not overlap");
-  await reply(app.requests[0], 200, {status: "ready", version: "0.3.5"});
+  await reply(app.requests[0], 200, {status: "ready", version: "0.3.6"});
   app.tick();
   assert.equal(app.requests.length, 2);
   app.requests[1].reject(new Error("network offline"));
@@ -513,7 +530,7 @@ async function nonoverlapAndNetworkFailure() {
 
 async function authenticationAndSafeRendering() {
   const app = harness();
-  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.5"});
+  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.6"});
   app.enterKey("secret-key");
   assert.equal(app.requests[1].url, "/status/data");
   assert.equal(app.requests[1].options.headers.Authorization, "Bearer secret-key");
@@ -544,9 +561,9 @@ async function lockLateResponsesAndRejectedKeys() {
   assert.equal(app.requests[3].url, "/healthz");
   await reply(app.requests[2], 200, snapshot());
   assert.equal(app.element("details").hidden, true, "A late authenticated result must not unlock details");
-  await reply(app.requests[0], 200, {status: "ready", version: "0.3.5"});
+  await reply(app.requests[0], 200, {status: "ready", version: "0.3.6"});
   assert.equal(app.element("health-panel").className, "health-panel tone-pending", "A cancelled old public request must not overwrite pending state");
-  await reply(app.requests[3], 503, {status: "unavailable", version: "0.3.5"});
+  await reply(app.requests[3], 503, {status: "unavailable", version: "0.3.6"});
   app.enterKey("rejected-key");
   await reply(app.requests[4], 401, {});
   assert.equal(app.element("details").hidden, true);
@@ -1155,7 +1172,7 @@ async function savedHostCatalogStaleAndPrivate() {
 }
 
 async function collapsiblePanelsAndSavedHostResults() {
-  for (const id of ["traffic-panel", "update-panel", "summary-panel", "links-panel", "hosts-panel", "self-test-panel", "inference-panel", "backends-panel", "models-panel", "aliases-panel", "performance-panel"]) {
+  for (const id of ["traffic-panel", "update-panel", "summary-panel", "links-panel", "settings-panel", "hosts-panel", "self-test-panel", "inference-panel", "backends-panel", "models-panel", "aliases-panel", "performance-panel"]) {
     const tag = markup.match(new RegExp(`<details\\b[^>]*\\bid="${id}"[^>]*>`));
     assert.ok(tag && /\bopen\b/.test(tag[0]), `${id} must be a native details panel that starts expanded`);
   }
@@ -1338,6 +1355,102 @@ async function trafficTilesChartAndWindows() {
   assert.equal(app.element("traffic-table-body").children.length, 0);
   assert.match(app.element("traffic-message").textContent, /Unlock backend details/);
   assert.equal(app.element("traffic-meta").textContent, "");
+}
+
+async function routingSettingsCheckboxesAndRaces() {
+  const app = await unlocked();
+  assert.equal(app.element("setting-advertise-machine").checked, true);
+  assert.equal(app.element("setting-advertise-machine").disabled, false);
+  assert.equal(app.element("setting-race-every").value, "20");
+  assert.match(app.element("settings-meta").textContent, /machine names shown/);
+  assert.match(app.element("settings-message").textContent, /apply to new requests immediately/);
+  assert.equal(app.settingsRequests.length, 0, "Settings arrive with the status snapshot; nothing extra is fetched");
+  app.element("setting-advertise-machine").checked = false;
+  app.element("setting-advertise-machine").events.change();
+  const post = app.settingsRequests.at(-1);
+  assert.deepEqual(JSON.parse(post.options.body), {advertise_machine_aliases: false});
+  assert.equal(app.element("setting-race").disabled, true, "One change is in flight at a time");
+  const routing = routingSnapshot({
+    settings: {advertise_machine_aliases: false, race_replicas: true, race_every: 5},
+    races: [{group: "qwen", started_at: "2026-09-20T10:00:00Z", winner: "qwen-b", participants: {
+      "qwen-b": {endpoint: "source-b", success: true, latency_ms: 120.4, kind: null},
+      "qwen-a": {endpoint: "source-a", success: false, latency_ms: 30, kind: "http_5xx"},
+      '<img src=x onerror="alert(1)">': {endpoint: "x", success: true, latency_ms: 5, kind: null},
+    }}, {group: "pending", started_at: "2026-09-20T10:01:00Z", winner: null, participants: {}}],
+  });
+  await reply(post, 200, routing);
+  assert.equal(app.element("setting-advertise-machine").checked, false);
+  assert.equal(app.element("setting-race").checked, true);
+  assert.equal(app.element("setting-race-every").value, "5");
+  assert.match(app.element("settings-message").textContent, /^Saved/);
+  assert.match(app.element("settings-meta").textContent, /machine names hidden · race every 5/);
+  assert.equal(app.element("settings-races").hidden, false);
+  const races = app.element("settings-races-list").children;
+  assert.equal(races.length, 2);
+  assert.match(races[0].textContent, /qwen-b \(winner\): 120 ms/);
+  assert.match(races[0].textContent, /qwen-a: failed \(http_5xx\)/);
+  assert.equal(races[0].children[1].children.length, 0, "Participant names stay inert text");
+  assert.match(races[1].textContent, /No replica answered/);
+  assert.equal(app.requests.at(-1).url, "/status/data", "Saving refreshes the alias table");
+  await reply(app.requests.at(-1), 200, {...snapshot(), routing, aliases: [
+    {name: "qwen-ha", kind: "ha", available: true, deployments: 2, advertised: true},
+    {name: "qwen-192-168-194-10", kind: "preferred", available: true, deployments: 2, advertised: false},
+  ]});
+  assert.match(app.element("aliases-body").textContent, /qwen-192-168-194-10Hidden from client model lists/);
+  assert.doesNotMatch(app.element("aliases-body").children[0].textContent, /Hidden/);
+  assert.equal(app.element("setting-race").disabled, false);
+
+  app.element("setting-race-every").value = "1";
+  app.element("setting-race-every").events.change();
+  assert.equal(app.settingsRequests.length, 1, "Out-of-range values are never sent");
+  assert.match(app.element("settings-message").textContent, /2 to 1000/);
+  assert.equal(app.element("setting-race-every").value, "5", "Inputs snap back to the saved value");
+  app.element("setting-race-every").value = "50";
+  app.element("setting-race-every").events.change();
+  const numberPost = app.settingsRequests.at(-1);
+  assert.deepEqual(JSON.parse(numberPost.options.body), {race_every: 50});
+  await reply(numberPost, 400, {error: "race_every must be a whole number from 2 to 1000."});
+  assert.match(app.element("settings-message").textContent, /rejected; nothing changed/);
+  assert.equal(app.element("setting-race-every").value, "5");
+  app.element("setting-prefer-fastest").checked = true;
+  app.element("setting-prefer-fastest").events.change();
+  await reply(app.settingsRequests.at(-1), 503, {error: "private /path/to/settings"});
+  assert.match(app.element("settings-message").textContent, /could not be saved/);
+  assert.doesNotMatch(app.element("settings-message").textContent, /private/);
+  assert.equal(app.element("setting-prefer-fastest").checked, false, "A failed save reverts the checkbox");
+  app.element("setting-prefer-fastest").checked = true;
+  app.element("setting-prefer-fastest").events.change();
+  app.settingsRequests.at(-1).reject(new Error("network lost"));
+  await flush();
+  assert.match(app.element("settings-message").textContent, /connection failed/);
+  assert.equal(app.element("setting-prefer-fastest").checked, false);
+  app.element("setting-race").checked = false;
+  app.element("setting-race").events.change();
+  await reply(app.settingsRequests.at(-1), 401, {});
+  assert.equal(app.element("details").hidden, true);
+  assert.equal(app.element("setting-race").disabled, true);
+  assert.equal(app.element("settings-races").hidden, true);
+  assert.match(app.element("settings-message").textContent, /Unlock backend details/);
+
+  const locked = harness();
+  locked.element("setting-race").checked = true;
+  locked.element("setting-race").events.change();
+  assert.equal(locked.settingsRequests.length, 0, "Locked pages cannot change routing");
+  const noKey = await unlocked(false);
+  assert.equal(noKey.element("setting-race").disabled, true);
+  assert.match(noKey.element("settings-message").textContent, /LLM_ROUTER_GATEWAY_API_KEY|does not report/);
+  const older = harness();
+  older.enterKey("secret-key");
+  const withoutRouting = snapshot();
+  delete withoutRouting.routing;
+  await reply(older.requests.at(-1), 200, withoutRouting);
+  assert.match(older.element("settings-message").textContent, /does not report routing settings/);
+  assert.equal(older.element("setting-race").disabled, true);
+  const storageProblem = harness();
+  storageProblem.enterKey("secret-key");
+  await reply(storageProblem.requests.at(-1), 200, {...snapshot(), routing: routingSnapshot({storage: {available: false, error: "Saved routing settings could not be read; defaults are in effect until the file is repaired."}})});
+  assert.match(storageProblem.element("settings-message").textContent, /defaults are in effect/);
+  assert.equal(storageProblem.element("setting-race").disabled, false, "Defaults can still be changed, which rewrites the file");
 }
 
 async function publicCachedSummary() {
@@ -1939,10 +2052,10 @@ async function updatesRequireExplicitAuthenticatedClick() {
     assert.doesNotMatch(app.element("update-message").textContent, /\d+%/);
   }
   app.expire(2000);
-  await reply(app.updateRequests.at(-1), 200, updateSnapshot({state: "succeeded", stage: "complete", run_id: "run-one", current_version: "0.3.5", updated_at: "2026-09-19T12:00:00Z"}));
+  await reply(app.updateRequests.at(-1), 200, updateSnapshot({state: "succeeded", stage: "complete", run_id: "run-one", current_version: "0.3.6", updated_at: "2026-09-19T12:00:00Z"}));
   assert.equal(app.element("update-progress").hidden, true);
   assert.match(app.element("update-message").textContent, /Update completed successfully/);
-  assert.match(app.element("update-observed").textContent, /0\.3\.5/);
+  assert.match(app.element("update-observed").textContent, /0\.3\.6/);
   assert.equal(app.requests.at(-1).url, "/status/data", "Confirmed completion refreshes installed version and router state");
   const count = app.updateRequests.length;
   app.expire(2000);
@@ -2147,7 +2260,7 @@ async function updateStatusValidationAndSafeRendering() {
 }
 
 (async () => {
-  for (const test of [publicReadiness, topbarVersionTracksCurrentSnapshot, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession, performanceIsPassiveAndPerDeployment, performanceUnknownZeroAndMissingTimings, performanceEmptyOlderAndUnavailableStorage, performanceEscapingAndPrivateStateClearing, performanceLateBodyAndNewSessionGuards, savedHostRoutingStatesAndSafeDetails, savedHostSaveEnrollmentAndRouterRefresh, savedHostSnapshotPollingIsAuthenticatedAndReadOnly, savedHostEnrollmentMutationRaceGuards, collapsiblePanelsAndSavedHostResults, trafficTilesChartAndWindows]) {
+  for (const test of [publicReadiness, topbarVersionTracksCurrentSnapshot, nonoverlapAndNetworkFailure, authenticationAndSafeRendering, lockLateResponsesAndRejectedKeys, keySwitchRace, timeoutAndPageRestore, safeRouterAndBackendLinks, selfTestIsExplicitAndIndependent, selfTestFailuresAndSafeRendering, selfTestPrivacyAndRaceGuards, selfTestAuthenticationFailure, savedHostLifecycle, savedHostsRestoreAndRequireAuthentication, savedHostFailuresAndSafeRendering, savedHostPrivacyAndRaceGuards, savedHostAuthRejectionAndTimeout, savedHostModelCatalogs, savedHostCatalogEmptyErrorTruncatedAndLegacy, savedHostCatalogEscapingAndValidation, savedHostCatalogStaleAndPrivate, publicCachedSummary, urlKeyBootstrapAndImmediateScrub, urlKeyInvalidAmbiguousAndCleanupFailure, urlKeyAuthenticationFailureAndPageRestore, liveFragmentKeyUnlockAndNavigation, liveFragmentKeyInvalidAndCleanupFailure, liveFragmentKeyCancelsOldSession, performanceIsPassiveAndPerDeployment, performanceUnknownZeroAndMissingTimings, performanceEmptyOlderAndUnavailableStorage, performanceEscapingAndPrivateStateClearing, performanceLateBodyAndNewSessionGuards, savedHostRoutingStatesAndSafeDetails, savedHostSaveEnrollmentAndRouterRefresh, savedHostSnapshotPollingIsAuthenticatedAndReadOnly, savedHostEnrollmentMutationRaceGuards, collapsiblePanelsAndSavedHostResults, trafficTilesChartAndWindows, routingSettingsCheckboxesAndRaces]) {
     await test();
     console.log(`PASS ${test.name}`);
   }

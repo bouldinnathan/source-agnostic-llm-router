@@ -55,6 +55,7 @@ def test_status_page_client_flows() -> None:
     assert "PASS savedHostEnrollmentMutationRaceGuards" in result.stdout
     assert "PASS collapsiblePanelsAndSavedHostResults" in result.stdout
     assert "PASS trafficTilesChartAndWindows" in result.stdout
+    assert "PASS routingSettingsCheckboxesAndRaces" in result.stdout
     assert "PASS updatesRequireExplicitAuthenticatedClick" in result.stdout
     assert "PASS updatesReconnectWithoutRepostingOrOldSuccess" in result.stdout
     assert "PASS updatesBusyFailuresAndBoundedWaiting" in result.stdout

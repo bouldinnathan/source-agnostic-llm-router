@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections import deque
+
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -36,6 +39,11 @@ class RuntimeRegistry:
         self.policy = policy
         self._states: dict[str, DeploymentState] = {}
         self._endpoint_states: dict[str, EndpointState] = {}
+        # Replica-race bookkeeping lives here so discovery refreshes, which
+        # replace the router object, do not reset the schedule or the history.
+        self.race_counters: dict[str, int] = {}
+        self.last_races: deque[dict[str, Any]] = deque(maxlen=5)
+        self.race_tasks: set[asyncio.Task[Any]] = set()
 
     def state(self, deployment: str) -> DeploymentState:
         return self._states.setdefault(deployment, DeploymentState())

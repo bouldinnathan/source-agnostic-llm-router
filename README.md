@@ -150,6 +150,13 @@ caveats instead of repeating them under every card. Each panel heading carries a
 live count, such as `2 of 3 online` or `82 requests · last 24 hours`, so a
 folded panel still tells you its state.
 
+The Fleet zone also has a **Routing settings** panel with three switches that
+save on the router the moment you change them and apply to new requests without
+a restart: **Advertise per-machine model names**, **Prefer the fastest replica**,
+and **Occasionally race all replicas** with its **Race every** interval. Recent
+races are listed under the switches. See
+[Fastest replica and replica races](#fastest-replica-and-replica-races).
+
 Enter the **router's** `LLM_ROUTER_GATEWAY_API_KEY` from `router.env` to unlock fleet
 details. This is not an LM Studio/provider token. A key entered in the password
 field is kept only in the page's memory, never added to URLs or browser storage,
@@ -598,7 +605,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.3.5-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.3.6-py3-none-any.whl
 llm-router --json discover
 ```
 
@@ -709,6 +716,40 @@ llm-router route --strategy priority --prefer local "Review this code"
 
 Priority labels may be `local`, `cloud`, a provider such as `ollama`, or a discovered source name. Explicit TOML models can set integer `priority` and `routing_weight`. Hard requirements such as `tool_use`, vision, context, and cost ceilings always take precedence over preferences.
 
+### Fastest replica and replica races
+
+Two switches on the status page's **Routing settings** panel tune how replicas of
+the same model are chosen. Both are off by default, persist in
+`~/.config/llm-router/routing-settings.json` (or `LLM_ROUTER_ROUTING_SETTINGS_FILE`)
+under the service account, and apply to new requests immediately.
+
+**Prefer the fastest replica** keeps the normal choice *between* models, then
+orders the chosen model's replicas by observed latency, lowest first. An explicit
+machine preference such as `qwen-golemframe` still wins. Observed latency comes
+from real requests in this process, so a replica that is never used keeps a
+stale figure; that is what the second switch is for.
+
+**Occasionally race all replicas** sends every Nth request for a model that has
+two or more available replicas to all of them at the same time. The first
+successful answer is returned to the client; the other replicas finish in the
+background and their latency and success are recorded like any other attempt, so
+every replica's numbers stay current. **Race every** sets N (2 to 1000, default
+20), counted per model. Raced requests cost one inference per replica, so keep N
+high on busy routers. Requests that name a machine (`…-machine` or
+`…-machine-nofailover`) are never raced, and a race counts as one client request
+in traffic totals. If every replica fails, the request falls through to the
+remaining candidates as usual. The race schedule and the last five race results
+survive discovery refreshes and are shown under the switches; they reset when the
+router process restarts.
+
+The settings API is `GET` and `POST /status/settings`. Both need the router
+Bearer key even on otherwise keyless gateways; `POST` additionally requires
+`X-LLM-Router-Settings: 1`, a same-origin browser request, and a JSON object with
+any of `advertise_machine_aliases`, `prefer_fastest_replica`, `race_replicas`, and
+`race_every`. Invalid values are rejected with HTTP 400 and nothing changes;
+a storage failure returns 503 and nothing changes. Detailed `/status/data`
+carries the same object under `routing`.
+
 ### Unified gateway and Home Assistant
 
 Set an inbound key and start the persistent gateway on an address Home Assistant can reach:
@@ -750,6 +791,15 @@ named `qwen` on machines `golemframe` and `pantheon`:
 | `qwen-pantheon` | Try Pantheon first when eligible, then matching replicas elsewhere. |
 | `qwen-golemframe-nofailover` | Only Golemframe may receive the request; return 503 if it cannot serve. |
 | `qwen-pantheon-nofailover` | Only Pantheon may receive the request; return 503 if it cannot serve. |
+
+Machine names come from `machine_id`, or from the saved address for automatically
+enrolled servers, so they can be IP addresses such as `qwen-192-168-194-10`. With
+several models on several machines the client picker gets long. The **Advertise
+per-machine model names** switch on the status page's Routing settings panel
+hides the `…-machine` and `…-machine-nofailover` names from `/api/tags` and
+`/v1/models`, leaving only the `auto` presets and the `…-ha` names. A hidden name
+still resolves when a client requests it, so existing Home Assistant entries keep
+working; the dashboard's Client model names table marks hidden names.
 
 The default group is the exact upstream model name, including its version/size tag.
 For example, `qwen3:14b` produces `qwen3-14b-ha`. Names are lowercased with punctuation

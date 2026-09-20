@@ -21,6 +21,8 @@ class Ranker:
     def __init__(self, config: RouterConfig, runtime: RuntimeRegistry) -> None:
         self.config = config
         self.runtime = runtime
+        # Dashboard switch: order replicas of the chosen model by observed latency.
+        self.prefer_fastest = False
 
     def rank(self, request: QueryRequest) -> RoutingDecision:
         strategy = request.strategy or self.config.policy.default_strategy
@@ -90,6 +92,8 @@ class Ranker:
         candidates.sort(key=lambda item: (-item.score, -item.model.quality, item.model.id))
         if self.config.policy.diversify_fallbacks:
             candidates = _diversify_endpoints(candidates)
+        if self.prefer_fastest:
+            candidates = _prefer_fastest_replicas(candidates)
         if request.preferred_endpoints:
             # A named machine is the first choice after hard constraints, even
             # when another replica has a better score. Preserve scoring within
@@ -193,6 +197,31 @@ def _inverse_utilities(values: dict[str, float | None]) -> dict[str, float]:
         if value is None:
             result[key] = 0.5
     return result
+
+
+def replica_group(model: ModelConfig) -> str:
+    return model.replica_group or model.upstream_model
+
+
+def _prefer_fastest_replicas(candidates: list[RouteCandidate]) -> list[RouteCandidate]:
+    """Keep the model choice, but try that model's replicas fastest-first.
+
+    Groups stay in the order their best-scored member earned; only the order
+    inside each group changes, so quality, capability, and cost decisions between
+    different models are untouched.
+    """
+    order: list[str] = []
+    groups: dict[str, list[RouteCandidate]] = {}
+    for item in candidates:
+        key = replica_group(item.model)
+        if key not in groups:
+            order.append(key)
+            groups[key] = []
+        groups[key].append(item)
+    ordered: list[RouteCandidate] = []
+    for key in order:
+        ordered.extend(sorted(groups[key], key=lambda item: (item.observed_latency_ms, -item.score, item.model.id)))
+    return ordered
 
 
 def _diversify_endpoints(candidates: list[RouteCandidate]) -> list[RouteCandidate]:

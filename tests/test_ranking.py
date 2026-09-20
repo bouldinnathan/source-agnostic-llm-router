@@ -153,3 +153,43 @@ def test_request_validation_rejects_invalid_limits() -> None:
 
     with pytest.raises(RequestError, match="non-negative"):
         QueryRequest.from_prompt("Hello", max_input_cost_per_million=-1)
+
+
+def _replica_config():
+    from dataclasses import replace
+
+    config = make_config(models=[
+        {"id": "qwen-a", "endpoint": "source-a", "upstream_model": "qwen", "quality": 0.9, "capabilities": {"general": 1.0}},
+        {"id": "qwen-b", "endpoint": "source-b", "upstream_model": "qwen", "quality": 0.9, "capabilities": {"general": 1.0}},
+        {"id": "big-a", "endpoint": "source-a", "upstream_model": "big", "quality": 0.99, "capabilities": {"general": 1.0}},
+    ])
+    return replace(config, endpoints={
+        name: replace(endpoint, machine_id=machine)
+        for (name, endpoint), machine in zip(config.endpoints.items(), ("golemframe", "pantheon"))
+    })
+
+
+def test_prefer_fastest_replica_reorders_only_within_a_replica_group() -> None:
+    from llm_router.routing_settings import RoutingSettings
+
+    router = LLMRouter(_replica_config())
+    for _ in range(3):
+        router.runtime.begin("qwen-a")
+        router.runtime.record_success("qwen-a", 900)
+        router.runtime.begin("qwen-b")
+        router.runtime.record_success("qwen-b", 120)
+    ha = QueryRequest.from_prompt("hello", allowed_deployments=("qwen-a", "qwen-b"), strategy="quality")
+    default_order = [item.model.id for item in router.route(ha).candidates]
+    router.settings = RoutingSettings(prefer_fastest_replica=True)
+    assert [item.model.id for item in router.route(ha).candidates] == ["qwen-b", "qwen-a"]
+    assert default_order[0] in {"qwen-a", "qwen-b"}
+
+    everything = QueryRequest.from_prompt("hello", strategy="quality")
+    ordered = [item.model.id for item in router.route(everything).candidates]
+    assert ordered[0] == "big-a", "The best-scoring model still wins across groups"
+    assert ordered.index("qwen-b") < ordered.index("qwen-a"), "Replicas of a model go fastest-first"
+
+    pinned = QueryRequest.from_prompt("hello", allowed_deployments=("qwen-a", "qwen-b"), preferred_endpoints=("source-a",))
+    assert router.route(pinned).candidates[0].model.id == "qwen-a", "An explicit machine preference still comes first"
+    router.settings = RoutingSettings()
+    assert [item.model.id for item in router.route(ha).candidates] == default_order
