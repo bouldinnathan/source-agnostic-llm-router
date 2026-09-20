@@ -66,7 +66,7 @@ class StaticGateway:
     def status(self):  # type: ignore[no-untyped-def]
         return {
             "status": "ready" if self._router else "unavailable",
-            "version": "0.3.8",
+            "version": "0.3.9",
         }
 
 
@@ -175,18 +175,38 @@ def test_home_assistant_float_context_window_is_accepted_as_integer() -> None:
     assert query.min_context_window == 8192 and type(query.min_context_window) is int
     assert query.max_tokens == 256 and type(query.max_tokens) is int
 
-    fractional = asyncio.run(request(app, "POST", "/api/chat", json={**body, "options": {"num_ctx": 8192.5}}))
-    assert fractional.status_code == 400
-    assert fractional.json()["error"] == "min_context_window must be a whole number; received the number 8192.5"
-    assert len(adapter.requests) == 1, "A rejected option never reaches a backend"
     for spelled in ("8192", "8192.0", " 8192 "):
         as_text = asyncio.run(request(app, "POST", "/api/chat", json={**body, "options": {"num_ctx": spelled}}))
         assert as_text.status_code == 200, as_text.text
         assert adapter.requests[-1].min_context_window == 8192 and type(adapter.requests[-1].min_context_window) is int
-    for bad, fragment in ((True, "boolean True"), ("eight thousand", "received the text 'eight thousand'"), ({"n": 1}, "received dict")):
-        rejected = asyncio.run(request(app, "POST", "/api/chat", json={**body, "options": {"num_ctx": bad}}))
-        assert rejected.status_code == 400, rejected.text
-        assert fragment in rejected.json()["error"]
+
+
+def test_unusable_client_tuning_values_are_ignored_not_fatal() -> None:
+    # The router corrects what it can and drops what it cannot; a conversation
+    # never fails over a tuning knob the client cannot fix.
+    router, adapter = make_gateway_router()
+    app = create_app(gateway=StaticGateway(router))
+    base = {"model": "auto", "stream": False, "messages": [{"role": "user", "content": "hi"}]}
+    for options in ({"num_ctx": 8192.5}, {"num_ctx": True}, {"num_ctx": "eight thousand"}, {"num_ctx": {"n": 1}}, {"num_ctx": 0}, {"num_ctx": -5}):
+        response = asyncio.run(request(app, "POST", "/api/chat", json={**base, "options": options}))
+        assert response.status_code == 200, (options, response.text)
+        assert adapter.requests[-1].min_context_window is None, options
+    for options in ({"num_predict": "lots"}, {"num_predict": 0}, {"num_predict": 2.5}):
+        response = asyncio.run(request(app, "POST", "/api/chat", json={**base, "options": options}))
+        assert response.status_code == 200, (options, response.text)
+        assert adapter.requests[-1].max_tokens == 2048, options
+    response = asyncio.run(request(app, "POST", "/api/chat", json={**base, "options": {"num_predict": "64", "temperature": "0.5"}}))
+    assert response.status_code == 200
+    assert adapter.requests[-1].max_tokens == 64 and adapter.requests[-1].temperature == 0.5
+    for temperature in ("warm", 5, -1, True, [0.5]):
+        response = asyncio.run(request(app, "POST", "/api/chat", json={**base, "options": {"temperature": temperature}}))
+        assert response.status_code == 200, (temperature, response.text)
+        assert adapter.requests[-1].temperature is None, temperature
+    openai = asyncio.run(request(app, "POST", "/v1/chat/completions", json={
+        "model": "auto", "messages": [{"role": "user", "content": "hi"}], "max_tokens": "many", "temperature": "hot",
+    }))
+    assert openai.status_code == 200, openai.text
+    assert adapter.requests[-1].max_tokens == 2048 and adapter.requests[-1].temperature is None
 
 
 def test_openai_float_max_tokens_is_accepted_as_integer() -> None:

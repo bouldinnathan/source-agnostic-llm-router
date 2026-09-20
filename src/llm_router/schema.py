@@ -126,8 +126,8 @@ class RouterConfig:
     source_path: str | None = None
 
 
-def _whole_number(name: str, value: Any) -> int | None:
-    """Return ``value`` as an int when it spells a whole number; otherwise raise."""
+def whole_number(name: str, value: Any) -> int | None:
+    """Return ``value`` as an int when it spells a whole number; otherwise raise RequestError."""
     if value is None:
         return None
     if isinstance(value, bool):
@@ -184,7 +184,7 @@ class QueryRequest:
         # non-finite, boolean, or non-numeric is rejected with a message that
         # names what arrived so the client side can be fixed.
         for name in ("max_tokens", "min_context_window"):
-            object.__setattr__(self, name, _whole_number(name, getattr(self, name)))
+            object.__setattr__(self, name, whole_number(name, getattr(self, name)))
         if self.max_tokens is None:
             raise RequestError("max_tokens must be a whole number")
         if self.max_tokens <= 0:

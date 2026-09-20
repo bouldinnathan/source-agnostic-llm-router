@@ -605,7 +605,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.3.8-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.3.9-py3-none-any.whl
 llm-router --json discover
 ```
 
@@ -771,11 +771,16 @@ A **Context window size** set in the Ollama integration arrives as a float such 
 `8192.0`, because Home Assistant's number selector stores whole numbers that way.
 The router treats integral floats in `num_ctx`, `num_predict`, and `max_tokens` as
 the integers they denote; fractional or non-finite values are still rejected with
-HTTP 400. Routers before 0.3.5 rejected the float outright, which Home Assistant
-logged as `min_context_window must be an integer (status code: 400)`. Since 0.3.8 a
-whole number spelled as text, such as `"8192"`, is accepted too, and a rejection
-names what arrived, for example `min_context_window must be a whole number;
-received the text 'eight'`, so the client setting can be corrected. Since 0.3.7
+HTTP 400 by the Python API. Routers before 0.3.5 rejected the float outright,
+which Home Assistant logged as `min_context_window must be an integer (status
+code: 400)`. Since 0.3.8 a whole number spelled as text, such as `"8192"`, is
+accepted too. Since 0.3.9 the gateway goes further for every client: an optional
+tuning value it cannot use, whether a fractional or negative context window, a
+token limit that is not a positive whole number, or a temperature outside 0 to 2,
+is **ignored and the request proceeds** with the router's default, because a
+conversation is worth more than a knob the client may be unable to change. Only
+callers of the Python `QueryRequest` API still get strict validation, whose
+message names what arrived. Since 0.3.7
 the requested context window is also forwarded to Ollama backends as `num_ctx`,
 so the value you set in Home Assistant is the context the model actually runs
 with, exactly as when Home Assistant talks to Ollama directly. Before that it

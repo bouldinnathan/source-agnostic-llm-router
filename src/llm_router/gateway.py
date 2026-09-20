@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import time
@@ -36,14 +37,14 @@ from .routing_settings import FIELDS as ROUTING_SETTING_FIELDS, RoutingSettings,
 from .provisioning import OllamaProvisioner, ProvisioningReport, ProvisioningSettings
 from .public_status import public_summary
 from .router import LLMRouter
-from .schema import QueryRequest, RoutedCompletion, RouterConfig
+from .schema import QueryRequest, RoutedCompletion, RouterConfig, whole_number
 from .saved_hosts import SavedHostStore, check_saved_host
 from .saved_discovery import is_saved_endpoint, merge_saved_discovery, saved_hosts_report
 from .self_test import run_backend_checks
 from .status_page import STATUS_CSS, STATUS_JS, render_status_html
 from .update_control import UpdateController, UpdateRequestError
 
-VERSION = "0.3.8"
+VERSION = "0.3.9"
 SAVED_HOST_REFRESH_SECONDS = 30.0
 SAVED_HOST_CHECK_COOLDOWN_SECONDS = 3.0
 VIRTUAL_MODELS: dict[str, str] = {
@@ -1434,6 +1435,28 @@ async def _gateway_self_test_checks(
     return checks
 
 
+def _usable_whole_number(value: Any, *, default: int | None) -> int | None:
+    """A positive whole number in any spelling, or ``default`` when unusable."""
+    if value is None:
+        return default
+    try:
+        number = whole_number("value", value)
+    except RequestError:
+        return default
+    return number if number is not None and number > 0 else default
+
+
+def _usable_temperature(value: Any) -> float | None:
+    """A temperature from 0 to 2 in any spelling, or ``None`` when unusable."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value.strip() if isinstance(value, str) else value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and 0 <= number <= 2 else None
+
+
 def _query_request(
     body: Mapping[str, Any],
     messages: list[Any],
@@ -1452,12 +1475,14 @@ def _query_request(
     options = body.get("options", {}) if ollama else {}
     if not isinstance(options, Mapping):
         raise ValueError("options must be an object")
-    max_tokens = (
-        options.get("num_predict", 2048)
-        if ollama
-        else body.get("max_completion_tokens", body.get("max_tokens", 2048))
+    # Optional tuning values are corrected, never fatal: a client such as Home
+    # Assistant cannot always control how it stores them, and a conversation is
+    # worth more than a knob. Unusable values fall back to the defaults below.
+    max_tokens = _usable_whole_number(
+        options.get("num_predict") if ollama else body.get("max_completion_tokens", body.get("max_tokens")),
+        default=2048,
     )
-    temperature = options.get("temperature") if ollama else body.get("temperature")
+    temperature = _usable_temperature(options.get("temperature") if ollama else body.get("temperature"))
     response_format: Mapping[str, Any] | None = None
     format_value = body.get("format") if ollama else body.get("response_format")
     if format_value == "json":
@@ -1483,7 +1508,7 @@ def _query_request(
         required.append("reasoning")
     if _messages_have_images(messages):
         required.append("vision")
-    min_context_window = options.get("num_ctx") if ollama else None
+    min_context_window = _usable_whole_number(options.get("num_ctx"), default=None) if ollama else None
     return QueryRequest(
         messages=tuple(dict(message) for message in messages),
         required_capabilities=tuple(required),
