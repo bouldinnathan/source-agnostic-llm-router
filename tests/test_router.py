@@ -106,6 +106,17 @@ def test_success_updates_health_and_latency() -> None:
     assert state.latency_ewma_ms is not None
 
 
+@pytest.mark.parametrize("field,value", [("max_tokens", 16.0), ("min_context_window", 8192.0)])
+def test_integral_floats_normalize_to_integers(field: str, value: float) -> None:
+    from llm_router.errors import RequestError
+
+    query = QueryRequest.from_prompt("hello", **{field: value})
+    assert getattr(query, field) == int(value) and type(getattr(query, field)) is int
+    for bad in (value + 0.5, float("nan"), float("inf"), True, "8192"):
+        with pytest.raises(RequestError):
+            QueryRequest.from_prompt("hello", **{field: bad})
+
+
 def _traffic(router: LLMRouter) -> dict:
     snapshot = router.metrics.snapshot()
     assert snapshot["available"] is True, snapshot

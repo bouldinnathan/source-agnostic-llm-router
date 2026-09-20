@@ -598,7 +598,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.3.4-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.3.5-py3-none-any.whl
 llm-router --json discover
 ```
 
@@ -725,6 +725,13 @@ In Home Assistant, use its [official Ollama integration](https://www.home-assist
 3. Enter `LLM_ROUTER_GATEWAY_API_KEY` as the API key.
 4. Add a Conversation or AI Task entry and select model `auto`.
 5. When enabling Home Assistant control, expose only the intended entities. Requests containing Assist tools automatically require a tool-capable deployment.
+
+A **Context window size** set in the Ollama integration arrives as a float such as
+`8192.0`, because Home Assistant's number selector stores whole numbers that way.
+The router treats integral floats in `num_ctx`, `num_predict`, and `max_tokens` as
+the integers they denote; fractional or non-finite values are still rejected with
+HTTP 400. Routers before 0.3.5 rejected the float outright, which Home Assistant
+logged as `min_context_window must be an integer (status code: 400)`.
 
 Home Assistant sees virtual models: the `auto` presets plus model-specific HA, preferred-machine, and machine-only aliases described below. It does not need to know whether an answer came from Ollama, another LAN host, or a cloud provider. Response `router` metadata identifies the actual deployment for diagnostics. Use the Ollama path because Home Assistant's [official OpenAI integration](https://www.home-assistant.io/integrations/openai_conversation) intentionally accepts only the official OpenAI endpoint.
 

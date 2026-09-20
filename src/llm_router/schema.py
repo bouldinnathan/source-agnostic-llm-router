@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Mapping, Sequence
 
 from .errors import RequestError
@@ -151,6 +152,13 @@ class QueryRequest:
             raise RequestError("messages must not be empty")
         if not all(isinstance(message, Mapping) for message in self.messages):
             raise RequestError("every message must be an object")
+        # JSON clients such as Home Assistant's number selector send whole
+        # numbers as floats (8192.0). Treat an integral float as the integer it
+        # denotes; anything fractional or non-finite still fails below.
+        for name in ("max_tokens", "min_context_window"):
+            value = getattr(self, name)
+            if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+                object.__setattr__(self, name, int(value))
         if isinstance(self.max_tokens, bool) or not isinstance(self.max_tokens, int):
             raise RequestError("max_tokens must be an integer")
         if self.max_tokens <= 0:

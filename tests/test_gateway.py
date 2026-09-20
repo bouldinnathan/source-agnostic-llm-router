@@ -66,7 +66,7 @@ class StaticGateway:
     def status(self):  # type: ignore[no-untyped-def]
         return {
             "status": "ready" if self._router else "unavailable",
-            "version": "0.3.4",
+            "version": "0.3.5",
         }
 
 
@@ -155,6 +155,42 @@ def test_ollama_chat_preserves_home_assistant_tools_non_streaming() -> None:
     assert function == {"name": "HassTurnOn", "arguments": {"name": "Kitchen"}}
     assert payload["router"]["deployment"] == "tool-model"
     assert adapter.requests[0].required_capabilities == ("tool_use",)
+
+
+def test_home_assistant_float_context_window_is_accepted_as_integer() -> None:
+    # Home Assistant's number selector stores whole numbers as floats, so its
+    # Ollama integration sends {"options": {"num_ctx": 8192.0}}.
+    router, adapter = make_gateway_router()
+    app = create_app(gateway=StaticGateway(router))
+    body = {
+        "model": "auto", "stream": False,
+        "messages": [{"role": "user", "content": "hi"}],
+        "options": {"num_ctx": 8192.0, "num_predict": 256.0},
+    }
+
+    response = asyncio.run(request(app, "POST", "/api/chat", json=body))
+
+    assert response.status_code == 200, response.text
+    query = adapter.requests[0]
+    assert query.min_context_window == 8192 and type(query.min_context_window) is int
+    assert query.max_tokens == 256 and type(query.max_tokens) is int
+
+    fractional = asyncio.run(request(app, "POST", "/api/chat", json={**body, "options": {"num_ctx": 8192.5}}))
+    assert fractional.status_code == 400
+    assert "min_context_window must be an integer" in fractional.json()["error"]
+    assert len(adapter.requests) == 1, "A rejected option never reaches a backend"
+
+
+def test_openai_float_max_tokens_is_accepted_as_integer() -> None:
+    router, adapter = make_gateway_router()
+    app = create_app(gateway=StaticGateway(router))
+
+    response = asyncio.run(request(app, "POST", "/v1/chat/completions", json={
+        "model": "auto", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 64.0,
+    }))
+
+    assert response.status_code == 200, response.text
+    assert adapter.requests[0].max_tokens == 64 and type(adapter.requests[0].max_tokens) is int
 
 
 def test_ollama_chat_returns_valid_ndjson_stream() -> None:

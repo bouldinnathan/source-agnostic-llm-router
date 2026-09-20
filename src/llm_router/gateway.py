@@ -42,7 +42,7 @@ from .self_test import run_backend_checks
 from .status_page import STATUS_CSS, STATUS_JS, render_status_html
 from .update_control import UpdateController, UpdateRequestError
 
-VERSION = "0.3.4"
+VERSION = "0.3.5"
 SAVED_HOST_REFRESH_SECONDS = 30.0
 SAVED_HOST_CHECK_COOLDOWN_SECONDS = 3.0
 VIRTUAL_MODELS: dict[str, str] = {
