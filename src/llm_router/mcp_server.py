@@ -26,7 +26,7 @@ def create_server(config_path: str | None = None, *, discovery: bool = True) -> 
 
     server = MCPServer(
         "llm-router",
-        version="0.3.7",
+        version="0.3.8",
         instructions=(
             "Use route_llm_query to compare deployments without sending data upstream. "
             "Use ask_best_llm only when the user wants the query sent to an external model. "

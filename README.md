@@ -605,7 +605,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.3.7-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.3.8-py3-none-any.whl
 llm-router --json discover
 ```
 
@@ -772,7 +772,10 @@ A **Context window size** set in the Ollama integration arrives as a float such 
 The router treats integral floats in `num_ctx`, `num_predict`, and `max_tokens` as
 the integers they denote; fractional or non-finite values are still rejected with
 HTTP 400. Routers before 0.3.5 rejected the float outright, which Home Assistant
-logged as `min_context_window must be an integer (status code: 400)`. Since 0.3.7
+logged as `min_context_window must be an integer (status code: 400)`. Since 0.3.8 a
+whole number spelled as text, such as `"8192"`, is accepted too, and a rejection
+names what arrived, for example `min_context_window must be a whole number;
+received the text 'eight'`, so the client setting can be corrected. Since 0.3.7
 the requested context window is also forwarded to Ollama backends as `num_ctx`,
 so the value you set in Home Assistant is the context the model actually runs
 with, exactly as when Home Assistant talks to Ollama directly. Before that it
@@ -809,7 +812,15 @@ The default group is the exact upstream model name, including its version/size t
 For example, `qwen3:14b` produces `qwen3-14b-ha`. Names are lowercased with punctuation
 converted to hyphens. Distinct names are never merged just because their aliases
 look alike: ambiguous aliases are omitted and reported under `alias_conflicts` in
-`/router/status`.
+`/router/status` and `/status/data`, and the status page's Client model names panel
+explains which names were left out. This is the usual reason a model that appears
+under Model deployments has no client name: for example `nemotron-3.5-lightning:30b`
+on Ollama and `nemotron-3.5-lightning-30b` on LM Studio both shorten to
+`nemotron-3-5-lightning-30b`, so the shared `nemotron-3-5-lightning-30b-ha` name is
+dropped for both. Their per-machine names survive, but those are exactly the names
+that **Advertise per-machine model names** hides when it is off, so the model can
+vanish from client pickers entirely. Give one side a `replica_group` to declare the
+two equivalent, or change one name, and the HA name returns.
 
 Set `replica_group = "qwen"` on explicit model entries to use a short group name or
 map equivalent models that Ollama and LM Studio advertise under different names.

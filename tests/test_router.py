@@ -112,8 +112,10 @@ def test_integral_floats_normalize_to_integers(field: str, value: float) -> None
 
     query = QueryRequest.from_prompt("hello", **{field: value})
     assert getattr(query, field) == int(value) and type(getattr(query, field)) is int
-    for bad in (value + 0.5, float("nan"), float("inf"), True, "8192"):
-        with pytest.raises(RequestError):
+    for spelled in (str(int(value)), f"{int(value)}.0", f" {int(value)} "):
+        assert getattr(QueryRequest.from_prompt("hello", **{field: spelled}), field) == int(value)
+    for bad in (value + 0.5, float("nan"), float("inf"), True, "eight", "", "1e3", "0x10", [8192]):
+        with pytest.raises(RequestError, match="must be a whole number"):
             QueryRequest.from_prompt("hello", **{field: bad})
 
 

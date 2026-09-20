@@ -43,7 +43,7 @@ from .self_test import run_backend_checks
 from .status_page import STATUS_CSS, STATUS_JS, render_status_html
 from .update_control import UpdateController, UpdateRequestError
 
-VERSION = "0.3.7"
+VERSION = "0.3.8"
 SAVED_HOST_REFRESH_SECONDS = 30.0
 SAVED_HOST_CHECK_COOLDOWN_SECONDS = 3.0
 VIRTUAL_MODELS: dict[str, str] = {
@@ -465,6 +465,7 @@ class RouterGateway:
             "endpoints": sorted(endpoints, key=lambda endpoint: (endpoint["machine"], endpoint["name"])),
             "models": sorted(models, key=lambda model: (model["name"], model["machine"], model["deployment"])),
             "aliases": aliases,
+            "alias_conflicts": [] if router is None else list(alias_conflicts(router.config)),
             "routing": self.routing_status(),
         }
 

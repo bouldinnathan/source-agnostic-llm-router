@@ -126,6 +126,32 @@ class RouterConfig:
     source_path: str | None = None
 
 
+def _whole_number(name: str, value: Any) -> int | None:
+    """Return ``value`` as an int when it spells a whole number; otherwise raise."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise RequestError(f"{name} must be a whole number; received the boolean {value}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            return int(value)
+        raise RequestError(f"{name} must be a whole number; received the number {value!r}")
+    if isinstance(value, str):
+        text = value.strip()
+        if len(text) <= 32:
+            try:
+                number = float(text)
+            except ValueError:
+                number = math.nan
+            if math.isfinite(number) and number.is_integer() and text.lstrip("+-").replace(".", "", 1).isdigit():
+                return int(number)
+        shown = text if len(text) <= 32 else text[:32] + "…"
+        raise RequestError(f"{name} must be a whole number; received the text {shown!r}")
+    raise RequestError(f"{name} must be a whole number; received {type(value).__name__}")
+
+
 @dataclass(frozen=True, slots=True)
 class QueryRequest:
     """A provider-neutral chat request plus routing constraints."""
@@ -152,24 +178,19 @@ class QueryRequest:
             raise RequestError("messages must not be empty")
         if not all(isinstance(message, Mapping) for message in self.messages):
             raise RequestError("every message must be an object")
-        # JSON clients such as Home Assistant's number selector send whole
-        # numbers as floats (8192.0). Treat an integral float as the integer it
-        # denotes; anything fractional or non-finite still fails below.
+        # JSON clients send whole numbers in several spellings: Home Assistant's
+        # number selector stores 8192.0, and some stored settings arrive as the
+        # text "8192". Accept any spelling of a whole number; anything fractional,
+        # non-finite, boolean, or non-numeric is rejected with a message that
+        # names what arrived so the client side can be fixed.
         for name in ("max_tokens", "min_context_window"):
-            value = getattr(self, name)
-            if isinstance(value, float) and math.isfinite(value) and value.is_integer():
-                object.__setattr__(self, name, int(value))
-        if isinstance(self.max_tokens, bool) or not isinstance(self.max_tokens, int):
-            raise RequestError("max_tokens must be an integer")
+            object.__setattr__(self, name, _whole_number(name, getattr(self, name)))
+        if self.max_tokens is None:
+            raise RequestError("max_tokens must be a whole number")
         if self.max_tokens <= 0:
             raise RequestError("max_tokens must be greater than zero")
-        if self.min_context_window is not None:
-            if isinstance(self.min_context_window, bool) or not isinstance(
-                self.min_context_window, int
-            ):
-                raise RequestError("min_context_window must be an integer")
-            if self.min_context_window <= 0:
-                raise RequestError("min_context_window must be greater than zero")
+        if self.min_context_window is not None and self.min_context_window <= 0:
+            raise RequestError("min_context_window must be greater than zero")
         for name, value in (
             ("max_input_cost_per_million", self.max_input_cost_per_million),
             ("max_output_cost_per_million", self.max_output_cost_per_million),

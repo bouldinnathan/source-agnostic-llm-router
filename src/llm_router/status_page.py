@@ -181,6 +181,7 @@ _STATUS_HTML = """<!doctype html>
       <details id="aliases-panel" class="card" open>
         <summary class="card-summary"><h2 id="aliases-title">Client model names <span class="card-summary-meta" id="aliases-meta"></span></h2></summary>
         <div class="card-intro"><p class="muted">HA shares replicas; preferred tries one machine first; pinned never fails over.</p></div>
+        <p id="alias-conflicts" class="alias-conflicts" role="status" hidden></p>
         <div class="table-scroll"><table><caption class="sr-only">High availability and machine-specific aliases</caption>
           <thead><tr><th scope="col">Alias</th><th scope="col">Routing</th><th scope="col">Status</th><th scope="col">Deployments</th></tr></thead>
           <tbody id="aliases-body"></tbody>
@@ -315,6 +316,7 @@ main{max-width:1400px;margin:auto;padding:38px 24px 24px}.heading,.section-headi
 .traffic-chart-wrap{padding:0 22px 18px}.traffic-chart-heading{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:8px 16px;margin-bottom:8px}.traffic-chart-heading h3{font-size:13px;margin:0}.chart-legend{display:flex;gap:16px;list-style:none;margin:0;padding:0;font-size:12px;color:var(--muted)}.chart-legend li{display:flex;align-items:center;gap:6px}.swatch{width:10px;height:10px;border-radius:2px;display:inline-block}.swatch-ok{background:var(--chart-ok)}.swatch-failed{background:var(--chart-failed)}
 .traffic-chart svg{display:block;width:100%;height:auto}.traffic-chart .bar-ok{fill:var(--chart-ok)}.traffic-chart .bar-failed{fill:var(--chart-failed)}.traffic-chart .axis{stroke:#cbd5e1;stroke-width:1}.traffic-chart .grid{stroke:var(--track);stroke-width:1}.traffic-chart text{font-size:11px;fill:var(--muted);font-family:inherit}.traffic-chart .hit{fill:transparent}.traffic-chart g:hover .hit{fill:rgba(20,37,61,.06)}.traffic-chart .chart-empty{font-size:12px}
 .traffic-table{margin-top:10px}.traffic-table .table-scroll{margin-top:8px}.traffic-table th,.traffic-table td{padding:8px 12px}.traffic-table td{font-variant-numeric:tabular-nums}
+.alias-conflicts{padding:0 22px 16px;font-size:13px;color:var(--amber);overflow-wrap:anywhere}
 .settings-form{display:grid;gap:12px;margin-top:12px}.setting{display:grid;grid-template-columns:auto 1fr;gap:10px 12px;align-items:start;font-size:14px;cursor:pointer}.setting input[type="checkbox"]{width:18px;height:18px;margin:2px 0 0}.setting strong{display:block;font-weight:600}.setting .muted{display:block;margin-top:2px}.setting-number{grid-template-columns:auto auto 1fr;align-items:center}.setting-number input{width:96px;padding:6px 10px}.settings-races{margin-top:16px;padding-top:12px;border-top:1px solid var(--line)}.settings-races h3{font-size:13px;margin-bottom:6px}.settings-races ul{margin:0;padding-left:18px;font-size:13px;display:grid;gap:6px}#settings-message.result-fail{color:var(--red)}#settings-message.result-pass{color:var(--green)}#settings-message.result-warning{color:var(--amber)}
 @media(max-width:500px){.setting-number{grid-template-columns:1fr}}
 .about-body dl{margin:0;display:grid;grid-template-columns:minmax(140px,190px) 1fr;gap:10px 18px;font-size:13px}.about-body dt{font-weight:600}.about-body dd{margin:0;color:var(--muted)}
@@ -489,6 +491,8 @@ STATUS_JS = r"""
     for (const id of ["endpoints-body", "models-body", "aliases-body"]) el(id).replaceChildren();
     for (const id of ["count-endpoints", "count-online", "count-models", "count-aliases", "uptime", "last-discovery"]) text(id, "—");
     for (const id of ["backends-meta", "models-meta", "aliases-meta"]) meta(id, "");
+    el("alias-conflicts").hidden = true;
+    text("alias-conflicts", "");
     text("version", "");
     el("setup-help").hidden = true;
   }
@@ -1445,6 +1449,11 @@ STATUS_JS = r"""
       cell(row, count(item.active_requests));
       cell(row, `${count(item.successes)} / ${count(item.failures)}`);
     });
+    const conflicts = Array.isArray(data.alias_conflicts) ? data.alias_conflicts.filter(name => typeof name === "string" && name.length > 0 && name.length <= 256).slice(0, 50) : [];
+    el("alias-conflicts").hidden = conflicts.length === 0;
+    text("alias-conflicts", conflicts.length
+      ? `${conflicts.length} generated name${conflicts.length === 1 ? " was" : "s were"} left out because two different models or machines would share ${conflicts.length === 1 ? "it" : "them"}: ${conflicts.join(", ")}. Those models stay routable through the auto presets. Give one side a distinct replica_group or machine_id to get the names back.`
+      : "");
     const kinds = {ha: "High availability", preferred: "Preferred + failover", pinned: "Pinned · no failover"};
     rows("aliases-body", data.aliases, 4, "No HA or machine aliases are available yet.", (row, item) => {
       cell(row, item.name, item.advertised === false ? "Hidden from client model lists" : null);

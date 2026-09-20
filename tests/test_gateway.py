@@ -66,7 +66,7 @@ class StaticGateway:
     def status(self):  # type: ignore[no-untyped-def]
         return {
             "status": "ready" if self._router else "unavailable",
-            "version": "0.3.7",
+            "version": "0.3.8",
         }
 
 
@@ -177,8 +177,16 @@ def test_home_assistant_float_context_window_is_accepted_as_integer() -> None:
 
     fractional = asyncio.run(request(app, "POST", "/api/chat", json={**body, "options": {"num_ctx": 8192.5}}))
     assert fractional.status_code == 400
-    assert "min_context_window must be an integer" in fractional.json()["error"]
+    assert fractional.json()["error"] == "min_context_window must be a whole number; received the number 8192.5"
     assert len(adapter.requests) == 1, "A rejected option never reaches a backend"
+    for spelled in ("8192", "8192.0", " 8192 "):
+        as_text = asyncio.run(request(app, "POST", "/api/chat", json={**body, "options": {"num_ctx": spelled}}))
+        assert as_text.status_code == 200, as_text.text
+        assert adapter.requests[-1].min_context_window == 8192 and type(adapter.requests[-1].min_context_window) is int
+    for bad, fragment in ((True, "boolean True"), ("eight thousand", "received the text 'eight thousand'"), ({"n": 1}, "received dict")):
+        rejected = asyncio.run(request(app, "POST", "/api/chat", json={**body, "options": {"num_ctx": bad}}))
+        assert rejected.status_code == 400, rejected.text
+        assert fragment in rejected.json()["error"]
 
 
 def test_openai_float_max_tokens_is_accepted_as_integer() -> None:

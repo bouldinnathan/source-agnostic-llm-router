@@ -496,3 +496,25 @@ def test_browser_never_persists_api_keys_and_bootstraps_url_keys_into_headers() 
     assert "replaceState" in script.text
     for forbidden in ("localStorage", "sessionStorage", "document.cookie", "?token="):
         assert forbidden not in script.text
+
+
+def test_dashboard_reports_omitted_ambiguous_aliases() -> None:
+    config = config_from_mapping({
+        "endpoints": {
+            "ollama-a": {"adapter": "ollama-chat", "base_url": "http://a.invalid:11434", "machine_id": "golemframe"},
+            "studio-b": {"adapter": "openai-compatible", "base_url": "http://b.invalid:1234/v1", "machine_id": "pantheon"},
+        },
+        "models": [
+            {"id": "lightning-a", "endpoint": "ollama-a", "upstream_model": "nemotron-3.5-lightning:30b"},
+            {"id": "lightning-b", "endpoint": "studio-b", "upstream_model": "nemotron-3.5-lightning-30b"},
+        ],
+    })
+    gateway = RouterGateway(discovery=False)
+    gateway._router = LLMRouter(config)
+    payload = asyncio.run(request(create_app(gateway=gateway), "/status/data")).json()
+
+    names = {row["name"] for row in payload["aliases"]}
+    assert payload["alias_conflicts"] == ["nemotron-3-5-lightning-30b-ha"]
+    assert "nemotron-3-5-lightning-30b-ha" not in names, "The shared HA name is dropped for both sides"
+    assert {"nemotron-3-5-lightning-30b-golemframe-nofailover", "nemotron-3-5-lightning-30b-pantheon-nofailover"} <= names
+    assert payload["counts"]["models"] == 2, "Both deployments still exist and route through auto"
