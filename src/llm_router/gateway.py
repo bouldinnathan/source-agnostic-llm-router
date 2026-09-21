@@ -45,8 +45,12 @@ from .saved_discovery import is_saved_endpoint, merge_saved_discovery, saved_hos
 from .self_test import run_backend_checks
 from .status_page import STATUS_CSS, STATUS_JS, render_status_html
 from .update_control import UpdateController, UpdateRequestError
+from .wire import (
+    AnthropicRelay, ResponsesRelay, anthropic_completion, anthropic_error, anthropic_query_fields,
+    anthropic_session_hint, anthropic_token_estimate, responses_completion, responses_error, responses_query_fields,
+)
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 # A streaming client hears from the router at least this often while a backend
 # is silent (loading a model, evaluating a long prompt), so idle-connection
 # timeouts in proxies and client libraries do not cut a slow start short.
@@ -1370,6 +1374,103 @@ def create_app(
             _record_failure(service, "openai", model, exc, 500)
             return _openai_error(_safe_exception(exc), 500, "internal_error")
 
+    async def anthropic_messages(request: Request) -> Response:
+        """Anthropic Messages API for Claude Code and other Anthropic SDK clients."""
+        denied = _authorize(request, anthropic=True)
+        if denied:
+            return denied
+        model = "unknown"
+        try:
+            body = await _json_body(request)
+            model = str(body.get("model", "auto"))
+            router = await service.router()
+            strategy, alias = _resolve_model(router, model)
+            fields = anthropic_query_fields(body)
+            query = QueryRequest(
+                **fields, strategy=strategy, preferred_tags=VIRTUAL_PREFERRED_TAGS.get(model, ()),
+                session_key=anthropic_session_hint(body) or _session_key(request, model, list(fields["messages"])),
+            )
+            if alias is not None:
+                query = alias.apply(query)
+            finished = _track(service)
+            try:
+                if body.get("stream", False):
+                    return await _relay(
+                        request, service, "anthropic", model, router.complete_stream(query), AnthropicRelay(model), finished,
+                    )
+                completion = await router.complete(query)
+            finally:
+                if not body.get("stream", False):
+                    finished()
+            return JSONResponse(anthropic_completion(model, completion))
+        except (ValueError, RequestError) as exc:
+            _record_failure(service, "anthropic", model, exc, 400)
+            unknown_model = isinstance(exc, ValueError) and "unknown virtual model" in str(exc)
+            return _anthropic_error(str(exc), 404 if unknown_model else 400, "not_found_error" if unknown_model else "invalid_request_error")
+        except (GatewayUnavailable, AllModelsFailed, NoEligibleModel) as exc:
+            _record_failure(service, "anthropic", model, exc, 503)
+            return _anthropic_error(str(exc), 503, "overloaded_error")
+        except RouterError as exc:
+            _record_failure(service, "anthropic", model, exc, 502)
+            return _anthropic_error(str(exc), 502, "api_error")
+        except Exception as exc:
+            _record_failure(service, "anthropic", model, exc, 500)
+            return _anthropic_error(_safe_exception(exc), 500, "api_error")
+
+    async def anthropic_count_tokens(request: Request) -> Response:
+        denied = _authorize(request, anthropic=True)
+        if denied:
+            return denied
+        try:
+            body = await _json_body(request)
+        except ValueError as exc:
+            return _anthropic_error(str(exc), 400, "invalid_request_error")
+        # Local backends do not count tokens for us; a character-based estimate
+        # keeps clients that budget their context working.
+        return JSONResponse({"input_tokens": anthropic_token_estimate(body)})
+
+    async def openai_responses(request: Request) -> Response:
+        """OpenAI Responses API for Codex and other Responses clients."""
+        denied = _authorize(request, openai=True)
+        if denied:
+            return denied
+        model = "unknown"
+        try:
+            body = await _json_body(request)
+            model = str(body.get("model", "auto"))
+            router = await service.router()
+            strategy, alias = _resolve_model(router, model)
+            fields = responses_query_fields(body)
+            query = QueryRequest(
+                **fields, strategy=strategy, preferred_tags=VIRTUAL_PREFERRED_TAGS.get(model, ()),
+                session_key=_session_key(request, model, list(fields["messages"])),
+            )
+            if alias is not None:
+                query = alias.apply(query)
+            finished = _track(service)
+            try:
+                if body.get("stream", False):
+                    return await _relay(
+                        request, service, "responses", model, router.complete_stream(query), ResponsesRelay(model), finished,
+                    )
+                completion = await router.complete(query)
+            finally:
+                if not body.get("stream", False):
+                    finished()
+            return JSONResponse(responses_completion(model, completion))
+        except (ValueError, RequestError) as exc:
+            _record_failure(service, "responses", model, exc, 400)
+            return JSONResponse(responses_error(str(exc), "invalid_request_error"), status_code=400)
+        except (GatewayUnavailable, AllModelsFailed, NoEligibleModel) as exc:
+            _record_failure(service, "responses", model, exc, 503)
+            return JSONResponse(responses_error(str(exc), "router_unavailable"), status_code=503)
+        except RouterError as exc:
+            _record_failure(service, "responses", model, exc, 502)
+            return JSONResponse(responses_error(str(exc), "upstream_error"), status_code=502)
+        except Exception as exc:
+            _record_failure(service, "responses", model, exc, 500)
+            return JSONResponse(responses_error(_safe_exception(exc), "internal_error"), status_code=500)
+
     routes = [
         Route("/", root, methods=["GET"]),
         Route("/status", status_page, methods=["GET"]),
@@ -1397,6 +1498,9 @@ def create_app(
         Route("/api/chat", ollama_chat, methods=["POST"]),
         Route("/v1/models", openai_models, methods=["GET"]),
         Route("/v1/chat/completions", openai_chat, methods=["POST"]),
+        Route("/v1/responses", openai_responses, methods=["POST"]),
+        Route("/v1/messages", anthropic_messages, methods=["POST"]),
+        Route("/v1/messages/count_tokens", anthropic_count_tokens, methods=["POST"]),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)
     app.add_middleware(RedactStatusQueryKey)
@@ -2153,17 +2257,25 @@ def _usage(usage: Mapping[str, Any]) -> dict[str, int]:
     }
 
 
-def _authorize(request: Request, *, openai: bool = False) -> Response | None:
+def _authorize(request: Request, *, openai: bool = False, anthropic: bool = False) -> Response | None:
     expected = os.environ.get("LLM_ROUTER_GATEWAY_API_KEY")
     if not expected:
         return None
     authorization = request.headers.get("authorization", "")
     supplied = authorization[7:] if authorization.lower().startswith("bearer ") else ""
+    if not supplied and anthropic:
+        supplied = request.headers.get("x-api-key", "")  # Anthropic SDKs send the key this way
     if supplied and hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
         return None
+    if anthropic:
+        return _anthropic_error("Invalid or missing gateway API key", 401, "authentication_error")
     if openai:
         return _openai_error("Invalid or missing gateway API key", 401, "authentication_error")
     return _ollama_error("Invalid or missing gateway API key", 401)
+
+
+def _anthropic_error(message: str, status: int, error_type: str) -> JSONResponse:
+    return JSONResponse(anthropic_error(message, error_type), status_code=status)
 
 
 def _ollama_error(message: str, status: int) -> JSONResponse:

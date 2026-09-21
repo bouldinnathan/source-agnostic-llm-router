@@ -69,7 +69,7 @@ class StaticGateway:
     def status(self):  # type: ignore[no-untyped-def]
         return {
             "status": "ready" if self._router else "unavailable",
-            "version": "0.6.0",
+            "version": "0.7.0",
         }
 
 
@@ -768,3 +768,178 @@ def test_in_flight_answers_are_counted_until_they_finish(monkeypatch) -> None:
     response = asyncio.run(request(app, "POST", "/api/chat", json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]}))
     assert response.status_code == 503 or response.status_code == 200  # a failing/slow adapter either way releases
     assert gateway.in_flight == 0
+
+
+def _anthropic_events(text: str) -> list[tuple[str, dict]]:
+    events: list[tuple[str, dict]] = []
+    event = None
+    for line in text.splitlines():
+        if line.startswith("event:"):
+            event = line[6:].strip()
+        elif line.startswith("data:") and event:
+            events.append((event, json.loads(line[5:].strip())))
+    return events
+
+
+def test_anthropic_messages_translate_tool_rounds_and_answers_in_anthropic_shape() -> None:
+    router, adapter = make_gateway_router()
+    app = create_app(gateway=StaticGateway(router))
+    body = {
+        "model": "auto", "max_tokens": 512, "temperature": 0.3,
+        "system": [{"type": "text", "text": "You control a house."}],
+        "metadata": {"user_id": "user_abc_session_123"},
+        "tools": [{"name": "HassTurnOn", "description": "Turn on", "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}}}],
+        "messages": [
+            {"role": "user", "content": "Turn on the kitchen light"},
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm"}, {"type": "text", "text": "Sure."}, {"type": "tool_use", "id": "toolu_1", "name": "HassTurnOn", "input": {"name": "Kitchen"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "done"}]}, {"type": "text", "text": "thanks, and the hall"}]},
+        ],
+    }
+    response = asyncio.run(request(app, "POST", "/v1/messages", json=body))
+    assert response.status_code == 200, response.text
+    query = adapter.requests[-1]
+    roles = [message["role"] for message in query.messages]
+    assert roles == ["system", "user", "assistant", "tool", "user"]
+    assert query.messages[0]["content"] == "You control a house."
+    assert query.messages[2]["tool_calls"][0]["function"] == {"name": "HassTurnOn", "arguments": {"name": "Kitchen"}}
+    assert query.messages[3] == {"role": "tool", "tool_call_id": "toolu_1", "content": "done"}
+    assert query.tools[0]["function"]["parameters"]["properties"]["name"]["type"] == "string"
+    assert query.max_tokens == 512 and query.max_tokens_specified and query.temperature == 0.3
+    assert "tool_use" in query.required_capabilities
+    assert query.session_key is not None and query.session_key.startswith("anthropic:") and "session_123" not in query.session_key
+    payload = response.json()
+    assert payload["type"] == "message" and payload["role"] == "assistant" and payload["model"] == "auto"
+    assert payload["stop_reason"] == "tool_use"
+    assert payload["content"][0] == {"type": "tool_use", "id": "call_light", "name": "HassTurnOn", "input": {"name": "Kitchen"}}
+    assert payload["usage"] == {"input_tokens": 10, "output_tokens": 4}
+    assert payload["router"]["deployment"] == "tool-model"
+
+    missing_limit = asyncio.run(request(app, "POST", "/v1/messages", json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]}))
+    assert missing_limit.status_code == 400 and missing_limit.json()["error"]["type"] == "invalid_request_error"
+    unknown = asyncio.run(request(app, "POST", "/v1/messages", json={"model": "claude-nope", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}))
+    assert unknown.status_code == 404 and unknown.json()["error"]["type"] == "not_found_error"
+    estimate = asyncio.run(request(app, "POST", "/v1/messages/count_tokens", json={"model": "auto", "messages": [{"role": "user", "content": "x" * 400}]}))
+    assert estimate.status_code == 200 and 80 <= estimate.json()["input_tokens"] <= 130
+
+
+def test_anthropic_streaming_uses_message_events_pings_and_tool_use_blocks(monkeypatch) -> None:
+    import llm_router.gateway as gateway_module
+
+    monkeypatch.setattr(gateway_module, "STREAM_HEARTBEAT_SECONDS", 0.02)
+    adapter = StreamingAdapter(pieces=("Hel", "lo"), first_token_delay=0.08, thinking="hmm", tool_calls=(
+        {"id": "toolu_9", "type": "function", "function": {"name": "HassTurnOn", "arguments": {"name": "Kitchen"}}},
+    ))
+    app, gateway = make_streaming_app(adapter)
+    body = {"model": "auto", "max_tokens": 100, "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+    response = asyncio.run(request(app, "POST", "/v1/messages", json=body))
+    assert response.status_code == 200 and response.headers["content-type"].startswith("text/event-stream")
+    events = _anthropic_events(response.text)
+    names = [name for name, _ in events]
+    assert names[0] == "message_start" and events[0][1]["message"]["role"] == "assistant"
+    assert "ping" in names, "Silence before the first token is covered by ping events"
+    assert names[-2:] == ["message_delta", "message_stop"]
+    blocks = [(payload["index"], payload["content_block"]["type"]) for name, payload in events if name == "content_block_start"]
+    assert blocks == [(0, "thinking"), (1, "text"), (2, "tool_use")]
+    text = "".join(payload["delta"]["text"] for name, payload in events if name == "content_block_delta" and payload["delta"]["type"] == "text_delta")
+    assert text == "Hello"
+    thinking = [payload["delta"]["thinking"] for name, payload in events if name == "content_block_delta" and payload["delta"]["type"] == "thinking_delta"]
+    assert thinking == ["hmm"]
+    tool_json = "".join(payload["delta"]["partial_json"] for name, payload in events if name == "content_block_delta" and payload["delta"]["type"] == "input_json_delta")
+    assert json.loads(tool_json) == {"name": "Kitchen"}
+    stops = [payload["index"] for name, payload in events if name == "content_block_stop"]
+    assert stops == [0, 1, 2], "Every block is closed"
+    assert events[-2][1]["delta"]["stop_reason"] == "tool_use" and events[-2][1]["usage"]["output_tokens"] == 2
+
+    app, gateway = make_streaming_app(StreamingAdapter(pieces=("Hel", "lo"), fail_after=1))
+    response = asyncio.run(request(app, "POST", "/v1/messages", json=body))
+    events = _anthropic_events(response.text)
+    assert events[-1][0] == "error" and events[-1][1]["error"]["type"] == "api_error" and "backend went away" in events[-1][1]["error"]["message"]
+    assert gateway.failures[-1]["api"] == "anthropic" and gateway.failures[-1]["kind"] == "stream_interrupted"
+
+
+def test_anthropic_clients_authenticate_with_x_api_key(monkeypatch) -> None:
+    monkeypatch.setenv("LLM_ROUTER_GATEWAY_API_KEY", "router-key")
+    router, _ = make_gateway_router()
+    app = create_app(gateway=StaticGateway(router))
+    body = {"model": "auto", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]}
+    denied = asyncio.run(request(app, "POST", "/v1/messages", json=body, headers={"x-api-key": "wrong"}))
+    assert denied.status_code == 401 and denied.json() == {"type": "error", "error": {"type": "authentication_error", "message": "Invalid or missing gateway API key"}}
+    assert asyncio.run(request(app, "POST", "/v1/messages", json=body, headers={"x-api-key": "router-key"})).status_code == 200
+    assert asyncio.run(request(app, "POST", "/v1/messages", json=body, headers={"authorization": "Bearer router-key"})).status_code == 200
+    assert asyncio.run(request(app, "POST", "/v1/chat/completions", json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]}, headers={"x-api-key": "router-key"})).status_code == 401, "Only the Anthropic surface reads x-api-key"
+
+
+def test_openai_responses_translate_items_and_flat_tools_and_answer_in_responses_shape() -> None:
+    router, adapter = make_gateway_router()
+    app = create_app(gateway=StaticGateway(router))
+    body = {
+        "model": "auto", "instructions": "You are Codex.", "max_output_tokens": 300, "store": False,
+        "tools": [{"type": "function", "name": "shell", "description": "Run", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}}, {"type": "web_search_preview"}],
+        "text": {"format": {"type": "json_schema", "name": "plan", "schema": {"type": "object"}, "strict": True}},
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "list files"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{\"cmd\": \"ls\"}"},
+            {"type": "function_call", "call_id": "call_2", "name": "shell", "arguments": "{\"cmd\": \"pwd\"}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "a.txt"},
+            {"type": "function_call_output", "call_id": "call_2", "output": "/home"},
+            {"role": "user", "content": "now turn on the light"},
+        ],
+    }
+    response = asyncio.run(request(app, "POST", "/v1/responses", json=body))
+    assert response.status_code == 200, response.text
+    query = adapter.requests[-1]
+    assert [message["role"] for message in query.messages] == ["system", "user", "assistant", "tool", "tool", "user"]
+    assert query.messages[0]["content"] == "You are Codex."
+    assert [call["function"]["arguments"] for call in query.messages[2]["tool_calls"]] == [{"cmd": "ls"}, {"cmd": "pwd"}], "Parallel calls share one assistant turn"
+    assert query.messages[3] == {"role": "tool", "tool_call_id": "call_1", "content": "a.txt"}
+    assert [tool["function"]["name"] for tool in query.tools] == ["shell"], "Only function tools reach a backend"
+    assert query.response_format == {"type": "json_schema", "json_schema": {"name": "plan", "schema": {"type": "object"}, "strict": True}}
+    assert query.max_tokens == 300 and query.max_tokens_specified
+    payload = response.json()
+    assert payload["object"] == "response" and payload["status"] == "completed" and payload["model"] == "auto"
+    call = payload["output"][-1]
+    assert call["type"] == "function_call" and call["call_id"] == "call_light" and call["name"] == "HassTurnOn"
+    assert json.loads(call["arguments"]) == {"name": "Kitchen"}
+    assert payload["usage"] == {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14, "input_tokens_details": {"cached_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 0}}
+
+    chained = asyncio.run(request(app, "POST", "/v1/responses", json={"model": "auto", "input": "hi", "previous_response_id": "resp_old"}))
+    assert chained.status_code == 400 and "previous_response_id" in chained.json()["error"]["message"]
+
+
+def test_openai_responses_streaming_emits_the_event_sequence_codex_expects(monkeypatch) -> None:
+    import llm_router.gateway as gateway_module
+
+    monkeypatch.setattr(gateway_module, "STREAM_HEARTBEAT_SECONDS", 0.02)
+    adapter = StreamingAdapter(pieces=("Hi", " there"), first_token_delay=0.08, thinking="hmm", tool_calls=(
+        {"id": "call_7", "type": "function", "function": {"name": "shell", "arguments": {"cmd": "ls"}}},
+    ))
+    app, gateway = make_streaming_app(adapter)
+    body = {"model": "auto", "stream": True, "input": "hi"}
+    response = asyncio.run(request(app, "POST", "/v1/responses", json=body))
+    assert response.status_code == 200
+    comments, _ = _sse_events(response.text)
+    assert comments, "Silence is covered by keep-alive comments"
+    events = _anthropic_events(response.text)
+    names = [name for name, _ in events]
+    assert names[:2] == ["response.created", "response.in_progress"]
+    assert names.index("response.output_item.added") < names.index("response.output_text.delta")
+    deltas = "".join(payload["delta"] for name, payload in events if name == "response.output_text.delta")
+    assert deltas == "Hi there"
+    assert "hmm" not in response.text, "Reasoning is not relayed to Responses clients"
+    done = next(payload for name, payload in events if name == "response.output_item.done" and payload["item"]["type"] == "message")
+    assert done["item"]["content"][0]["text"] == "Hi there" and done["item"]["status"] == "completed"
+    call_done = next(payload for name, payload in events if name == "response.output_item.done" and payload["item"]["type"] == "function_call")
+    assert call_done["item"]["call_id"] == "call_7" and json.loads(call_done["item"]["arguments"]) == {"cmd": "ls"}
+    assert "response.function_call_arguments.done" in names
+    completed = events[-1]
+    assert completed[0] == "response.completed" and completed[1]["response"]["status"] == "completed"
+    assert completed[1]["response"]["usage"]["total_tokens"] == 5
+    assert [item["type"] for item in completed[1]["response"]["output"]] == ["message", "function_call"]
+    sequence = [payload["sequence_number"] for _, payload in events]
+    assert sequence == sorted(sequence) and len(set(sequence)) == len(sequence)
+
+    app, gateway = make_streaming_app(StreamingAdapter(pieces=("Hi", " there"), fail_after=1))
+    response = asyncio.run(request(app, "POST", "/v1/responses", json=body))
+    events = _anthropic_events(response.text)
+    assert events[-1][0] == "error" and events[-1][1]["code"] == "stream_interrupted"
+    assert gateway.failures[-1]["api"] == "responses"

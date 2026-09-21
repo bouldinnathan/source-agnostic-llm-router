@@ -634,7 +634,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.6.0-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.7.0-py3-none-any.whl
 llm-router --json discover
 ```
 
@@ -929,7 +929,49 @@ Home Assistant streams its answers from the Ollama API, so it now receives
 tokens as the model produces them and hears a heartbeat every 15 seconds while
 a model loads or a long entity list is evaluated. Home Assistant sees virtual models: the `auto` presets plus model-specific HA, preferred-machine, and machine-only aliases described below. It does not need to know whether an answer came from Ollama, another LAN host, or a cloud provider. Response `router` metadata identifies the actual deployment for diagnostics. Use the Ollama path because Home Assistant's [official OpenAI integration](https://www.home-assistant.io/integrations/openai_conversation) intentionally accepts only the official OpenAI endpoint.
 
-The gateway also serves OpenAI-compatible `GET /v1/models` and `POST /v1/chat/completions`, plus health and diagnostics at `/healthz` and authenticated `/router/status`.
+The gateway also serves OpenAI-compatible `GET /v1/models` and `POST /v1/chat/completions`, the OpenAI Responses API at `POST /v1/responses`, the Anthropic Messages API at `POST /v1/messages` (with `POST /v1/messages/count_tokens`), plus health and diagnostics at `/healthz` and authenticated `/router/status`.
+
+### Agent clients: Claude Code, Codex, Hermes, OpenClaw and others
+
+Every client dialect reaches every backend. The router translates each inbound
+API into its neutral request, so a Claude Code session, a Codex session, and a
+Home Assistant conversation can all be served by the same Ollama or LM Studio
+models, with the same aliases, failover, streaming, heartbeats, session
+affinity, and traffic accounting.
+
+- **Anthropic Messages API** (`POST /v1/messages`): used by Claude Code and
+  the Anthropic SDKs. Point Claude Code at the router with
+  `ANTHROPIC_BASE_URL=http://router-host:8088`, set `ANTHROPIC_API_KEY` (or
+  `ANTHROPIC_AUTH_TOKEN`) to the router key, and name a router alias in
+  `ANTHROPIC_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL`. The router accepts the
+  key as `x-api-key` or as a Bearer token. System prompts, text and image
+  blocks, `tool_use` and `tool_result` blocks, `tools` with `input_schema`,
+  `max_tokens` (required, as in the real API), `temperature`, and `thinking`
+  are translated; streaming answers use the real event sequence
+  (`message_start`, content blocks with `text_delta`, `thinking_delta` and
+  `input_json_delta`, `message_delta`, `message_stop`) with `ping` events
+  during silences. Claude Code's per-session `metadata.user_id` drives
+  session affinity. `count_tokens` returns a character-based estimate, since
+  local backends do not count tokens for the router.
+- **OpenAI Responses API** (`POST /v1/responses`): used by Codex. In
+  `~/.codex/config.toml` add a provider with `base_url =
+  "http://router-host:8088/v1"` and `wire_api = "responses"`, select it with
+  `model_provider`, and set `model` to a router alias. `instructions`, message
+  items with `input_text`/`output_text`/`input_image` parts, `function_call`
+  and `function_call_output` items, flat function `tools`, `max_output_tokens`,
+  `text.format` and `reasoning.effort` are translated; other tool types are
+  dropped, `previous_response_id` is rejected (send the whole conversation, as
+  Codex does with `store = false`), and reasoning is not relayed back because
+  Responses clients expect signed summaries. Streaming answers use the real
+  event sequence (`response.created` through `response.completed`, with
+  `output_text` deltas and `function_call_arguments` events) and keep-alive
+  comments during silences.
+- **Chat Completions and Ollama**: everything else, including Hermes,
+  OpenClaw, Open WebUI and Home Assistant, as described above.
+
+All four surfaces share the router key, the model aliases, and **Recent failed
+requests** on the status page, where the API column shows which dialect a
+failed request used.
 
 ### Model replicas, preferred machines, and HA
 
