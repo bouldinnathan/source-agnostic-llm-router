@@ -617,7 +617,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.4.0-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.5.0-py3-none-any.whl
 llm-router --json discover
 ```
 
@@ -745,16 +745,18 @@ which is what a voice assistant feels as the pause before it starts speaking.
 
 **Occasionally race all replicas** sends every Nth request for a model that has
 two or more available replicas to all of them at the same time. The first
-successful answer is returned to the client; the other replicas finish in the
-background and their latency and success are recorded like any other attempt, so
-every replica's numbers stay current. **Race every** sets N (2 to 1000, default
-20), counted per model. Raced requests cost one inference per replica, so keep N
-high on busy routers. Requests that name a machine (`…-machine` or
-`…-machine-nofailover`) are never raced, and a race counts as one client request
-in traffic totals. If every replica fails, the request falls through to the
-remaining candidates as usual. The race schedule and the last five race results
-survive discovery refreshes and are shown under the switches; they reset when the
-router process restarts.
+replica to produce a token answers the client. Each other replica is stopped as
+soon as its own first token has been timed, so a race refreshes every replica's
+time to first token for the price of one prompt evaluation each and never
+generates a long answer twice. Turn on **Rank the fastest replica by first
+token** to let those measurements steer replica choice; total answer time is
+only measured on the replica that actually serves. **Race every** sets N (2 to
+1000, default 20), counted per model. Requests that name a machine (`…-machine`
+or `…-machine-nofailover`) are never raced, and a race counts as one client
+request in traffic totals. If every replica fails before its first token, the
+request falls through to the remaining candidates as usual. The race schedule
+and the last five race results survive discovery refreshes and are shown under
+the switches; they reset when the router process restarts.
 
 The settings API is `GET` and `POST /status/settings`. Both need the router
 Bearer key even on otherwise keyless gateways; `POST` additionally requires
@@ -768,13 +770,33 @@ carries the same object under `routing`.
 ### Streaming, silences, and long-running requests
 
 The router always asks Ollama and OpenAI-compatible backends for a **token
-stream** (`stream: true`) and folds the chunks back into one answer, including
-tool calls whose arguments arrive in fragments. The client still receives a
-single reply, as before. Streaming changes what a timeout means: a backend that
-is still producing tokens is never cut off for taking long overall, only for
-going silent. A backend or proxy that ignores `stream` and answers in one piece
-is accepted as well; set `options.stream = false` on an endpoint to ask for
-that explicitly.
+stream** (`stream: true`). A client that asked for a stream itself (Ollama's
+`/api/chat` streams by default; OpenAI's `stream: true`) receives each fragment
+as the backend produces it, in its own API's chunk format, with tool calls
+delivered whole at the end once their fragmented arguments have been
+reassembled. A client that asked for one JSON answer gets the folded result
+when the backend finishes, as before. Streaming changes what a timeout means:
+a backend that is still producing tokens is never cut off for taking long
+overall, only for going silent. A backend or proxy that ignores `stream` and
+answers in one piece is accepted as well; set `options.stream = false` on an
+endpoint to ask for that explicitly.
+
+While a backend is silent before its first token, a streaming client hears a
+**heartbeat** from the router every 15 seconds: an empty Ollama chunk or an SSE
+comment line, both of which clients ignore. That keeps reverse proxies and
+client libraries with idle-connection timeouts from giving up during a model
+load or a long prompt evaluation. The response itself starts with the first
+fragment or the first heartbeat, whichever comes first, so a request that fails
+at once (an unknown model name, a backend the router already knows is down)
+still gets a real HTTP error status. Failing over is only possible before
+anything has been sent: a backend that dies part-way through a streamed answer
+cannot be replaced without repeating text the client already has, so the
+failure is reported in the stream (`{"error": …}` for Ollama clients, an
+`error` event for OpenAI clients) and listed under **Recent failed requests**
+as *Stream interrupted*. Buffered requests keep failing over at any point,
+since nothing has reached the client. When a streaming client hangs up, the
+router closes the backend connection, which makes Ollama and LM Studio stop
+generating.
 
 Three limits on the **Routing settings** panel govern silences, and none of
 them caps a working answer by default:
@@ -794,9 +816,9 @@ first token within 300 s", "no token for 90 s during generation", or "exceeded
 the request cap") and fails over like any other failure. Ollama's `keep_alive`
 and `think` request fields are forwarded to Ollama backends when a client sends
 usable values, so Home Assistant's `keep_alive: -1` keeps its model loaded.
-Multi-day agent jobs are fine as long as their own client waits; the router
-holds no state for a stream across a restart, so a request in flight during a
-router update fails and the client must retry it.
+Multi-day agent jobs are fine as long as their own client keeps reading; the
+router holds no state for a stream across a restart, so a request in flight
+during a router update fails and the client must retry it.
 
 ### Unified gateway and Home Assistant
 
@@ -855,7 +877,9 @@ Home Assistant system log: Home Assistant groups repeated failures under the
 first traceback it recorded, so an old `min_context_window` message can stay on
 screen for days while the current failures are `No eligible model` or timeouts.
 
-Home Assistant sees virtual models: the `auto` presets plus model-specific HA, preferred-machine, and machine-only aliases described below. It does not need to know whether an answer came from Ollama, another LAN host, or a cloud provider. Response `router` metadata identifies the actual deployment for diagnostics. Use the Ollama path because Home Assistant's [official OpenAI integration](https://www.home-assistant.io/integrations/openai_conversation) intentionally accepts only the official OpenAI endpoint.
+Home Assistant streams its answers from the Ollama API, so it now receives
+tokens as the model produces them and hears a heartbeat every 15 seconds while
+a model loads or a long entity list is evaluated. Home Assistant sees virtual models: the `auto` presets plus model-specific HA, preferred-machine, and machine-only aliases described below. It does not need to know whether an answer came from Ollama, another LAN host, or a cloud provider. Response `router` metadata identifies the actual deployment for diagnostics. Use the Ollama path because Home Assistant's [official OpenAI integration](https://www.home-assistant.io/integrations/openai_conversation) intentionally accepts only the official OpenAI endpoint.
 
 The gateway also serves OpenAI-compatible `GET /v1/models` and `POST /v1/chat/completions`, plus health and diagnostics at `/healthz` and authenticated `/router/status`.
 
@@ -980,8 +1004,8 @@ Health timestamps and errors appear under `/router/status`; `/readyz` returns 50
 when no enabled deployment is currently usable. Backend HA still requires a surviving
 eligible replica within the configured retry budget and the client's timeout. The
 gateway itself needs separate redundancy if its host must also tolerate failure.
-Backend answers are streamed into the router and delivered to the client in one
-piece once complete.
+Streaming clients receive fragments as they are generated; a failure after the
+first fragment is reported in the stream rather than failed over.
 
 ### CLI routing
 

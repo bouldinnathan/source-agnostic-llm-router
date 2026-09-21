@@ -86,6 +86,19 @@ class RuntimeRegistry:
             else:
                 state.first_token_ewma_ms = alpha * first_token_ms + (1 - alpha) * state.first_token_ewma_ms
 
+    def record_first_token(self, deployment: str, first_token_ms: float) -> None:
+        """Note a first-token time for an attempt that was stopped on purpose.
+
+        A race loser is closed once it has produced its first token, so it has
+        no total latency and counts as neither a success nor a failure.
+        """
+        state = self.state(deployment)
+        alpha = self.policy.latency_ewma_alpha
+        if state.first_token_ewma_ms is None:
+            state.first_token_ewma_ms = first_token_ms
+        else:
+            state.first_token_ewma_ms = alpha * first_token_ms + (1 - alpha) * state.first_token_ewma_ms
+
     def record_failure(self, deployment: str, reason: str) -> None:
         state = self.state(deployment)
         state.active_requests = max(0, state.active_requests - 1)

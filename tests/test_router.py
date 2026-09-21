@@ -384,3 +384,144 @@ def test_attempts_carry_the_configured_stream_timeouts_and_record_first_token(tm
     assert STREAM_TIMEOUTS.get().first_token == 300, "The context variable is reset after each attempt"
     row = router.metrics.snapshot()["deployments"][0]
     assert row["metrics"]["first_token_ms"]["latest"] == 42.5
+
+
+class StreamingFake:
+    """Replica fake whose answers arrive as fragments, with per-endpoint timing and failures."""
+
+    def __init__(self, plans: dict[str, dict]) -> None:
+        self.plans = plans
+        self.calls: list[str] = []
+        self.closed: list[str] = []
+
+    async def complete(self, endpoint, model, request):  # type: ignore[no-untyped-def]
+        from llm_router.adapters.base import final_result
+        return await final_result(self.stream(endpoint, model, request))
+
+    async def stream(self, endpoint, model, request):  # type: ignore[no-untyped-def]
+        from llm_router.adapters.base import StreamDelta
+
+        plan = self.plans.get(endpoint.name, {})
+        self.calls.append(endpoint.name)
+        pieces = plan.get("pieces", ("Hel", "lo"))
+        try:
+            await asyncio.sleep(plan.get("first_token_delay", 0.0))
+            for index, piece in enumerate(pieces):
+                if plan.get("fail_after") == index:
+                    raise UpstreamError("backend went away", kind="connection")
+                yield StreamDelta(text=piece, first_token_ms=1.0 if index == 0 else None)
+                await asyncio.sleep(plan.get("piece_delay", 0.0))
+            yield UpstreamResult(text="".join(pieces), usage={"prompt_eval_count": 4, "eval_count": len(pieces)}, finish_reason="stop")
+        finally:
+            self.closed.append(endpoint.name)
+
+
+def test_complete_stream_relays_fragments_then_the_completion() -> None:
+    from llm_router.routing_settings import RoutingSettings
+    from llm_router.schema import RoutedCompletion
+
+    adapter = StreamingFake({"source-a": {"pieces": ("Hel", "lo")}})
+    router = _replica_router(adapter, RoutingSettings())
+
+    async def scenario():
+        events = []
+        async for event in router.complete_stream(QueryRequest.from_prompt("hi")):
+            events.append(event)
+        return events
+
+    events = asyncio.run(scenario())
+    assert [event.text for event in events[:-1]] == ["Hel", "lo"]
+    completion = events[-1]
+    assert isinstance(completion, RoutedCompletion) and completion.text == "Hello"
+    assert completion.attempts[-1]["first_token_ms"] == 1.0
+    assert router.runtime.state(completion.deployment).first_token_ewma_ms == 1.0
+    assert _traffic(router)["requests_ok"] == 1
+
+
+def test_failure_after_a_relayed_fragment_interrupts_instead_of_retrying() -> None:
+    from llm_router.errors import StreamInterrupted
+    from llm_router.routing_settings import RoutingSettings
+
+    plans = {"source-a": {"pieces": ("Hel", "lo"), "fail_after": 1}, "source-b": {"pieces": ("Bon", "jour")}}
+    prompt = QueryRequest.from_prompt("hi")
+
+    async def relayed():
+        adapter = StreamingFake(plans)
+        router = _replica_router(adapter, RoutingSettings())
+        seen = []
+        with pytest.raises(StreamInterrupted) as failure:
+            async for event in router.complete_stream(prompt):
+                seen.append(event.text)
+        assert seen == ["Hel"], "The fragment already sent cannot be taken back, so no retry follows"
+        assert failure.value.sent == 3 and failure.value.failure.kind == "connection"
+        assert "3 characters" in str(failure.value)
+        assert adapter.calls == ["source-a"]
+        traffic = _traffic(router)
+        assert traffic["requests_failed"] == 1 and traffic["failures"] == {"connection": 1}
+
+    asyncio.run(relayed())
+
+    async def buffered():
+        adapter = StreamingFake(plans)
+        router = _replica_router(adapter, RoutingSettings())
+        completion = await router.complete(prompt)
+        assert completion.text == "Bonjour", "Nothing had reached the client, so the request failed over"
+        assert adapter.calls == ["source-a", "source-b"]
+        assert [attempt["success"] for attempt in completion.attempts] == [False, True]
+        assert _traffic(router)["reroutes_ok"] == 1
+
+    asyncio.run(buffered())
+
+
+def test_races_are_decided_by_first_token_and_losers_stop_after_theirs() -> None:
+    plans = {
+        "source-a": {"first_token_delay": 0.06, "pieces": ("fast", " finish")},
+        "source-b": {"first_token_delay": 0.01, "pieces": ("slow", " but", " first"), "piece_delay": 0.04},
+    }
+    adapter = StreamingFake(plans)
+    router = _replica_router(adapter)
+    prompt = QueryRequest.from_prompt("hello")
+
+    async def scenario():
+        await router.complete(prompt)
+        adapter.calls.clear()
+        adapter.closed.clear()
+        before = router.runtime.state("qwen-a").successes
+        seen = []
+        async for event in router.complete_stream(prompt):
+            seen.append(event)
+        completion = seen[-1]
+        assert completion.deployment == "qwen-b", "The replica whose first token came first is relayed"
+        assert [event.text for event in seen[:-1]] == ["slow", " but", " first"]
+        assert sorted(adapter.calls) == ["source-a", "source-b"]
+        await _settle(router)
+        assert sorted(adapter.closed) == ["source-a", "source-b"]
+        race = router.runtime.last_races[0]
+        assert race["winner"] == "qwen-b"
+        loser = race["participants"]["qwen-a"]
+        assert loser["stopped"] is True and loser["first_token_ms"] == 1.0 and loser["latency_ms"] is None
+        assert router.runtime.state("qwen-a").first_token_ewma_ms == 1.0
+        assert router.runtime.state("qwen-a").successes == before and router.runtime.state("qwen-a").failures == 0, "A stopped loser is neither a success nor a failure"
+        assert router.runtime.state("qwen-a").active_requests == 0
+        assert _traffic(router)["requests_ok"] == 2
+
+    asyncio.run(scenario())
+
+
+def test_closing_the_stream_early_stops_the_backend_and_records_nothing() -> None:
+    from llm_router.routing_settings import RoutingSettings
+
+    adapter = StreamingFake({"source-a": {"pieces": ("Hel", "lo"), "piece_delay": 0.5}})
+    router = _replica_router(adapter, RoutingSettings())
+
+    async def scenario():
+        stream = router.complete_stream(QueryRequest.from_prompt("hi"))
+        first = await stream.__anext__()
+        assert first.text == "Hel"
+        await stream.aclose()
+        assert adapter.closed == ["source-a"], "Hanging up closes the backend stream"
+        assert router.runtime.state("qwen-a").active_requests == 0
+        assert router.runtime.state("qwen-a").successes == 0 and router.runtime.state("qwen-a").failures == 0
+        assert _traffic(router)["requests_ok"] == 0 and _traffic(router)["requests_failed"] == 0
+
+    asyncio.run(scenario())

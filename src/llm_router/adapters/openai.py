@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from contextlib import aclosing
+from typing import Any, AsyncIterator, Mapping
 
 from ..errors import UpstreamError
 from ..schema import EndpointConfig, ModelConfig, QueryRequest, UpstreamResult
 from .base import (
     FIRST_TOKEN_KEY,
     BaseHTTPAdapter,
+    StreamDelta,
+    final_result,
     merge_payload,
     message_text,
     neutral_tool_calls,
@@ -25,6 +28,14 @@ class OpenAIChatAdapter(BaseHTTPAdapter):
         model: ModelConfig,
         request: QueryRequest,
     ) -> UpstreamResult:
+        return await final_result(self.stream(endpoint, model, request))
+
+    async def stream(
+        self,
+        endpoint: EndpointConfig,
+        model: ModelConfig,
+        request: QueryRequest,
+    ) -> AsyncIterator[StreamDelta | UpstreamResult]:
         body: dict[str, Any] = {
             "model": model.upstream_model,
             "messages": openai_messages(request.messages),
@@ -43,13 +54,17 @@ class OpenAIChatAdapter(BaseHTTPAdapter):
             if endpoint.options.get("stream_usage", True) is not False:
                 body["stream_options"] = {"include_usage": True}
         payload = merge_payload(request.extra_body, body)
-        data = dict(await self.post_json(
-            endpoint,
-            str(endpoint.options.get("path", "/chat/completions")),
-            payload,
-            default_headers={"Content-Type": "application/json"},
-            stream_format="openai-sse" if streaming else None,
-        ))
+        path = str(endpoint.options.get("path", "/chat/completions"))
+        headers = {"Content-Type": "application/json"}
+        if not streaming:
+            yield self._result(dict(await self.post_json(endpoint, path, payload, default_headers=headers)))
+            return
+        async with aclosing(self.stream_json(endpoint, path, payload, default_headers=headers, stream_format="openai-sse")) as items:
+            async for item in items:
+                yield item if isinstance(item, StreamDelta) else self._result(dict(item))
+
+    @staticmethod
+    def _result(data: dict[str, Any]) -> UpstreamResult:
         first_token_ms = data.pop(FIRST_TOKEN_KEY, None)
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):

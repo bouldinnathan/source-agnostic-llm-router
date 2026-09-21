@@ -26,10 +26,11 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from .adapters.base import StreamDelta
 from .bootstrap import BootstrapResult, bootstrap_router, load_optional_config
 from .aliases import ModelAlias, alias_conflicts, build_aliases
 from .discovery import DiscoveryReport, DiscoverySettings, ProbeResult, merge_router_configs
-from .errors import AllModelsFailed, NoEligibleModel, RequestError, RouterError
+from .errors import AllModelsFailed, NoEligibleModel, RequestError, RouterError, StreamInterrupted
 from .health import probe_endpoints
 from .inference_jobs import InferenceJobError, InferenceJobs, Runner
 from .inference_test import run_inference_checks
@@ -45,7 +46,11 @@ from .self_test import run_backend_checks
 from .status_page import STATUS_CSS, STATUS_JS, render_status_html
 from .update_control import UpdateController, UpdateRequestError
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
+# A streaming client hears from the router at least this often while a backend
+# is silent (loading a model, evaluating a long prompt), so idle-connection
+# timeouts in proxies and client libraries do not cut a slow start short.
+STREAM_HEARTBEAT_SECONDS = 15.0
 SAVED_HOST_REFRESH_SECONDS = 30.0
 SAVED_HOST_CHECK_COOLDOWN_SECONDS = 3.0
 VIRTUAL_MODELS: dict[str, str] = {
@@ -1256,12 +1261,10 @@ def create_app(
             )
             if alias is not None:
                 query = alias.apply(query)
+            if body.get("stream", True):
+                return await _relay(request, service, "ollama", model, router.complete_stream(query), _OllamaRelay(model))
             completion = await router.complete(query)
             first, final = _ollama_completion(model, completion)
-            if body.get("stream", True):
-                return StreamingResponse(
-                    _ndjson([first, final]), media_type="application/x-ndjson"
-                )
             combined = dict(final)
             combined["message"] = first["message"]
             return JSONResponse(combined)
@@ -1321,13 +1324,14 @@ def create_app(
             )
             if alias is not None:
                 query = alias.apply(query)
-            completion = await router.complete(query)
-            payload = _openai_completion(model, completion)
             if body.get("stream", False):
-                return StreamingResponse(
-                    _openai_sse(payload), media_type="text/event-stream"
+                options = body.get("stream_options")
+                include_usage = isinstance(options, Mapping) and options.get("include_usage") is True
+                return await _relay(
+                    request, service, "openai", model, router.complete_stream(query), _OpenAIRelay(model, include_usage)
                 )
-            return JSONResponse(payload)
+            completion = await router.complete(query)
+            return JSONResponse(_openai_completion(model, completion))
         except (ValueError, RequestError) as exc:
             _record_failure(service, "openai", model, exc, 400)
             return _openai_error(str(exc), 400, "invalid_request_error")
@@ -1742,28 +1746,265 @@ def _openai_completion(model: str, completion: RoutedCompletion) -> dict[str, An
     }
 
 
-async def _openai_sse(payload: Mapping[str, Any]) -> AsyncIterator[bytes]:
-    choice = payload["choices"][0]
-    message = choice["message"]
-    delta = dict(message)
-    delta.pop("role", None)
-    chunk = {
-        "id": payload["id"],
-        "object": "chat.completion.chunk",
-        "created": payload["created"],
-        "model": payload["model"],
-        "choices": [{"index": 0, "delta": {"role": "assistant", **delta}, "finish_reason": None}],
-    }
-    final = {
-        "id": payload["id"],
-        "object": "chat.completion.chunk",
-        "created": payload["created"],
-        "model": payload["model"],
-        "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}],
-    }
-    yield f"data: {json.dumps(chunk, separators=(',', ':'))}\n\n".encode()
-    yield f"data: {json.dumps(final, separators=(',', ':'))}\n\n".encode()
-    yield b"data: [DONE]\n\n"
+_PENDING = object()
+_CLEANUPS: set[asyncio.Future[Any]] = set()
+
+
+def _line(item: Mapping[str, Any]) -> bytes:
+    return (json.dumps(item, separators=(",", ":")) + "\n").encode()
+
+
+def _event(item: Mapping[str, Any]) -> bytes:
+    return f"data: {json.dumps(item, separators=(',', ':'))}\n\n".encode()
+
+
+class _OllamaRelay:
+    """Render router fragments as Ollama's newline-delimited chat stream."""
+
+    media_type = "application/x-ndjson"
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+
+    def _chunk(self, message: Mapping[str, Any]) -> bytes:
+        return _line({"model": self.model, "created_at": _timestamp(), "message": message, "done": False})
+
+    def heartbeat(self) -> bytes:
+        # An empty fragment keeps the connection alive; clients append nothing.
+        return self._chunk({"role": "assistant", "content": ""})
+
+    def delta(self, fragment: StreamDelta) -> bytes:
+        message: dict[str, Any] = {"role": "assistant", "content": fragment.text}
+        if fragment.thinking:
+            message["thinking"] = fragment.thinking
+        return self._chunk(message)
+
+    def finish(self, completion: RoutedCompletion, sent: int) -> list[bytes]:
+        first, final = _ollama_completion(self.model, completion)
+        first["message"]["content"] = completion.text[sent:]
+        chunks: list[bytes] = []
+        if first["message"]["content"] or first["message"].get("tool_calls"):
+            chunks.append(_line(first))
+        chunks.append(_line(final))
+        return chunks
+
+    def error(self, message: str, error_type: str) -> bytes:
+        return _line({"error": message})
+
+
+class _OpenAIRelay:
+    """Render router fragments as OpenAI chat.completion.chunk server-sent events."""
+
+    media_type = "text/event-stream"
+
+    def __init__(self, model: str, include_usage: bool) -> None:
+        self.model = model
+        self.include_usage = include_usage
+        self.id = "chatcmpl-" + uuid.uuid4().hex
+        self.created = int(time.time())
+        self.started = False
+
+    def _chunk(self, delta: Mapping[str, Any], finish_reason: str | None = None, **extra: Any) -> bytes:
+        return _event({
+            "id": self.id, "object": "chat.completion.chunk", "created": self.created, "model": self.model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra,
+        })
+
+    def heartbeat(self) -> bytes:
+        return b": keepalive\n\n"
+
+    def delta(self, fragment: StreamDelta) -> bytes:
+        delta: dict[str, Any] = {}
+        if not self.started:
+            delta["role"] = "assistant"
+            self.started = True
+        if fragment.text:
+            delta["content"] = fragment.text
+        if fragment.thinking:
+            delta["reasoning_content"] = fragment.thinking
+        return self._chunk(delta)
+
+    def finish(self, completion: RoutedCompletion, sent: int) -> list[bytes]:
+        payload = _openai_completion(self.model, completion)
+        choice = payload["choices"][0]
+        delta: dict[str, Any] = {} if self.started else {"role": "assistant"}
+        remainder = completion.text[sent:]
+        if remainder:
+            delta["content"] = remainder
+        if choice["message"].get("tool_calls"):
+            delta["tool_calls"] = [
+                {"index": index, **call} for index, call in enumerate(choice["message"]["tool_calls"])
+            ]
+        chunks: list[bytes] = []
+        if delta:
+            chunks.append(self._chunk(delta))
+        chunks.append(self._chunk({}, choice["finish_reason"], router=payload["router"]))
+        if self.include_usage:
+            chunks.append(_event({
+                "id": self.id, "object": "chat.completion.chunk", "created": self.created, "model": self.model,
+                "choices": [], "usage": payload["usage"],
+            }))
+        chunks.append(b"data: [DONE]\n\n")
+        return chunks
+
+    def error(self, message: str, error_type: str) -> bytes:
+        return _event({"error": {"message": message, "type": error_type, "param": None, "code": error_type}})
+
+
+async def _relay(
+    request: Request | None, service: Any, api: str, model: str,
+    events: AsyncIterator[StreamDelta | RoutedCompletion], render: _OllamaRelay | _OpenAIRelay,
+) -> Response:
+    """Stream the router's fragments to the client, with heartbeats during silences.
+
+    The response starts when the first fragment arrives or the first heartbeat
+    is due, whichever comes first, so a request that fails quickly still gets a
+    real HTTP error status. After that, a failure is reported in the stream.
+    A client that hangs up at any point stops the backend.
+    """
+    return await _ActiveRelay(request, service, api, model, events, render).start()
+
+
+class _ActiveRelay:
+    """One client's stream: the router events, the pending read, and the hang-up watch."""
+
+    def __init__(
+        self, request: Request | None, service: Any, api: str, model: str,
+        events: AsyncIterator[StreamDelta | RoutedCompletion], render: _OllamaRelay | _OpenAIRelay,
+    ) -> None:
+        self.service, self.api, self.model = service, api, model
+        self.events = events
+        self.render = render
+        self.receive = request.receive if request is not None else None
+        self.head: asyncio.Future[Any] | None = None
+        # The request body has been read, so the next message the server hands
+        # us is the client hanging up. Not every server cancels a streaming
+        # response on its own when that happens.
+        self.watch: asyncio.Future[Any] | None = asyncio.ensure_future(self.receive()) if self.receive else None
+        self.first: Any = _PENDING
+        self.closed = False
+
+    async def _wait(self) -> str:
+        """Wait for the next event, a heartbeat's worth of silence, or a hang-up."""
+        if self.head is None:
+            self.head = asyncio.ensure_future(self.events.__anext__())
+        waiters = {self.head} if self.watch is None else {self.head, self.watch}
+        done, _ = await asyncio.wait(waiters, timeout=STREAM_HEARTBEAT_SECONDS, return_when=asyncio.FIRST_COMPLETED)
+        if self.head in done:
+            return "event"
+        if self.watch is not None and self.watch in done:
+            try:
+                message = self.watch.result()
+            except BaseException:
+                self.watch = None  # the server stopped telling us; sends will fail instead
+                return "silence"
+            if isinstance(message, Mapping) and message.get("type") == "http.disconnect":
+                return "gone"
+            self.watch = asyncio.ensure_future(self.receive())  # type: ignore[misc]
+            return "silence"
+        return "silence"
+
+    async def start(self) -> Response:
+        outcome = await self._wait()
+        if outcome == "gone":
+            await self.close()
+            return Response(status_code=499)
+        if outcome == "event":
+            assert self.head is not None
+            try:
+                self.first = self.head.result()
+            except BaseException:
+                self.head = None
+                await self.close()
+                raise
+            self.head = None
+        return _RelayResponse(self)
+
+    async def body(self) -> AsyncIterator[bytes]:
+        sent = 0
+        item = self.first
+        try:
+            if item is _PENDING:
+                yield self.render.heartbeat()  # the client has already waited one interval
+            while True:
+                while item is _PENDING:
+                    outcome = await self._wait()
+                    if outcome == "gone":
+                        return
+                    if outcome == "silence":
+                        yield self.render.heartbeat()
+                        continue
+                    assert self.head is not None
+                    head, self.head = self.head, None
+                    item = head.result()
+                if isinstance(item, RoutedCompletion):
+                    for chunk in self.render.finish(item, sent):
+                        yield chunk
+                    return
+                sent += len(item.text)
+                yield self.render.delta(item)
+                item = _PENDING
+        except StreamInterrupted as exc:
+            _record_failure(self.service, self.api, self.model, exc, 200)
+            yield self.render.error(str(exc), "stream_interrupted")
+        except RouterError as exc:
+            _record_failure(self.service, self.api, self.model, exc, 200)
+            yield self.render.error(str(exc), "router_error")
+        except Exception as exc:
+            _record_failure(self.service, self.api, self.model, exc, 200)
+            yield self.render.error(_safe_exception(exc), "internal_error")
+
+    async def close(self) -> None:
+        """Stop the backend read and the hang-up watch; safe to call more than once.
+
+        Runs shielded: a server that cancels the response on a hang-up must
+        not also cancel the close-out that stops the backend.
+        """
+        if self.closed:
+            return
+        self.closed = True
+        cleanup = asyncio.ensure_future(_close_events(self.head, self.events, self.watch))
+        _CLEANUPS.add(cleanup)
+        cleanup.add_done_callback(_CLEANUPS.discard)
+        await asyncio.shield(cleanup)
+
+
+class _RelayResponse(StreamingResponse):
+    """A streaming response that closes its backend stream however it ends.
+
+    The server may abandon the body iterator without closing it (a hang-up
+    before the first chunk, an error while sending), so the close-out is tied
+    to the response itself rather than to the iterator.
+    """
+
+    def __init__(self, relay: _ActiveRelay) -> None:
+        super().__init__(relay.body(), media_type=relay.render.media_type)
+        self.relay = relay
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self.relay.close()
+
+
+async def _close_events(
+    head: asyncio.Future[Any] | None, events: AsyncIterator[Any], watch: asyncio.Future[Any] | None = None,
+) -> None:
+    if watch is not None:
+        watch.cancel()
+    if head is not None and not head.done():
+        head.cancel()
+        try:
+            await head
+        except BaseException:
+            pass
+    close = getattr(events, "aclose", None)
+    if close is not None:
+        try:
+            await close()
+        except BaseException:
+            pass
 
 
 async def _ndjson(items: list[Mapping[str, Any]]) -> AsyncIterator[bytes]:
@@ -1866,6 +2107,8 @@ def _failure_summary(exc: Exception) -> tuple[str, str]:
         return "all_attempts_failed", f"{len(exc.failures)} attempt{'s' if len(exc.failures) != 1 else ''} failed, {kinds}: {attempts}"
     if isinstance(exc, GatewayUnavailable):
         return "router_unavailable", str(exc)
+    if isinstance(exc, StreamInterrupted):
+        return "stream_interrupted", str(exc)
     if isinstance(exc, (ValueError, RequestError)):
         return "rejected", str(exc)
     if isinstance(exc, RouterError):

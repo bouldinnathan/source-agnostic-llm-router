@@ -186,7 +186,7 @@ async function reply(request, status, data) {
 
 function snapshot() {
   return {
-    ready: true, status: "ready", version: "0.4.0", uptime_seconds: 65,
+    ready: true, status: "ready", version: "0.5.0", uptime_seconds: 65,
     checked_at: "2026-09-16T12:00:00Z", last_discovery: null,
     counts: {endpoints: 1, online: 1, models: 1, available_models: 1, aliases: 1},
     endpoints: [{name: "backend", machine: "laptop", address: "http://private-backend:1234", state: "online", model_count: 1, available_models: 1}],
@@ -206,7 +206,7 @@ function routingSnapshot(overrides = {}) {
 }
 
 function updateSnapshot(overrides = {}) {
-  return {available: true, busy: false, state: "idle", stage: "idle", message: "Ready", run_id: null, updated_at: null, current_version: "0.4.0", ...overrides};
+  return {available: true, busy: false, state: "idle", stage: "idle", message: "Ready", run_id: null, updated_at: null, current_version: "0.5.0", ...overrides};
 }
 
 function inferenceSnapshot(overrides = {}) {
@@ -471,11 +471,11 @@ async function publicReadiness() {
     assert.equal(app.requests[0].url, "/healthz");
     assert.equal(app.requests[0].options.headers.Authorization, undefined);
     // The real public endpoint deliberately contains no ready field.
-    await reply(app.requests[0], httpStatus, {status, version: "0.4.0"});
+    await reply(app.requests[0], httpStatus, {status, version: "0.5.0"});
     assert.equal(app.element("health-panel").className, `health-panel tone-${tone}`);
     assert.equal(app.element("gateway-state").textContent, "Responding");
     assert.equal(app.element("model-readiness").textContent, readiness);
-    assert.equal(app.element("version").textContent, "Version 0.4.0", "Version should remain visible while details are locked");
+    assert.equal(app.element("version").textContent, "Version 0.5.0", "Version should remain visible while details are locked");
     assert.equal(app.element("details").hidden, true);
     assert.equal(app.element("refresh-button").disabled, false);
   }
@@ -489,13 +489,13 @@ async function topbarVersionTracksCurrentSnapshot() {
   assert.ok(header && /\bid="version"/.test(header[1]), "Version belongs at the top of the page, before locked details");
   assert.equal(Array.from(markup.matchAll(/\bid="version"/g)).length, 1);
   const app = harness();
-  await reply(app.requests[0], 503, {status: "unavailable", version: "0.4.0"});
+  await reply(app.requests[0], 503, {status: "unavailable", version: "0.5.0"});
   assert.equal(app.element("details").hidden, true);
   assert.equal(app.element("version").hidden, false);
-  assert.equal(app.element("version").textContent, "Version 0.4.0", "Even an unavailable public gateway identifies its version");
+  assert.equal(app.element("version").textContent, "Version 0.5.0", "Even an unavailable public gateway identifies its version");
   app.enterKey("secret-key");
-  await reply(app.requests.at(-1), 200, {...snapshot(), version: "0.4.0"});
-  assert.equal(app.element("version").textContent, "Version 0.4.0");
+  await reply(app.requests.at(-1), 200, {...snapshot(), version: "0.5.0"});
+  assert.equal(app.element("version").textContent, "Version 0.5.0");
   app.tick();
   app.requests.at(-1).reject(new Error("offline"));
   await flush();
@@ -516,7 +516,7 @@ async function nonoverlapAndNetworkFailure() {
   app.tick();
   app.element("refresh-button").events.click();
   assert.equal(app.requests.length, 1, "In-flight requests must not overlap");
-  await reply(app.requests[0], 200, {status: "ready", version: "0.4.0"});
+  await reply(app.requests[0], 200, {status: "ready", version: "0.5.0"});
   app.tick();
   assert.equal(app.requests.length, 2);
   app.requests[1].reject(new Error("network offline"));
@@ -531,7 +531,7 @@ async function nonoverlapAndNetworkFailure() {
 
 async function authenticationAndSafeRendering() {
   const app = harness();
-  await reply(app.requests[0], 503, {status: "unavailable", version: "0.4.0"});
+  await reply(app.requests[0], 503, {status: "unavailable", version: "0.5.0"});
   app.enterKey("secret-key");
   assert.equal(app.requests[1].url, "/status/data");
   assert.equal(app.requests[1].options.headers.Authorization, "Bearer secret-key");
@@ -562,9 +562,9 @@ async function lockLateResponsesAndRejectedKeys() {
   assert.equal(app.requests[3].url, "/healthz");
   await reply(app.requests[2], 200, snapshot());
   assert.equal(app.element("details").hidden, true, "A late authenticated result must not unlock details");
-  await reply(app.requests[0], 200, {status: "ready", version: "0.4.0"});
+  await reply(app.requests[0], 200, {status: "ready", version: "0.5.0"});
   assert.equal(app.element("health-panel").className, "health-panel tone-pending", "A cancelled old public request must not overwrite pending state");
-  await reply(app.requests[3], 503, {status: "unavailable", version: "0.4.0"});
+  await reply(app.requests[3], 503, {status: "unavailable", version: "0.5.0"});
   app.enterKey("rejected-key");
   await reply(app.requests[4], 401, {});
   assert.equal(app.element("details").hidden, true);
@@ -1376,6 +1376,7 @@ async function routingSettingsCheckboxesAndRaces() {
     races: [{group: "qwen", started_at: "2026-09-20T10:00:00Z", winner: "qwen-b", participants: {
       "qwen-b": {endpoint: "source-b", success: true, latency_ms: 120.4, kind: null},
       "qwen-a": {endpoint: "source-a", success: false, latency_ms: 30, kind: "http_5xx"},
+      "qwen-c": {endpoint: "source-c", success: true, stopped: true, latency_ms: null, kind: null, first_token_ms: 412.6},
       '<img src=x onerror="alert(1)">': {endpoint: "x", success: true, latency_ms: 5, kind: null},
     }}, {group: "pending", started_at: "2026-09-20T10:01:00Z", winner: null, participants: {}}],
   });
@@ -1390,6 +1391,7 @@ async function routingSettingsCheckboxesAndRaces() {
   assert.equal(races.length, 2);
   assert.match(races[0].textContent, /qwen-b \(winner\): 120 ms/);
   assert.match(races[0].textContent, /qwen-a: failed \(http_5xx\)/);
+  assert.match(races[0].textContent, /qwen-c: first token 413 ms, then stopped/, "A race loser is stopped after its first token");
   assert.equal(races[0].children[1].children.length, 0, "Participant names stay inert text");
   assert.match(races[1].textContent, /No replica answered/);
   assert.equal(app.requests.at(-1).url, "/status/data", "Saving refreshes the alias table");
@@ -2123,10 +2125,10 @@ async function updatesRequireExplicitAuthenticatedClick() {
     assert.doesNotMatch(app.element("update-message").textContent, /\d+%/);
   }
   app.expire(2000);
-  await reply(app.updateRequests.at(-1), 200, updateSnapshot({state: "succeeded", stage: "complete", run_id: "run-one", current_version: "0.4.0", updated_at: "2026-09-19T12:00:00Z"}));
+  await reply(app.updateRequests.at(-1), 200, updateSnapshot({state: "succeeded", stage: "complete", run_id: "run-one", current_version: "0.5.0", updated_at: "2026-09-19T12:00:00Z"}));
   assert.equal(app.element("update-progress").hidden, true);
   assert.match(app.element("update-message").textContent, /Update completed successfully/);
-  assert.match(app.element("update-observed").textContent, /0\.4\.0/);
+  assert.match(app.element("update-observed").textContent, /0\.5\.0/);
   assert.equal(app.requests.at(-1).url, "/status/data", "Confirmed completion refreshes installed version and router state");
   const count = app.updateRequests.length;
   app.expire(2000);

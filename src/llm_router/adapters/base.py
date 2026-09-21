@@ -9,7 +9,8 @@ import json
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol
+from contextlib import aclosing
+from typing import Any, AsyncIterator, Mapping, Protocol
 
 import httpx
 
@@ -36,6 +37,20 @@ class StreamTimeouts:
 # The router sets this before each attempt; adapters read it. A context variable
 # keeps the Adapter protocol unchanged for custom adapters.
 STREAM_TIMEOUTS: ContextVar[StreamTimeouts] = ContextVar("llm_router_stream_timeouts", default=StreamTimeouts())
+
+
+@dataclass(slots=True)
+class StreamDelta:
+    """One fragment of a backend answer, as generated.
+
+    ``first_token_ms`` is set on the first fragment of an answer only. A
+    fragment may carry neither text nor thinking when it only advanced a tool
+    call, whose arguments are assembled and delivered with the final result.
+    """
+
+    text: str = ""
+    thinking: str = ""
+    first_token_ms: float | None = None
 FIRST_TOKEN_KEY = "_router_first_token_ms"
 _MAX_STREAM_LINE = 1024 * 1024
 _MAX_STREAM_BYTES = 64 * 1024 * 1024
@@ -57,10 +72,11 @@ class _NdjsonAggregator:
         self.final: dict[str, Any] | None = None
         self.done = False
 
-    def feed(self, line: str) -> bool:
+    def feed(self, line: str) -> StreamDelta | None:
+        """Fold one line; return the fragment it carried, if any."""
         line = line.strip()
         if not line:
-            return False
+            return None
         try:
             chunk = json.loads(line)
         except ValueError as exc:
@@ -69,25 +85,26 @@ class _NdjsonAggregator:
             raise UpstreamError("Upstream JSON chunk is not an object", retryable=False, kind="invalid_response")
         if chunk.get("error"):
             raise UpstreamError(f"Upstream reported an error while streaming: {_clean_upstream_text(chunk['error'])}")
-        carried = False
+        delta: StreamDelta | None = None
         message = chunk.get("message")
         if isinstance(message, Mapping):
             content = message.get("content")
             if isinstance(content, str) and content:
                 self.text.append(content)
-                carried = True
+                delta = StreamDelta(text=content)
             thinking = message.get("thinking")
             if isinstance(thinking, str) and thinking:
                 self.thinking.append(thinking)
-                carried = True
+                delta = delta or StreamDelta()
+                delta.thinking = thinking
             calls = message.get("tool_calls")
             if isinstance(calls, list) and calls:
                 self.calls.extend(call for call in calls if isinstance(call, Mapping))
-                carried = True
+                delta = delta or StreamDelta()
         if chunk.get("done"):
             self.final = dict(chunk)
             self.done = True
-        return carried
+        return delta
 
     def result(self) -> dict[str, Any]:
         final = dict(self.final or {"done": True})
@@ -112,14 +129,15 @@ class _SseAggregator:
         self.meta: dict[str, Any] = {}
         self.done = False
 
-    def feed(self, line: str) -> bool:
+    def feed(self, line: str) -> StreamDelta | None:
+        """Fold one line; return the fragment it carried, if any."""
         line = line.rstrip("\r")
         if not line or line.startswith(":") or not line.startswith("data:"):
-            return False  # comments, event/id lines, and blank separators carry nothing
+            return None  # comments, event/id lines, and blank separators carry nothing
         data = line[5:].strip()
         if data == "[DONE]":
             self.done = True
-            return False
+            return None
         try:
             chunk = json.loads(data)
         except ValueError as exc:
@@ -135,7 +153,7 @@ class _SseAggregator:
                 self.meta[key] = chunk[key]
         if isinstance(chunk.get("usage"), Mapping):
             self.usage = chunk["usage"]
-        carried = False
+        carried: StreamDelta | None = None
         choices = chunk.get("choices")
         if isinstance(choices, list) and choices and isinstance(choices[0], Mapping):
             choice = choices[0]
@@ -144,12 +162,13 @@ class _SseAggregator:
                 content = delta.get("content")
                 if isinstance(content, str) and content:
                     self.text.append(content)
-                    carried = True
+                    carried = StreamDelta(text=content)
                 for key in ("reasoning_content", "reasoning"):
                     reasoning = delta.get(key)
                     if isinstance(reasoning, str) and reasoning:
                         self.reasoning.append(reasoning)
-                        carried = True
+                        carried = carried or StreamDelta()
+                        carried.thinking += reasoning
                 calls = delta.get("tool_calls")
                 if isinstance(calls, list):
                     for call in calls:
@@ -169,7 +188,7 @@ class _SseAggregator:
                             arguments = function.get("arguments")
                             if isinstance(arguments, str):
                                 entry["function"]["arguments"] += arguments
-                        carried = True
+                        carried = carried or StreamDelta()
             if choice.get("finish_reason"):
                 self.finish = str(choice["finish_reason"])
         return carried
@@ -201,6 +220,14 @@ def _stream_timeout_error(*, first_token_seen: bool, timeouts: StreamTimeouts, c
 
 
 class Adapter(Protocol):
+    """A backend driver. ``complete`` is required; ``stream`` is optional.
+
+    ``stream(endpoint, model, request)`` is an async iterator of
+    :class:`StreamDelta` fragments followed by one :class:`UpstreamResult`.
+    Closing it early must stop the backend. Adapters without it are driven
+    through ``complete`` and deliver the whole answer as their only item.
+    """
+
     async def complete(
         self,
         endpoint: EndpointConfig,
@@ -209,11 +236,83 @@ class Adapter(Protocol):
     ) -> UpstreamResult: ...
 
 
+def adapter_stream(
+    adapter: Any, endpoint: EndpointConfig, model: ModelConfig, request: QueryRequest,
+) -> AsyncIterator[StreamDelta | UpstreamResult]:
+    """Drive any adapter as a stream, whether or not it implements ``stream``."""
+    stream = getattr(adapter, "stream", None)
+    if callable(stream):
+        return stream(endpoint, model, request)
+
+    async def whole() -> AsyncIterator[StreamDelta | UpstreamResult]:
+        yield await adapter.complete(endpoint, model, request)
+
+    return whole()
+
+
+async def final_result(items: AsyncIterator[StreamDelta | UpstreamResult]) -> UpstreamResult:
+    """Drain an adapter stream and return its result."""
+    result: UpstreamResult | None = None
+    try:
+        async for item in items:
+            if isinstance(item, UpstreamResult):
+                result = item
+    finally:
+        close = getattr(items, "aclose", None)
+        if close is not None:
+            await close()
+    if result is None:
+        raise UpstreamError("Adapter stream ended without a result", retryable=False, kind="adapter")
+    return result
+
+
 class BaseHTTPAdapter:
     default_auth_scheme = "bearer"
     default_auth_header = "Authorization"
     default_auth_prefix = "Bearer "
     default_auth_query_param = "key"
+
+    async def stream(
+        self,
+        endpoint: EndpointConfig,
+        model: ModelConfig,
+        request: QueryRequest,
+    ) -> AsyncIterator[StreamDelta | UpstreamResult]:
+        """Yield answer fragments, then the result. Non-streaming adapters yield the result only."""
+        yield await self.complete(endpoint, model, request)
+
+    async def stream_json(
+        self,
+        endpoint: EndpointConfig,
+        path: str,
+        payload: Mapping[str, Any],
+        *,
+        default_headers: Mapping[str, str] | None = None,
+        stream_format: str,
+    ) -> AsyncIterator[StreamDelta | dict[str, Any]]:
+        """POST JSON and yield answer fragments, then the folded final object.
+
+        The final object has the shape a non-streamed call returns, plus the
+        time to first token under :data:`FIRST_TOKEN_KEY`. Closing the
+        generator early closes the backend connection, which makes Ollama and
+        LM Studio stop generating.
+        """
+        if type(self).post_json is not BaseHTTPAdapter.post_json:
+            # A subclass that replaced post_json (retries, a test double) keeps
+            # its buffered path: the whole answer arrives as the final object.
+            yield dict(await self.post_json(
+                endpoint, path, payload, default_headers=default_headers, stream_format=stream_format,
+            ))
+            return
+        if not endpoint.base_url:
+            raise UpstreamError(
+                f"Endpoint '{endpoint.name}' has no base_url", retryable=False, kind="configuration"
+            )
+        headers, params = self.connection_metadata(endpoint, default_headers or {})
+        url = endpoint.base_url.rstrip("/") + "/" + path.lstrip("/")
+        async with aclosing(self._iter_stream(endpoint, url, payload, headers, params, stream_format)) as items:
+            async for item in items:
+                yield item
 
     async def post_json(
         self,
@@ -281,6 +380,24 @@ class BaseHTTPAdapter:
         params: Mapping[str, str],
         stream_format: str,
     ) -> dict[str, Any]:
+        final: dict[str, Any] | None = None
+        async with aclosing(self._iter_stream(endpoint, url, payload, headers, params, stream_format)) as items:
+            async for item in items:
+                if isinstance(item, dict):
+                    final = item
+        if final is None:
+            raise UpstreamError("Upstream stream ended without a final message", retryable=False, kind="invalid_response")
+        return final
+
+    async def _iter_stream(
+        self,
+        endpoint: EndpointConfig,
+        url: str,
+        payload: Mapping[str, Any],
+        headers: Mapping[str, str],
+        params: Mapping[str, str],
+        stream_format: str,
+    ) -> AsyncIterator[StreamDelta | dict[str, Any]]:
         timeouts = STREAM_TIMEOUTS.get()
         started = time.monotonic()
         deadline = None if timeouts.total is None else started + timeouts.total
@@ -332,7 +449,8 @@ class BaseHTTPAdapter:
                             raise UpstreamError("Upstream returned a non-object JSON body", retryable=False, kind="invalid_response")
                         result = dict(whole)
                         result[FIRST_TOKEN_KEY] = round((time.monotonic() - started) * 1000, 2)
-                        return result
+                        yield result
+                        return
                     lines = response.aiter_lines()
                     received = 0
                     while not aggregator.done:
@@ -346,8 +464,13 @@ class BaseHTTPAdapter:
                         received += len(line)
                         if len(line) > _MAX_STREAM_LINE or received > _MAX_STREAM_BYTES:
                             raise UpstreamError("Upstream stream is too large", retryable=False, kind="invalid_response")
-                        if aggregator.feed(line) and first_token_at is None:
+                        delta = aggregator.feed(line)
+                        if delta is None:
+                            continue
+                        if first_token_at is None:
                             first_token_at = time.monotonic()
+                            delta.first_token_ms = round((first_token_at - started) * 1000, 2)
+                        yield delta
                 finally:
                     await response.aclose()
         except httpx.TimeoutException as exc:
@@ -358,7 +481,7 @@ class BaseHTTPAdapter:
             raise UpstreamError(f"Upstream HTTP failure: {type(exc).__name__}", kind="connection") from exc
         result = aggregator.result()
         result[FIRST_TOKEN_KEY] = None if first_token_at is None else round((first_token_at - started) * 1000, 2)
-        return result
+        yield result
 
     def connection_metadata(
         self,

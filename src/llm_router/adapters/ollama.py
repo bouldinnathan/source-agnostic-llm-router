@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from contextlib import aclosing
+from typing import Any, AsyncIterator, Mapping
 
 from ..errors import UpstreamError
 from ..schema import EndpointConfig, ModelConfig, QueryRequest, UpstreamResult
-from .base import FIRST_TOKEN_KEY, BaseHTTPAdapter, merge_payload, message_text, neutral_tool_calls
+from .base import (
+    FIRST_TOKEN_KEY,
+    BaseHTTPAdapter,
+    StreamDelta,
+    final_result,
+    merge_payload,
+    message_text,
+    neutral_tool_calls,
+)
 
 
 class OllamaChatAdapter(BaseHTTPAdapter):
@@ -18,6 +27,14 @@ class OllamaChatAdapter(BaseHTTPAdapter):
         model: ModelConfig,
         request: QueryRequest,
     ) -> UpstreamResult:
+        return await final_result(self.stream(endpoint, model, request))
+
+    async def stream(
+        self,
+        endpoint: EndpointConfig,
+        model: ModelConfig,
+        request: QueryRequest,
+    ) -> AsyncIterator[StreamDelta | UpstreamResult]:
         options: dict[str, Any] = {}
         if request.max_tokens_specified:
             options["num_predict"] = request.max_tokens
@@ -77,12 +94,17 @@ class OllamaChatAdapter(BaseHTTPAdapter):
                 body["format"] = dict(schema) if isinstance(schema, Mapping) else "json"
             else:
                 body["format"] = dict(response_format)
-        data = dict(await self.post_json(
-            endpoint,
-            str(endpoint.options.get("path", "/api/chat")),
-            merge_payload(request.extra_body, body),
-            stream_format="ollama-ndjson" if streaming else None,
-        ))
+        path = str(endpoint.options.get("path", "/api/chat"))
+        payload = merge_payload(request.extra_body, body)
+        if not streaming:
+            yield self._result(dict(await self.post_json(endpoint, path, payload)))
+            return
+        async with aclosing(self.stream_json(endpoint, path, payload, stream_format="ollama-ndjson")) as items:
+            async for item in items:
+                yield item if isinstance(item, StreamDelta) else self._result(dict(item))
+
+    @staticmethod
+    def _result(data: dict[str, Any]) -> UpstreamResult:
         first_token_ms = data.pop(FIRST_TOKEN_KEY, None)
         message = data.get("message")
         if not isinstance(message, Mapping):

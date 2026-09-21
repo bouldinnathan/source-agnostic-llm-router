@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+
+import pytest
 
 import httpx
 
@@ -66,7 +69,7 @@ class StaticGateway:
     def status(self):  # type: ignore[no-untyped-def]
         return {
             "status": "ready" if self._router else "unavailable",
-            "version": "0.4.0",
+            "version": "0.5.0",
         }
 
 
@@ -463,3 +466,246 @@ def test_keep_alive_and_think_pass_through_only_when_usable() -> None:
     assert adapter.requests[-1].think is None
     openai = asyncio.run(request(app, "POST", "/v1/chat/completions", json={"model": "auto", "messages": base["messages"], "keep_alive": -1}))
     assert openai.status_code == 200 and adapter.requests[-1].keep_alive is None, "keep_alive is an Ollama concept"
+
+
+class StreamingAdapter:
+    """Answers in fragments; optionally slow to start or failing part-way."""
+
+    def __init__(self, *, pieces=("Hel", "lo"), first_token_delay=0.0, piece_delay=0.0, fail_after=None, tool_calls=(), thinking="") -> None:  # type: ignore[no-untyped-def]
+        self.pieces = pieces
+        self.first_token_delay = first_token_delay
+        self.piece_delay = piece_delay
+        self.fail_after = fail_after
+        self.tool_calls = tool_calls
+        self.thinking = thinking
+        self.closed = 0
+
+    async def complete(self, endpoint, model, request):  # type: ignore[no-untyped-def]
+        from llm_router.adapters.base import final_result
+        return await final_result(self.stream(endpoint, model, request))
+
+    async def stream(self, endpoint, model, request):  # type: ignore[no-untyped-def]
+        from llm_router.adapters.base import StreamDelta
+
+        try:
+            await asyncio.sleep(self.first_token_delay)
+            if self.fail_after == 0:
+                raise UpstreamError("backend went away", kind="connection")
+            if self.thinking:
+                yield StreamDelta(thinking=self.thinking, first_token_ms=5.0)
+            for index, piece in enumerate(self.pieces):
+                yield StreamDelta(text=piece, first_token_ms=5.0 if index == 0 and not self.thinking else None)
+                if self.fail_after == index + 1:
+                    raise UpstreamError("backend went away", kind="connection")
+                await asyncio.sleep(self.piece_delay)
+            yield UpstreamResult(text="".join(self.pieces), usage={"input_tokens": 3, "output_tokens": 2}, finish_reason="stop", tool_calls=tuple(self.tool_calls))
+        finally:
+            self.closed += 1
+
+
+class RecordingGateway(StaticGateway):
+    def __init__(self, router):  # type: ignore[no-untyped-def]
+        super().__init__(router)
+        self.failures = []
+
+    def record_request_failure(self, **fields):  # type: ignore[no-untyped-def]
+        self.failures.append(fields)
+
+
+def make_streaming_app(adapter, *, max_attempts: int = 1):  # type: ignore[no-untyped-def]
+    config = make_config(
+        models=[{"id": "stream-model", "endpoint": "source-a", "upstream_model": "stream-model", "quality": 0.9, "capabilities": {"general": 1.0, "tool_use": 1.0}}],
+        router={"max_attempts": max_attempts},
+    )
+    adapters = AdapterRegistry()
+    adapters.register("ollama-chat", adapter)
+    gateway = RecordingGateway(LLMRouter(config, adapters=adapters))
+    return create_app(gateway=gateway), gateway
+
+
+def _sse_events(text: str) -> tuple[list[str], list]:
+    comments = [line for line in text.splitlines() if line.startswith(":")]
+    events = [line[5:].strip() for line in text.splitlines() if line.startswith("data:")]
+    return comments, [event if event == "[DONE]" else json.loads(event) for event in events]
+
+
+def test_ollama_chat_relays_fragments_with_heartbeats_then_the_final_chunk(monkeypatch) -> None:
+    import llm_router.gateway as gateway_module
+
+    monkeypatch.setattr(gateway_module, "STREAM_HEARTBEAT_SECONDS", 0.02)
+    adapter = StreamingAdapter(pieces=("Hel", "lo"), first_token_delay=0.08, thinking="hmm", tool_calls=(
+        {"id": "call_1", "type": "function", "function": {"name": "HassTurnOn", "arguments": {"name": "Kitchen"}}},
+    ))
+    app, _ = make_streaming_app(adapter)
+    response = asyncio.run(request(app, "POST", "/api/chat", json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]}))
+    assert response.status_code == 200 and response.headers["content-type"].startswith("application/x-ndjson")
+    chunks = [json.loads(line) for line in response.text.splitlines()]
+    contents = [chunk["message"].get("content") for chunk in chunks]
+    heartbeats = [chunk for chunk in chunks if chunk["message"].get("content") == "" and not chunk["done"] and "thinking" not in chunk["message"] and "tool_calls" not in chunk["message"]]
+    assert heartbeats, "A silent backend still produces empty keep-alive chunks"
+    assert all(chunk["model"] == "auto" and "created_at" in chunk for chunk in chunks)
+    thinking = next(chunk for chunk in chunks if "thinking" in chunk["message"])
+    assert thinking["message"]["thinking"] == "hmm" and thinking["message"]["content"] == ""
+    assert [content for content in contents if content] == ["Hel", "lo"], "Text is relayed as it is generated, never repeated at the end"
+    tool_chunk = next(chunk for chunk in chunks if chunk["message"].get("tool_calls"))
+    assert tool_chunk["message"]["tool_calls"][0]["function"] == {"name": "HassTurnOn", "arguments": {"name": "Kitchen"}}
+    final = chunks[-1]
+    assert final["done"] is True and final["done_reason"] == "stop"
+    assert final["prompt_eval_count"] == 3 and final["eval_count"] == 2
+    assert final["router"]["deployment"] == "stream-model"
+    assert adapter.closed == 1
+
+
+def test_openai_chat_relays_server_sent_events_with_usage_and_done(monkeypatch) -> None:
+    import llm_router.gateway as gateway_module
+
+    monkeypatch.setattr(gateway_module, "STREAM_HEARTBEAT_SECONDS", 0.02)
+    adapter = StreamingAdapter(pieces=("Hi", " there"), first_token_delay=0.08)
+    app, _ = make_streaming_app(adapter)
+    body = {"model": "auto", "stream": True, "stream_options": {"include_usage": True}, "messages": [{"role": "user", "content": "hi"}]}
+    response = asyncio.run(request(app, "POST", "/v1/chat/completions", json=body))
+    assert response.status_code == 200 and response.headers["content-type"].startswith("text/event-stream")
+    comments, events = _sse_events(response.text)
+    assert comments and all(comment.startswith(": keepalive") for comment in comments), "SSE comments keep the connection alive"
+    assert events[-1] == "[DONE]"
+    chunks = events[:-1]
+    assert all(chunk["object"] == "chat.completion.chunk" and chunk["model"] == "auto" for chunk in chunks)
+    assert len({chunk["id"] for chunk in chunks}) == 1
+    deltas = [chunk["choices"][0]["delta"] for chunk in chunks if chunk["choices"]]
+    assert deltas[0] == {"role": "assistant", "content": "Hi"}
+    assert deltas[1] == {"content": " there"}
+    finish = [chunk for chunk in chunks if chunk["choices"] and chunk["choices"][0]["finish_reason"]]
+    assert finish[-1]["choices"][0]["finish_reason"] == "stop" and finish[-1]["router"]["deployment"] == "stream-model"
+    usage = [chunk for chunk in chunks if not chunk["choices"]]
+    assert usage and usage[-1]["usage"] == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+
+    without_usage = asyncio.run(request(app, "POST", "/v1/chat/completions", json={**body, "stream_options": {}}))
+    _, events = _sse_events(without_usage.text)
+    assert all(chunk == "[DONE]" or chunk["choices"] for chunk in events), "Usage chunks only when the client asked"
+
+
+def test_streaming_failures_after_the_first_token_are_reported_in_band() -> None:
+    app, gateway = make_streaming_app(StreamingAdapter(pieces=("Hel", "lo"), fail_after=1))
+    response = asyncio.run(request(app, "POST", "/api/chat", json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]}))
+    assert response.status_code == 200, "The status was already sent with the first fragment"
+    chunks = [json.loads(line) for line in response.text.splitlines()]
+    assert chunks[0]["message"]["content"] == "Hel"
+    assert "error" in chunks[-1] and "backend went away" in chunks[-1]["error"] and "3 characters" in chunks[-1]["error"]
+    assert gateway.failures[-1]["kind"] == "stream_interrupted" and gateway.failures[-1]["api"] == "ollama"
+
+    app, gateway = make_streaming_app(StreamingAdapter(pieces=("Hel", "lo"), fail_after=1))
+    response = asyncio.run(request(app, "POST", "/v1/chat/completions", json={"model": "auto", "stream": True, "messages": [{"role": "user", "content": "hi"}]}))
+    _, events = _sse_events(response.text)
+    assert events[0]["choices"][0]["delta"]["content"] == "Hel"
+    assert events[-1]["error"]["type"] == "stream_interrupted" and "[DONE]" not in events
+    assert gateway.failures[-1]["kind"] == "stream_interrupted" and gateway.failures[-1]["api"] == "openai"
+
+
+def test_quick_failures_on_streaming_requests_keep_real_http_status_codes(monkeypatch) -> None:
+    import llm_router.gateway as gateway_module
+
+    app, gateway = make_streaming_app(StreamingAdapter(fail_after=0))
+    response = asyncio.run(request(app, "POST", "/api/chat", json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]}))
+    assert response.status_code == 503 and "All selected LLM deployments failed" in response.json()["error"]
+    assert gateway.failures[-1]["kind"] == "all_attempts_failed" and gateway.failures[-1]["status"] == 503
+    response = asyncio.run(request(app, "POST", "/v1/chat/completions", json={"model": "auto", "stream": True, "messages": [{"role": "user", "content": "hi"}]}))
+    assert response.status_code == 503 and response.json()["error"]["type"] == "router_unavailable"
+    response = asyncio.run(request(app, "POST", "/api/chat", json={"model": "no-such-model", "messages": [{"role": "user", "content": "hi"}]}))
+    assert response.status_code == 400
+
+    # A backend that stays silent past the first heartbeat and then fails can
+    # only report the failure in the stream that has already begun.
+    monkeypatch.setattr(gateway_module, "STREAM_HEARTBEAT_SECONDS", 0.02)
+    app, gateway = make_streaming_app(StreamingAdapter(first_token_delay=0.08, fail_after=0))
+    response = asyncio.run(request(app, "POST", "/api/chat", json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]}))
+    assert response.status_code == 200
+    chunks = [json.loads(line) for line in response.text.splitlines()]
+    assert chunks[0]["message"]["content"] == "" and chunks[0]["done"] is False
+    assert "All selected LLM deployments failed" in chunks[-1]["error"]
+    assert gateway.failures[-1]["kind"] == "all_attempts_failed" and gateway.failures[-1]["status"] == 200
+
+
+def test_non_streaming_clients_still_get_one_json_answer_after_a_mid_answer_failover() -> None:
+    config = make_config(
+        models=[
+            {"id": "flaky", "endpoint": "source-a", "upstream_model": "m", "quality": 0.95, "capabilities": {"general": 1.0}},
+            {"id": "steady", "endpoint": "source-b", "upstream_model": "m", "quality": 0.9, "capabilities": {"general": 1.0}},
+        ],
+        router={"max_attempts": 2},
+    )
+
+    class PerEndpoint(StreamingAdapter):
+        async def stream(self, endpoint, model, request):  # type: ignore[no-untyped-def]
+            self.fail_after = 1 if endpoint.name == "source-a" else None
+            self.pieces = ("Hel", "lo") if endpoint.name == "source-a" else ("Bon", "jour")
+            async for item in super().stream(endpoint, model, request):
+                yield item
+
+    adapters = AdapterRegistry()
+    adapters.register("ollama-chat", PerEndpoint())
+    app = create_app(gateway=StaticGateway(LLMRouter(config, adapters=adapters)))
+    response = asyncio.run(request(app, "POST", "/api/chat", json={"model": "auto", "stream": False, "messages": [{"role": "user", "content": "hi"}]}))
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["message"]["content"] == "Bonjour" and payload["router"]["deployment"] == "steady"
+
+
+async def _drive_until_hang_up(app, path: str, body: dict, *, spec_version: str, disconnect_after: float):  # type: ignore[no-untyped-def]
+    """Run the ASGI app by hand so the client can hang up part-way through."""
+    sent: list = []
+    state = {"body_sent": False}
+
+    async def receive():  # type: ignore[no-untyped-def]
+        if not state["body_sent"]:
+            state["body_sent"] = True
+            return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+        await asyncio.sleep(disconnect_after)
+        return {"type": "http.disconnect"}
+
+    async def send(message):  # type: ignore[no-untyped-def]
+        sent.append(message)
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0", "spec_version": spec_version}, "http_version": "1.1",
+        "method": "POST", "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
+        "headers": [(b"host", b"router.test"), (b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 4321), "server": ("router.test", 80),
+    }
+    started = time.perf_counter()
+    await asyncio.wait_for(app(scope, receive, send), 3.0)
+    return sent, time.perf_counter() - started
+
+
+@pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
+def test_a_client_that_hangs_up_before_the_first_token_stops_the_backend(monkeypatch, spec_version, path) -> None:
+    import llm_router.gateway as gateway_module
+
+    monkeypatch.setattr(gateway_module, "STREAM_HEARTBEAT_SECONDS", 0.5)
+    adapter = StreamingAdapter(first_token_delay=5.0)
+    app, gateway = make_streaming_app(adapter)
+    router = asyncio.run(gateway.router())
+    body = {"model": "auto", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+    sent, elapsed = asyncio.run(_drive_until_hang_up(app, path, body, spec_version=spec_version, disconnect_after=0.05))
+    assert elapsed < 1.0, "The router notices the hang-up itself instead of waiting for the backend or the next heartbeat"
+    assert adapter.closed == 1, "The backend stream is closed, which stops generation"
+    assert router.runtime.state("stream-model").active_requests == 0
+    assert [message["status"] for message in sent if message["type"] == "http.response.start"] in ([], [499])
+    assert router.metrics.snapshot()["traffic"]["totals"]["requests_ok"] == 0
+    assert gateway.failures == [], "A client hanging up is not a router failure"
+
+
+@pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
+def test_a_client_that_hangs_up_mid_answer_stops_the_backend(monkeypatch, spec_version) -> None:
+    import llm_router.gateway as gateway_module
+
+    monkeypatch.setattr(gateway_module, "STREAM_HEARTBEAT_SECONDS", 0.5)
+    adapter = StreamingAdapter(pieces=("Hel", "lo", "!"), piece_delay=5.0)
+    app, gateway = make_streaming_app(adapter)
+    router = asyncio.run(gateway.router())
+    body = {"model": "auto", "messages": [{"role": "user", "content": "hi"}]}
+    sent, elapsed = asyncio.run(_drive_until_hang_up(app, "/api/chat", body, spec_version=spec_version, disconnect_after=0.05))
+    assert elapsed < 1.0
+    bodies = [message for message in sent if message["type"] == "http.response.body" and message.get("body")]
+    assert json.loads(bodies[0]["body"])["message"]["content"] == "Hel", "The first fragment was relayed before the hang-up"
+    assert adapter.closed == 1 and router.runtime.state("stream-model").active_requests == 0

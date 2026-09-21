@@ -81,6 +81,22 @@ class UpstreamError(RouterError):
         self.kind = classify_failure(kind, status_code=status_code, retryable=retryable)
 
 
+class StreamInterrupted(RouterError):
+    """A deployment failed after part of its answer had already reached the client.
+
+    The text the client holds cannot be taken back, so the router does not
+    fail over; the client sees the failure in the stream and decides.
+    """
+
+    def __init__(self, failure: UpstreamFailure, sent: int) -> None:
+        self.failure = failure
+        self.sent = sent
+        super().__init__(
+            f"{failure.deployment} stopped after {sent} character{'s' if sent != 1 else ''} of its answer "
+            f"had been sent: {failure.reason}"
+        )
+
+
 class AllModelsFailed(RouterError):
     """Raised after all selected deployments fail."""
 

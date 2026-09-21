@@ -391,7 +391,7 @@ def test_reasoning_only_ollama_response_is_diagnosed() -> None:
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 
-def _streamed_backend(monkeypatch, *, body: bytes | None = None, content=None, status: int = 200, captured: list | None = None, content_type: str | None = None):
+def _streamed_backend(monkeypatch, *, body: bytes | None = None, content=None, status: int = 200, captured: list | None = None, content_type: str | None = None, responses: list | None = None):
     """Serve a canned body (or async byte stream) through the adapter's own HTTP client."""
     from llm_router.adapters import base
 
@@ -399,7 +399,10 @@ def _streamed_backend(monkeypatch, *, body: bytes | None = None, content=None, s
         if captured is not None:
             captured.append(json.loads(request.content))
         headers = {"content-type": content_type} if content_type else {}
-        return httpx.Response(status, content=content if content is not None else body, headers=headers)
+        response = httpx.Response(status, content=content if content is not None else body, headers=headers)
+        if responses is not None:
+            responses.append(response)
+        return response
 
     def client(**kwargs):  # type: ignore[no-untyped-def]
         kwargs.pop("verify", None)
@@ -542,3 +545,52 @@ def test_stream_timeouts_distinguish_first_token_idle_and_cap(monkeypatch) -> No
     finally:
         STREAM_TIMEOUTS.reset(token)
     assert result.text == "Hi!", "A pause shorter than the idle limit is fine"
+
+
+def test_ollama_adapter_stream_yields_fragments_then_the_result(monkeypatch) -> None:
+    from llm_router.adapters.base import StreamDelta
+    from llm_router.schema import UpstreamResult
+
+    chunks = [
+        {"message": {"role": "assistant", "content": "", "thinking": "hmm"}, "done": False},
+        {"message": {"role": "assistant", "content": "Hel"}, "done": False},
+        {"message": {"role": "assistant", "content": "lo"}, "done": False},
+        {"message": {"role": "assistant", "content": ""}, "done": True, "done_reason": "stop", "eval_count": 2},
+    ]
+    _streamed_backend(monkeypatch, body="\n".join(json.dumps(chunk) for chunk in chunks).encode())
+
+    async def collect():
+        items = []
+        async for item in OllamaChatAdapter().stream(OLLAMA_ENDPOINT, MODEL, QueryRequest.from_prompt("hi")):
+            items.append(item)
+        return items
+
+    items = asyncio.run(collect())
+    deltas, result = items[:-1], items[-1]
+    assert all(isinstance(delta, StreamDelta) for delta in deltas)
+    assert [(delta.text, delta.thinking) for delta in deltas] == [("", "hmm"), ("Hel", ""), ("lo", "")]
+    assert deltas[0].first_token_ms is not None and deltas[1].first_token_ms is None, "Only the first fragment is timed"
+    assert isinstance(result, UpstreamResult) and result.text == "Hello" and result.usage == {"eval_count": 2}
+    assert result.first_token_ms == deltas[0].first_token_ms
+
+
+def test_closing_an_adapter_stream_early_closes_the_backend_connection(monkeypatch) -> None:
+    from llm_router.adapters.base import StreamDelta
+
+    responses: list = []
+
+    async def content():
+        yield json.dumps({"message": {"role": "assistant", "content": "Hel"}, "done": False}).encode() + b"\n"
+        await asyncio.Event().wait()  # the backend would keep generating for a long time
+
+    _streamed_backend(monkeypatch, content=content(), responses=responses)
+
+    async def scenario():
+        stream = OllamaChatAdapter().stream(OLLAMA_ENDPOINT, MODEL, QueryRequest.from_prompt("hi"))
+        first = await stream.__anext__()
+        assert isinstance(first, StreamDelta) and first.text == "Hel"
+        assert responses[0].is_closed is False
+        await asyncio.wait_for(stream.aclose(), 1.0)
+        assert responses[0].is_closed is True, "Closing the adapter stream closes the upstream response, which stops generation"
+
+    asyncio.run(scenario())

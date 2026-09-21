@@ -1092,7 +1092,9 @@ STATUS_JS = r"""
       const parts = Object.entries(race.participants)
         .filter(([, result]) => result && typeof result === "object")
         .map(([name, result]) => `${name}${name === race.winner ? " (winner)" : ""}: ${result.success === true
-          ? (Number.isFinite(result.latency_ms) ? `${Math.round(result.latency_ms)} ms` : "succeeded")
+          ? (result.stopped === true
+            ? (Number.isFinite(result.first_token_ms) ? `first token ${Math.round(result.first_token_ms)} ms, then stopped` : "stopped after its first token")
+            : (Number.isFinite(result.latency_ms) ? `${Math.round(result.latency_ms)} ms` : "succeeded"))
           : `failed${typeof result.kind === "string" ? ` (${result.kind})` : ""}`}`);
       detail.textContent = `${race.winner === null ? "No replica answered. " : ""}${parts.length ? parts.join(" · ") : "Waiting for results"}`;
       item.append(head, detail);
@@ -1211,6 +1213,7 @@ STATUS_JS = r"""
     const kinds = {
       rejected: ["Rejected", "error"], no_eligible_model: ["No eligible model", "warning"], all_attempts_failed: ["All attempts failed", "error"],
       router_unavailable: ["Router unavailable", "warning"], router_error: ["Router error", "error"], internal_error: ["Internal error", "error"],
+      stream_interrupted: ["Stream interrupted", "error"],
     };
     for (const item of valid) {
       const row = document.createElement("tr");

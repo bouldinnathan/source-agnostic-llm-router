@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from contextlib import aclosing
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import os
 import re
 import time
-from typing import Any, Sequence
+from typing import Any, AsyncIterator, Sequence
 
 from .adapters import AdapterRegistry
-from .adapters.base import STREAM_TIMEOUTS, StreamTimeouts
-from .errors import AllModelsFailed, NoEligibleModel, UpstreamError, UpstreamFailure
+from .adapters.base import STREAM_TIMEOUTS, StreamDelta, StreamTimeouts, adapter_stream
+from .errors import AllModelsFailed, NoEligibleModel, StreamInterrupted, UpstreamError, UpstreamFailure
 from .metrics import MetricsStore
 from .ranking import Ranker, replica_group
 from .routing_settings import RoutingSettings
@@ -80,10 +81,35 @@ class LLMRouter:
     async def complete(self, request: QueryRequest) -> RoutedCompletion:
         """Call the highest-ranked deployment and fail over across sources.
 
+        The answer is read from the backend as a stream but returned whole, so
+        a deployment that fails part-way through is simply retried elsewhere.
+        See :meth:`complete_stream` for replica races.
+        """
+
+        async with aclosing(self.complete_stream(request, relay=False)) as events:
+            async for event in events:
+                if isinstance(event, RoutedCompletion):
+                    return event
+        raise AllModelsFailed([])  # unreachable: complete_stream always ends in a completion or raises
+
+    async def complete_stream(
+        self, request: QueryRequest, *, relay: bool = True,
+    ) -> AsyncIterator[StreamDelta | RoutedCompletion]:
+        """Yield an answer's fragments as they are generated, then the completion.
+
+        Failures before any fragment has been yielded fail over to the next
+        candidate silently. With ``relay`` the caller is passing fragments on to
+        a client as they arrive, so a failure after the first fragment cannot be
+        retried without repeating text the client already has; it raises
+        :class:`StreamInterrupted` instead. With ``relay=False`` nothing is ever
+        committed and every failure fails over.
+
         With replica racing enabled, every Nth request whose best candidate has
         other available replicas is sent to all of them at once. The first
-        successful answer is returned; the rest finish in the background so each
-        replica's observed latency stays current.
+        replica to produce a token is relayed; each other replica is stopped as
+        soon as its own first token has been timed, so a race refreshes every
+        replica's time to first token for the cost of one prompt evaluation
+        each, without generating the whole answer twice.
         """
 
         try:
@@ -97,21 +123,36 @@ class LLMRouter:
         failure_kinds: list[str] = []
         remaining = list(decision.candidates[:limit])
 
+        sources: list[AsyncIterator[StreamDelta | _AttemptOutcome]] = []
         participants = self._race_participants(request, decision)
         if participants:
-            outcome = await self._race(request, participants, failures, attempts, failure_kinds)
-            if outcome is not None:
-                return await self._finish(outcome, decision, failures, attempts, failure_kinds)
+            sources.append(self._race_stream(request, participants, failures, attempts, failure_kinds))
             raced = {candidate.model.id for candidate in participants}
             remaining = [candidate for candidate in decision.candidates if candidate.model.id not in raced][:limit]
+        sources.extend(self._attempt_stream(candidate, request) for candidate in remaining)
 
-        for candidate in remaining:
-            outcome = await self._attempt(candidate, request)
+        sent = 0
+        for source in sources:
+            outcome: _AttemptOutcome | None = None
+            async with aclosing(source) as events:
+                async for event in events:
+                    if isinstance(event, _AttemptOutcome):
+                        outcome = event
+                        break
+                    if event.text or event.thinking:
+                        sent += len(event.text)
+                        yield event
+            if outcome is None:
+                continue  # every raced replica failed before its first token; try what is left
             if outcome.failure is None:
-                return await self._finish(outcome, decision, failures, attempts, failure_kinds)
+                yield await self._finish(outcome, decision, failures, attempts, failure_kinds)
+                return
             failures.append(outcome.failure)
             attempts.append(outcome.attempt)
             failure_kinds.append(outcome.failure.kind)
+            if relay and sent:
+                await self._record_request(success=False, rerouted=len(failures) > 1, failure_kinds=failure_kinds)
+                raise StreamInterrupted(outcome.failure, sent)
 
         await self._record_request(success=False, rerouted=len(failures) > 1, failure_kinds=failure_kinds)
         raise AllModelsFailed(failures)
@@ -140,61 +181,91 @@ class LLMRouter:
             tool_calls=outcome.result.tool_calls,
         )
 
-    async def _attempt(
+    async def _attempt_stream(
         self, candidate: RouteCandidate, request: QueryRequest, *, race: dict[str, Any] | None = None,
-    ) -> _AttemptOutcome:
-        """Run one upstream attempt and record it; never raises except on cancellation."""
+    ) -> AsyncIterator[StreamDelta | _AttemptOutcome]:
+        """Run one upstream attempt: yield its fragments, then its recorded outcome.
+
+        Never raises except on cancellation or when closed early, in which case
+        the backend connection is closed and nothing is recorded for the
+        deployment beyond the end of its in-flight request.
+        """
         model = candidate.model
         endpoint = self.config.endpoints[model.endpoint]
         self.runtime.begin(model.id)
         started = time.perf_counter()
         timeouts_token = STREAM_TIMEOUTS.set(self._stream_timeouts())
+        recorded = False
+        result: UpstreamResult | None = None
+        failure: UpstreamFailure | None = None
+        first_token_ms: float | None = None
         try:
-            adapter = self.adapters.get(endpoint.adapter)
-            result = await adapter.complete(endpoint, model, request)
-        except asyncio.CancelledError:
-            self.runtime.end_without_result(model.id)
-            raise
-        except UpstreamError as exc:
+            try:
+                adapter = self.adapters.get(endpoint.adapter)
+                async with aclosing(adapter_stream(adapter, endpoint, model, request)) as items:
+                    async for item in items:
+                        if isinstance(item, UpstreamResult):
+                            result = item
+                            break
+                        if first_token_ms is None:
+                            first_token_ms = (
+                                item.first_token_ms if item.first_token_ms is not None
+                                else (time.perf_counter() - started) * 1_000
+                            )
+                        yield item
+                if result is None:
+                    raise UpstreamError("Adapter stream ended without a result", retryable=False, kind="adapter")
+            except UpstreamError as exc:
+                failure = UpstreamFailure(
+                    deployment=model.id, endpoint=model.endpoint, reason=exc.reason,
+                    retryable=exc.retryable, status_code=exc.status_code, kind=exc.kind,
+                )
+            except Exception as exc:  # Custom adapters must not crash the MCP process.
+                failure = UpstreamFailure(
+                    deployment=model.id, endpoint=model.endpoint,
+                    reason=f"Adapter failure: {type(exc).__name__}", retryable=False, kind="adapter",
+                )
             latency_ms = (time.perf_counter() - started) * 1_000
-            failure = UpstreamFailure(
-                deployment=model.id, endpoint=model.endpoint, reason=exc.reason,
-                retryable=exc.retryable, status_code=exc.status_code, kind=exc.kind,
-            )
-        except Exception as exc:  # Custom adapters must not crash the MCP process.
-            latency_ms = (time.perf_counter() - started) * 1_000
-            failure = UpstreamFailure(
-                deployment=model.id, endpoint=model.endpoint,
-                reason=f"Adapter failure: {type(exc).__name__}", retryable=False, kind="adapter",
-            )
-        else:
-            latency_ms = (time.perf_counter() - started) * 1_000
-            self.runtime.record_success(model.id, latency_ms, first_token_ms=result.first_token_ms)
-            observation = await self._record_metrics(endpoint, model, latency_ms, success=True, result=result)
-            attempt = {
-                "deployment": model.id, "endpoint": model.endpoint,
-                "latency_ms": round(latency_ms, 2), "success": True,
-            }
-            if result.first_token_ms is not None:
-                attempt["first_token_ms"] = round(result.first_token_ms, 2)
+            if failure is None:
+                assert result is not None
+                if result.first_token_ms is None and first_token_ms is not None:
+                    result = replace(result, first_token_ms=first_token_ms)
+                self.runtime.record_success(model.id, latency_ms, first_token_ms=result.first_token_ms)
+                recorded = True
+                observation = await self._record_metrics(endpoint, model, latency_ms, success=True, result=result)
+                attempt = {
+                    "deployment": model.id, "endpoint": model.endpoint,
+                    "latency_ms": round(latency_ms, 2), "success": True,
+                }
+                if result.first_token_ms is not None:
+                    attempt["first_token_ms"] = round(result.first_token_ms, 2)
+                if race is not None:
+                    attempt["race"] = True
+                    race["participants"][model.id] = {
+                        "endpoint": model.endpoint, "success": True, "latency_ms": round(latency_ms, 2), "kind": None,
+                        "first_token_ms": None if result.first_token_ms is None else round(result.first_token_ms, 2),
+                    }
+                yield _AttemptOutcome(candidate, result, observation, None, attempt)
+                return
+            self.runtime.record_failure(model.id, failure.reason)
+            recorded = True
+            await self._record_metrics(endpoint, model, latency_ms, success=False)
+            attempt = {**failure.to_dict(), "latency_ms": round(latency_ms, 2), "success": False}
             if race is not None:
                 attempt["race"] = True
                 race["participants"][model.id] = {
-                    "endpoint": model.endpoint, "success": True, "latency_ms": round(latency_ms, 2), "kind": None,
-                    "first_token_ms": None if result.first_token_ms is None else round(result.first_token_ms, 2),
+                    "endpoint": model.endpoint, "success": False, "latency_ms": round(latency_ms, 2), "kind": failure.kind,
                 }
-            return _AttemptOutcome(candidate, result, observation, None, attempt)
+            yield _AttemptOutcome(candidate, None, {"request_duration_ms": latency_ms}, failure, attempt)
         finally:
-            STREAM_TIMEOUTS.reset(timeouts_token)
-        self.runtime.record_failure(model.id, failure.reason)
-        await self._record_metrics(endpoint, model, latency_ms, success=False)
-        attempt = {**failure.to_dict(), "latency_ms": round(latency_ms, 2), "success": False}
-        if race is not None:
-            attempt["race"] = True
-            race["participants"][model.id] = {
-                "endpoint": model.endpoint, "success": False, "latency_ms": round(latency_ms, 2), "kind": failure.kind,
-            }
-        return _AttemptOutcome(candidate, None, {"request_duration_ms": latency_ms}, failure, attempt)
+            if not recorded:
+                self.runtime.end_without_result(model.id)
+            try:
+                STREAM_TIMEOUTS.reset(timeouts_token)
+            except ValueError:
+                # The first fragment was pulled by another task (a race head), so
+                # the variable was set in that task's context, which is gone.
+                pass
 
     def _race_participants(self, request: QueryRequest, decision: RoutingDecision) -> tuple[RouteCandidate, ...]:
         """Decide whether this request is one of the periodic all-replica races."""
@@ -213,11 +284,16 @@ class LLMRouter:
             return ()
         return members
 
-    async def _race(
+    async def _race_stream(
         self, request: QueryRequest, participants: tuple[RouteCandidate, ...],
         failures: list[UpstreamFailure], attempts: list[dict[str, Any]], failure_kinds: list[str],
-    ) -> _AttemptOutcome | None:
-        """Send the request to every replica; return the first success, if any."""
+    ) -> AsyncIterator[StreamDelta | _AttemptOutcome]:
+        """Send the request to every replica; relay the first to produce a token.
+
+        Replicas that fail before any token are recorded as failures here.
+        Yields nothing when every replica failed. The other replicas are closed
+        in the background once their own first token has been timed.
+        """
         record: dict[str, Any] = {
             "group": replica_group(participants[0].model),
             "started_at": datetime.now(timezone.utc).isoformat(),
@@ -225,28 +301,66 @@ class LLMRouter:
             "participants": {},
         }
         self.runtime.last_races.appendleft(record)
-        tasks = {asyncio.create_task(self._attempt(candidate, request, race=record)) for candidate in participants}
-        pending = set(tasks)
+        heads: dict[asyncio.Future[Any], tuple[RouteCandidate, Any]] = {}
+        for candidate in participants:
+            stream = self._attempt_stream(candidate, request, race=record)
+            heads[asyncio.ensure_future(stream.__anext__())] = (candidate, stream)
+        winner: tuple[RouteCandidate, Any, StreamDelta | _AttemptOutcome] | None = None
         try:
-            while pending:
-                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    outcome = task.result()
-                    if outcome.failure is None:
-                        record["winner"] = outcome.candidate.model.id
-                        # Losers keep running so their latency is measured too.
-                        for other in pending:
-                            self.runtime.race_tasks.add(other)
-                            other.add_done_callback(self.runtime.race_tasks.discard)
-                        return outcome
-                    failures.append(outcome.failure)
-                    attempts.append(outcome.attempt)
-                    failure_kinds.append(outcome.failure.kind)
-        except asyncio.CancelledError:
-            for task in pending:
-                task.cancel()
+            while heads and winner is None:
+                done, _ = await asyncio.wait(set(heads), return_when=asyncio.FIRST_COMPLETED)
+                for head in done:
+                    candidate, stream = heads.pop(head)
+                    first = head.result()
+                    if isinstance(first, _AttemptOutcome) and first.failure is not None:
+                        failures.append(first.failure)
+                        attempts.append(first.attempt)
+                        failure_kinds.append(first.failure.kind)
+                        await stream.aclose()
+                        continue
+                    winner = (candidate, stream, first)
+                    break
+        except BaseException:
+            for head in heads:
+                head.cancel()
             raise
-        return None
+        if winner is None:
+            return
+        candidate, stream, first = winner
+        record["winner"] = candidate.model.id
+        for head, (loser, loser_stream) in heads.items():
+            task = asyncio.create_task(self._stop_loser(head, loser, loser_stream, record))
+            self.runtime.race_tasks.add(task)
+            task.add_done_callback(self.runtime.race_tasks.discard)
+        async with aclosing(stream) as events:
+            yield first
+            if isinstance(first, _AttemptOutcome):
+                return
+            async for event in events:
+                yield event
+
+    async def _stop_loser(
+        self, head: asyncio.Future[Any], candidate: RouteCandidate, stream: Any, record: dict[str, Any],
+    ) -> None:
+        """Let a race loser reach its first token, time it, then close it."""
+        try:
+            first = await head
+        except (StopAsyncIteration, asyncio.CancelledError):
+            return
+        try:
+            if isinstance(first, StreamDelta):
+                # Losers keep the first-token figure current at the cost of one
+                # prompt evaluation; they are neither successes nor failures.
+                first_token_ms = first.first_token_ms
+                if first_token_ms is not None:
+                    self.runtime.record_first_token(candidate.model.id, first_token_ms)
+                record["participants"][candidate.model.id] = {
+                    "endpoint": candidate.model.endpoint, "success": True, "stopped": True,
+                    "latency_ms": None, "kind": None,
+                    "first_token_ms": None if first_token_ms is None else round(first_token_ms, 2),
+                }
+        finally:
+            await stream.aclose()
 
     async def _record_request(
         self, *, success: bool, rerouted: bool, failure_kinds: Sequence[str] = (),
