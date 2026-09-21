@@ -69,7 +69,7 @@ class StaticGateway:
     def status(self):  # type: ignore[no-untyped-def]
         return {
             "status": "ready" if self._router else "unavailable",
-            "version": "0.5.0",
+            "version": "0.6.0",
         }
 
 
@@ -709,3 +709,62 @@ def test_a_client_that_hangs_up_mid_answer_stops_the_backend(monkeypatch, spec_v
     bodies = [message for message in sent if message["type"] == "http.response.body" and message.get("body")]
     assert json.loads(bodies[0]["body"])["message"]["content"] == "Hel", "The first fragment was relayed before the hang-up"
     assert adapter.closed == 1 and router.runtime.state("stream-model").active_requests == 0
+
+
+def test_session_keys_come_from_the_header_or_the_conversation_fingerprint() -> None:
+    from starlette.datastructures import Headers
+    from types import SimpleNamespace
+
+    from llm_router.gateway import _session_key
+
+    def request(**headers):  # type: ignore[no-untyped-def]
+        return SimpleNamespace(headers=Headers(headers))
+
+    system = {"role": "system", "content": "You are a house assistant. Entities: light.kitchen"}
+    turn_one = [system, {"role": "user", "content": "turn on the kitchen light"}]
+    turn_two = [*turn_one, {"role": "assistant", "content": "Done."}, {"role": "user", "content": "and the hall"}]
+    key = _session_key(request(), "qwen-ha", turn_one)
+    assert key is not None and key.startswith("conversation:") and len(key) == len("conversation:") + 32
+    assert _session_key(request(), "qwen-ha", turn_two) == key, "Later turns of the same conversation share the key"
+    assert _session_key(request(), "qwen-ha", [system, {"role": "user", "content": "what time is it"}]) != key
+    assert _session_key(request(), "other-model", turn_one) != key
+    parts = [system, {"role": "user", "content": [{"type": "text", "text": "turn on the kitchen light"}, {"type": "image_url", "image_url": {"url": "data:..."}}]}]
+    assert _session_key(request(), "qwen-ha", parts) == key, "Text parts count; attachments do not"
+    assert _session_key(request(**{"X-LLM-Router-Session": " agent-42 "}), "qwen-ha", turn_one) == "named:agent-42"
+    assert _session_key(request(), "qwen-ha", [{"role": "assistant", "content": "hello"}]) is None
+    assert "turn on" not in key, "Only a digest is kept, never prompt text"
+
+
+def test_in_flight_answers_are_counted_until_they_finish(monkeypatch) -> None:
+    import llm_router.gateway as gateway_module
+
+    class CountingGateway(RecordingGateway):
+        def __init__(self, router):  # type: ignore[no-untyped-def]
+            super().__init__(router)
+            self.in_flight = 0
+            self.peak = 0
+
+        def begin_request(self) -> None:
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+
+        def end_request(self) -> None:
+            self.in_flight -= 1
+
+    monkeypatch.setattr(gateway_module, "STREAM_HEARTBEAT_SECONDS", 0.5)
+    config = make_config(models=[{"id": "stream-model", "endpoint": "source-a", "upstream_model": "m", "quality": 0.9, "capabilities": {"general": 1.0}}], router={"max_attempts": 1})
+    adapters = AdapterRegistry()
+    adapters.register("ollama-chat", StreamingAdapter(pieces=("Hel", "lo")))
+    gateway = CountingGateway(LLMRouter(config, adapters=adapters))
+    app = create_app(gateway=gateway)
+    for body in ({"model": "auto", "messages": [{"role": "user", "content": "hi"}]}, {"model": "auto", "stream": False, "messages": [{"role": "user", "content": "hi"}]}):
+        response = asyncio.run(request(app, "POST", "/api/chat", json=body))
+        assert response.status_code == 200
+    assert gateway.peak == 1 and gateway.in_flight == 0, "Streamed and buffered answers both count while in progress and are released after"
+
+    adapters.register("ollama-chat", StreamingAdapter(pieces=("Hel", "lo", "!"), piece_delay=5.0))
+    asyncio.run(_drive_until_hang_up(app, "/api/chat", {"model": "auto", "messages": [{"role": "user", "content": "hi"}]}, spec_version="2.3", disconnect_after=0.05))
+    assert gateway.in_flight == 0, "A hang-up releases the count too"
+    response = asyncio.run(request(app, "POST", "/api/chat", json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]}))
+    assert response.status_code == 503 or response.status_code == 200  # a failing/slow adapter either way releases
+    assert gateway.in_flight == 0

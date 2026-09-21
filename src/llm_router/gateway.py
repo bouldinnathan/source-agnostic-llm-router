@@ -46,7 +46,7 @@ from .self_test import run_backend_checks
 from .status_page import STATUS_CSS, STATUS_JS, render_status_html
 from .update_control import UpdateController, UpdateRequestError
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 # A streaming client hears from the router at least this often while a backend
 # is silent (loading a model, evaluating a long prompt), so idle-connection
 # timeouts in proxies and client libraries do not cut a slow start short.
@@ -140,6 +140,9 @@ class RouterGateway:
         self.metrics = metrics_store if metrics_store is not None else MetricsStore()
         self.routing_settings_store = routing_settings_store if routing_settings_store is not None else RoutingSettingsStore()
         self._recent_failures: deque[dict[str, Any]] = deque(maxlen=25)
+        # Client answers in progress, streamed or not. The updater reads this
+        # from /healthz and waits for zero before restarting the service.
+        self.in_flight = 0
         self.routing_settings = RoutingSettings()
         self._routing_settings_error: str | None = None
         self.reload_routing_settings()
@@ -167,6 +170,12 @@ class RouterGateway:
         if router is not None:
             router.settings = saved
         return saved
+
+    def begin_request(self) -> None:
+        self.in_flight += 1
+
+    def end_request(self) -> None:
+        self.in_flight = max(0, self.in_flight - 1)
 
     def record_request_failure(self, *, api: str, model: str, status: int, kind: str, detail: str) -> None:
         """Remember why a client request failed: name, status and diagnosis, never prompt text."""
@@ -376,6 +385,7 @@ class RouterGateway:
             "status": state,
             "ready": ready,
             "version": VERSION,
+            "in_flight": self.in_flight,
             "last_refresh": (
                 datetime.fromtimestamp(self._last_refresh, timezone.utc).isoformat()
                 if self._last_refresh is not None
@@ -1257,13 +1267,21 @@ def create_app(
             if not messages:
                 return JSONResponse(_ollama_empty(model, "load"))
             query = _query_request(
-                body, messages, strategy, ollama=True, preferred_tags=preferred_tags
+                body, messages, strategy, ollama=True, preferred_tags=preferred_tags,
+                session_key=_session_key(request, model, messages),
             )
             if alias is not None:
                 query = alias.apply(query)
-            if body.get("stream", True):
-                return await _relay(request, service, "ollama", model, router.complete_stream(query), _OllamaRelay(model))
-            completion = await router.complete(query)
+            finished = _track(service)
+            try:
+                if body.get("stream", True):
+                    return await _relay(
+                        request, service, "ollama", model, router.complete_stream(query), _OllamaRelay(model), finished,
+                    )
+                completion = await router.complete(query)
+            finally:
+                if not body.get("stream", True):
+                    finished()
             first, final = _ollama_completion(model, completion)
             combined = dict(final)
             combined["message"] = first["message"]
@@ -1320,17 +1338,24 @@ def create_app(
             if not isinstance(messages, list) or not messages:
                 raise ValueError("messages must be a non-empty array")
             query = _query_request(
-                body, messages, strategy, ollama=False, preferred_tags=preferred_tags
+                body, messages, strategy, ollama=False, preferred_tags=preferred_tags,
+                session_key=_session_key(request, model, messages),
             )
             if alias is not None:
                 query = alias.apply(query)
-            if body.get("stream", False):
-                options = body.get("stream_options")
-                include_usage = isinstance(options, Mapping) and options.get("include_usage") is True
-                return await _relay(
-                    request, service, "openai", model, router.complete_stream(query), _OpenAIRelay(model, include_usage)
-                )
-            completion = await router.complete(query)
+            finished = _track(service)
+            try:
+                if body.get("stream", False):
+                    options = body.get("stream_options")
+                    include_usage = isinstance(options, Mapping) and options.get("include_usage") is True
+                    return await _relay(
+                        request, service, "openai", model, router.complete_stream(query),
+                        _OpenAIRelay(model, include_usage), finished,
+                    )
+                completion = await router.complete(query)
+            finally:
+                if not body.get("stream", False):
+                    finished()
             return JSONResponse(_openai_completion(model, completion))
         except (ValueError, RequestError) as exc:
             _record_failure(service, "openai", model, exc, 400)
@@ -1501,6 +1526,61 @@ def _usable_temperature(value: Any) -> float | None:
     return number if math.isfinite(number) and 0 <= number <= 2 else None
 
 
+def _track(service: Any) -> Any:
+    """Count one client answer in progress on the service; returns an idempotent finisher."""
+    begin = getattr(service, "begin_request", None)
+    end = getattr(service, "end_request", None)
+    if begin is None or end is None:
+        return lambda: None
+    begin()
+    done = False
+
+    def finished() -> None:
+        nonlocal done
+        if not done:
+            done = True
+            end()
+
+    return finished
+
+
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            str(part.get("text", "")) for part in content if isinstance(part, Mapping) and part.get("type") == "text"
+        )
+    return ""
+
+
+def _session_key(request: Request, model: str, messages: list[Any]) -> str | None:
+    """Identify the conversation, so its turns keep landing on the same replica.
+
+    A client may name its session with ``X-LLM-Router-Session``. Otherwise the
+    requested model, the system prompt, and the first user message make a
+    fingerprint that stays the same across the turns of one conversation. No
+    prompt text is stored: only a digest.
+    """
+    named = request.headers.get("x-llm-router-session", "").strip()
+    if named:
+        return "named:" + "".join(char for char in named if char.isprintable())[:120]
+    system = next(
+        (_message_text(item.get("content")) for item in messages if isinstance(item, Mapping) and item.get("role") == "system"),
+        "",
+    )
+    user = next(
+        (_message_text(item.get("content")) for item in messages if isinstance(item, Mapping) and item.get("role") == "user"),
+        "",
+    )
+    if not system and not user:
+        return None
+    digest = hashlib.sha256(
+        json.dumps([model, system[:8192], user[:8192]], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return "conversation:" + digest[:32]
+
+
 def _query_request(
     body: Mapping[str, Any],
     messages: list[Any],
@@ -1508,6 +1588,7 @@ def _query_request(
     *,
     ollama: bool,
     preferred_tags: tuple[str, ...] = (),
+    session_key: str | None = None,
 ) -> QueryRequest:
     if not all(isinstance(message, Mapping) for message in messages):
         raise ValueError("every message must be an object")
@@ -1571,6 +1652,7 @@ def _query_request(
         tools=tuple(dict(tool) for tool in tools),
         response_format=response_format,
         preferred_tags=preferred_tags,
+        session_key=session_key,
     )
 
 
@@ -1854,15 +1936,22 @@ class _OpenAIRelay:
 async def _relay(
     request: Request | None, service: Any, api: str, model: str,
     events: AsyncIterator[StreamDelta | RoutedCompletion], render: _OllamaRelay | _OpenAIRelay,
+    finished: Any = None,
 ) -> Response:
     """Stream the router's fragments to the client, with heartbeats during silences.
 
     The response starts when the first fragment arrives or the first heartbeat
     is due, whichever comes first, so a request that fails quickly still gets a
     real HTTP error status. After that, a failure is reported in the stream.
-    A client that hangs up at any point stops the backend.
+    A client that hangs up at any point stops the backend. ``finished`` is
+    called once, however the stream ends.
     """
-    return await _ActiveRelay(request, service, api, model, events, render).start()
+    relay = _ActiveRelay(request, service, api, model, events, render, finished)
+    try:
+        return await relay.start()
+    except BaseException:
+        await relay.close()
+        raise
 
 
 class _ActiveRelay:
@@ -1871,10 +1960,12 @@ class _ActiveRelay:
     def __init__(
         self, request: Request | None, service: Any, api: str, model: str,
         events: AsyncIterator[StreamDelta | RoutedCompletion], render: _OllamaRelay | _OpenAIRelay,
+        finished: Any = None,
     ) -> None:
         self.service, self.api, self.model = service, api, model
         self.events = events
         self.render = render
+        self.finished = finished
         self.receive = request.receive if request is not None else None
         self.head: asyncio.Future[Any] | None = None
         # The request body has been read, so the next message the server hands
@@ -1963,6 +2054,8 @@ class _ActiveRelay:
         if self.closed:
             return
         self.closed = True
+        if self.finished is not None:
+            self.finished()
         cleanup = asyncio.ensure_future(_close_events(self.head, self.events, self.watch))
         _CLEANUPS.add(cleanup)
         cleanup.add_done_callback(_CLEANUPS.discard)

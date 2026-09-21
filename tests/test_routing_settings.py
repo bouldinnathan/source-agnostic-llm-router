@@ -18,7 +18,7 @@ def test_defaults_keep_current_behaviour_and_missing_file_reads_as_defaults(tmp_
     assert store.load() == RoutingSettings()
     assert RoutingSettings().to_dict() == {
         "advertise_machine_aliases": True, "prefer_fastest_replica": False, "prefer_first_token": False,
-        "race_replicas": False, "race_every": 20,
+        "race_replicas": False, "session_affinity": True, "race_every": 20,
         "first_token_timeout_seconds": 300, "idle_timeout_seconds": 90, "max_request_seconds": 0,
     }
     assert not (tmp_path / "missing").exists(), "Reading never creates files"

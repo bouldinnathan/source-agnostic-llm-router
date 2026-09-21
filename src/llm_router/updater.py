@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from typing import Iterator, Sequence
 
 from .update_progress import UpdateProgress
@@ -218,6 +219,69 @@ def _populate_release(install_dir: Path, release: Path, commit: str) -> Path:
     return runtime
 
 
+DRAIN_SECONDS = 15 * 60
+
+
+def _router_status_url() -> tuple[str, str | None] | None:
+    """The running gateway's status URL and API key, from the service's own environment file."""
+    config_home = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    try:
+        text = (Path(config_home) / "llm-router" / "router.env").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    port = values.get("LLM_ROUTER_PORT", "8088")
+    if not port.isdigit() or not 0 < int(port) < 65536:
+        return None
+    host = values.get("LLM_ROUTER_HOST", "127.0.0.1")
+    if host in {"", "0.0.0.0", "::", "[::]"}:
+        host = "127.0.0.1"
+    return f"http://{host}:{int(port)}/router/status", values.get("LLM_ROUTER_GATEWAY_API_KEY") or None
+
+
+def _in_flight(url: str, key: str | None) -> int | None:
+    """How many answers the gateway is producing, or None when it cannot say."""
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"} if key else {})
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:  # noqa: S310 - local gateway from our own env file
+            payload = json.loads(response.read(65536))
+    except Exception:
+        return None
+    value = payload.get("in_flight") if isinstance(payload, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _drain(limit: float = DRAIN_SECONDS) -> None:
+    """Wait for the router to finish the answers it is producing before it is restarted.
+
+    A restart cuts every stream in flight, and an agent's multi-hour job cannot
+    be resumed by anyone but its client. A gateway too old to report the count
+    or an unreachable one is restarted at once, as before.
+    """
+    target = _router_status_url()
+    if target is None:
+        return
+    url, key = target
+    deadline = time.monotonic() + limit
+    reported: int | None = None
+    while True:
+        count = _in_flight(url, key)
+        if not count:
+            return
+        if count != reported:
+            print(f"Waiting for {count} in-flight request{'s' if count != 1 else ''} to finish before restarting.")
+            reported = count
+        if time.monotonic() >= deadline:
+            print("Restarting anyway: in-flight requests did not finish within the drain limit.")
+            return
+        time.sleep(2)
+
+
 def _service_active() -> bool:
     result = _run(["systemctl", "--user", "show", SERVICE_NAME, "--property=ActiveState", "--value"])
     state = result.stdout.strip()
@@ -356,6 +420,9 @@ def run_update(install_dir: Path) -> None:
             # Read the service state after staging so a deliberate stop made during
             # the download is honored. Never turn a stopped service on automatically.
             was_active = _service_active()
+            if was_active:
+                progress.advance("draining")
+                _drain()
             progress.advance("restarting")
             _activate(install_dir, runtime, was_active)
             actual_current = commit

@@ -62,7 +62,9 @@ def write_user_service(
         "Environment=PYTHONUNBUFFERED=1\n"
         "Restart=on-failure\n"
         "RestartSec=5\n"
-        "TimeoutStopSec=30\n"
+        # On stop the gateway keeps serving the answers already in flight;
+        # give a long agent turn time to finish before systemd kills it.
+        "TimeoutStopSec=900\n"
         "UMask=0077\n"
         "NoNewPrivileges=true\n\n"
         "[Install]\n"

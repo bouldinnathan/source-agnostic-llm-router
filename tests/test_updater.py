@@ -322,3 +322,41 @@ def test_release_directory_symlink_is_rejected(installation: Path, tmp_path: Pat
     (installation / "releases").symlink_to(tmp_path, target_is_directory=True)
     with pytest.raises(RuntimeError, match="must not be a symlink"):
         updater._stage(installation, NEW)
+
+
+def test_drain_waits_for_in_flight_answers_then_restarts_anyway(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(updater, "_router_status_url", lambda: ("http://127.0.0.1:8088/router/status", "k"))
+    counts = iter([2, 2, 1, 0])
+    polled: list[tuple[str, str | None]] = []
+
+    def in_flight(url: str, key: str | None) -> int | None:
+        polled.append((url, key))
+        return next(counts)
+
+    monkeypatch.setattr(updater, "_in_flight", in_flight)
+    monkeypatch.setattr(updater.time, "sleep", lambda _: None)
+    updater._drain()
+    assert len(polled) == 4 and polled[0] == ("http://127.0.0.1:8088/router/status", "k")
+    output = capsys.readouterr().out
+    assert output.count("Waiting for") == 2, "Progress is printed when the count changes, not every poll"
+    assert "2 in-flight requests" in output and "1 in-flight request " in output
+
+    monkeypatch.setattr(updater, "_in_flight", lambda url, key: 3)
+    updater._drain(limit=0)
+    assert "Restarting anyway" in capsys.readouterr().out
+
+    monkeypatch.setattr(updater, "_in_flight", lambda url, key: None)
+    updater._drain()
+    monkeypatch.setattr(updater, "_router_status_url", lambda: None)
+    updater._drain()
+
+
+def test_router_status_url_comes_from_the_service_environment_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert updater._router_status_url() is None, "No service environment means no drain"
+    env_dir = tmp_path / "llm-router"
+    env_dir.mkdir()
+    (env_dir / "router.env").write_text("# managed\nLLM_ROUTER_HOST=0.0.0.0\nLLM_ROUTER_PORT=9099\nLLM_ROUTER_GATEWAY_API_KEY=\"secret\"\n", encoding="utf-8")
+    assert updater._router_status_url() == ("http://127.0.0.1:9099/router/status", "secret"), "A LAN listener is reached on loopback"
+    (env_dir / "router.env").write_text("LLM_ROUTER_PORT=notaport\n", encoding="utf-8")
+    assert updater._router_status_url() is None

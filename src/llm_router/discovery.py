@@ -246,6 +246,9 @@ class ModelDiscovery:
         entries = entries[: self.settings.max_models_per_source]
         if probe.kind == "ollama" and entries:
             entries = await self._ollama_details(client, probe, entries, headers, params)
+        elif probe.kind == "openai" and entries and (probe.local or probe.base_url.startswith("http://")):
+            # Only plain-HTTP or LAN servers can be LM Studio; cloud APIs are never asked.
+            entries = await self._lmstudio_details(client, probe, entries, headers, params)
 
         endpoint = _endpoint_for_probe(probe)
         if probe.configured_endpoint is None:
@@ -313,6 +316,48 @@ class ModelDiscovery:
             return entry
 
         return list(await asyncio.gather(*(enrich(entry) for entry in entries)))
+
+    async def _lmstudio_details(
+        self,
+        client: httpx.AsyncClient,
+        probe: ProbeSpec,
+        entries: list[Mapping[str, Any]],
+        headers: Mapping[str, str],
+        params: Mapping[str, str],
+    ) -> list[Mapping[str, Any]]:
+        """Merge LM Studio's native model listing, which knows context sizes and model types.
+
+        ``/api/v0/models`` reports each model's maximum context, the context it
+        is actually loaded with, whether it is an embedding model, and its
+        capabilities. Other OpenAI-compatible servers answer 404, which
+        changes nothing.
+        """
+        base = probe.base_url.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        try:
+            response = await client.get(
+                base + "/api/v0/models", headers=headers, params=params, timeout=probe.timeout_seconds,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return entries
+        listed = payload.get("data") if isinstance(payload, Mapping) else None
+        if not isinstance(listed, list):
+            return entries
+        details = {
+            str(item["id"]): item for item in listed
+            if isinstance(item, Mapping) and isinstance(item.get("id"), str)
+        }
+        merged: list[Mapping[str, Any]] = []
+        for entry in entries:
+            name = _model_name(entry, "openai")
+            detail = details.get(name) if name else None
+            merged.append({**entry, "_lmstudio": dict(detail)} if detail is not None else entry)
+        return merged
 
     def _probes(self) -> tuple[ProbeSpec, ...]:
         probes = _configured_probes(self.configured, self.settings.timeout_seconds)
@@ -433,10 +478,13 @@ def infer_model_profile(
     if any(token in lowered for token in ("mini", "nano", "small", "flash", "haiku", "lite")):
         quality = min(quality, 0.82)
 
+    # LM Studio serves a model with the context it was loaded with, not the
+    # model's maximum, so the loaded size comes first. Ollama's /api/show puts
+    # the maximum under an architecture-prefixed key such as qwen3.context_length.
     context = _first_positive_int(
         metadata,
-        ("context_length", "context_window", "input_token_limit", "num_ctx"),
-    ) or (32_768 if local else 128_000)
+        ("loaded_context_length", "max_context_length", "context_length", "context_window", "input_token_limit", "num_ctx"),
+    ) or _architecture_context_length(metadata) or (32_768 if local else 128_000)
     max_output = _first_positive_int(
         metadata,
         ("max_output_tokens", "output_token_limit", "max_tokens"),
@@ -450,12 +498,12 @@ def infer_model_profile(
     if any(token in lowered for token in ("code", "coder", "codestral", "devstral")):
         coding = max(coding, 0.94)
     vision = 0.0
-    if "vision" in declared or any(
+    if "vision" in declared or metadata.get("type") == "vlm" or any(
         token in lowered for token in ("vision", "llava", "-vl", ".vl", "multimodal")
     ):
         vision = 0.9
     tools = 0.0
-    if "tools" in declared or "tool" in declared:
+    if declared & {"tools", "tool", "tool_use", "function_calling"}:
         tools = 0.9
     elif not local:
         tools = 0.86
@@ -870,6 +918,12 @@ def _model_name(entry: Mapping[str, Any], kind: str) -> str | None:
 
 
 def _is_chat_model(name: str, metadata: Mapping[str, Any]) -> bool:
+    detail = metadata.get("_lmstudio")
+    if isinstance(detail, Mapping) and detail.get("type") == "embeddings":
+        # LM Studio knows an embedding model whatever it is called. The reverse
+        # is not reliable: an embedding model imported as a GGUF is listed as
+        # an "llm", so a chat-looking type still goes through the name check.
+        return False
     lowered = name.lower()
     blocked = (
         "embedding",
@@ -908,8 +962,11 @@ def _model_config(
     *,
     source_priority: tuple[str, ...] = (),
 ) -> ModelConfig:
-    detail = metadata.get("_show")
-    merged_metadata = {**metadata, **detail} if isinstance(detail, Mapping) else metadata
+    merged_metadata: dict[str, Any] = dict(metadata)
+    for key in ("_show", "_lmstudio"):
+        detail = metadata.get(key)
+        if isinstance(detail, Mapping):
+            merged_metadata.update(detail)
     profile = infer_model_profile(
         model_name,
         provider=probe.provider,
@@ -953,6 +1010,18 @@ def _declared_capabilities(metadata: Mapping[str, Any]) -> set[str]:
         if isinstance(value, list):
             values.extend(value)
     return {str(value).lower() for value in values}
+
+
+def _architecture_context_length(metadata: Mapping[str, Any]) -> int | None:
+    """Ollama reports ``<architecture>.context_length`` inside ``model_info``."""
+    info = metadata.get("model_info")
+    if not isinstance(info, Mapping):
+        return None
+    for key, value in info.items():
+        if isinstance(key, str) and key.endswith(".context_length"):
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+    return None
 
 
 def _first_positive_int(metadata: Mapping[str, Any], keys: tuple[str, ...]) -> int | None:

@@ -65,6 +65,30 @@ class LLMRouter:
         self.ranker.prefer_fastest = value.prefer_fastest_replica
         self.ranker.prefer_first_token = value.prefer_first_token
 
+    def _sticky(self, request: QueryRequest, decision: RoutingDecision) -> RoutingDecision | None:
+        """Keep a conversation on the replica that answered it last, when it still qualifies.
+
+        The backend's prompt cache makes a follow-up turn far cheaper on the
+        same server than a fresh evaluation of the whole context elsewhere. An
+        unavailable, open-circuit, or now-ineligible replica is simply not
+        sticky, and a named machine always wins over affinity.
+        """
+        key = request.session_key
+        if not self._settings.session_affinity or not key:
+            return None
+        deployment = self.runtime.session_deployment(key)
+        if deployment is None:
+            return None
+        match = next((candidate for candidate in decision.candidates if candidate.model.id == deployment), None)
+        if match is None or not self.runtime.is_available(deployment):
+            return None
+        if request.preferred_endpoints and match.model.endpoint not in request.preferred_endpoints:
+            return None
+        if decision.candidates[0] is match:
+            return decision
+        others = tuple(candidate for candidate in decision.candidates if candidate is not match)
+        return replace(decision, candidates=(match, *others))
+
     def _stream_timeouts(self) -> StreamTimeouts:
         settings = self._settings
         return StreamTimeouts(
@@ -117,6 +141,9 @@ class LLMRouter:
         except NoEligibleModel:
             await self._record_request(success=False, rerouted=False, failure_kinds=("no_eligible_model",))
             raise
+        sticky = self._sticky(request, decision)
+        if sticky is not None:
+            decision = sticky
         limit = min(self.config.policy.max_attempts, len(decision.candidates))
         failures: list[UpstreamFailure] = []
         attempts: list[dict[str, Any]] = []
@@ -124,7 +151,8 @@ class LLMRouter:
         remaining = list(decision.candidates[:limit])
 
         sources: list[AsyncIterator[StreamDelta | _AttemptOutcome]] = []
-        participants = self._race_participants(request, decision)
+        # A conversation that is already warm somewhere is not worth racing.
+        participants = () if sticky is not None else self._race_participants(request, decision)
         if participants:
             sources.append(self._race_stream(request, participants, failures, attempts, failure_kinds))
             raced = {candidate.model.id for candidate in participants}
@@ -145,6 +173,8 @@ class LLMRouter:
             if outcome is None:
                 continue  # every raced replica failed before its first token; try what is left
             if outcome.failure is None:
+                if request.session_key:
+                    self.runtime.remember_session(request.session_key, outcome.candidate.model.id)
                 yield await self._finish(outcome, decision, failures, attempts, failure_kinds)
                 return
             failures.append(outcome.failure)

@@ -441,6 +441,17 @@ Non-chat models are displayed but are not enrolled as chat deployments. When
 Ollama exposes both APIs at one address, routing prefers its native API and
 does not create duplicate copies of the models.
 
+Context windows come from the backends rather than from guesses where they
+can. Ollama's `/api/show` reports each model's maximum context (the
+architecture's `context_length`), which a request's `num_ctx` may use up to.
+LM Studio's native `/api/v0/models` listing reports the context a model is
+**loaded with**, which is what it actually serves, its maximum, whether it is
+an embedding or vision model, and whether it supports tools; the router asks
+plain-HTTP OpenAI-compatible servers for it and ignores a 404. A model LM
+Studio has not loaded yet is enrolled with its maximum context, but LM Studio
+loads it just-in-time with the default context from its own model settings, so
+set that default there when clients need more than 4096 tokens.
+
 One address's server checks (for example Ollama and the OpenAI-compatible API)
 sit side by side on wide screens and stack on narrow ones. Model IDs appear as a
 compact wrapped grid with the API address shown once per server, or beside each
@@ -501,13 +512,19 @@ LM Studio, your operating system, or backend model files.
 Starting with **0.3.2**, `/status` has a **Check for updates** button at the top.
 Unlock the page with the router API key first. Clicking the button checks the
 official `main` branch and **automatically installs a newer commit**, if one is
-available; it is not a check-only button. A running router restarts briefly after
-the new runtime passes validation. An unchanged commit does not reinstall or
+available; it is not a check-only button. A running router restarts after the
+new runtime passes validation, and only once the answers it is producing have
+finished: the updater watches the in-flight count at `/router/status` and waits
+up to 15 minutes before restarting anyway, and the service unit gives the old
+process another 15 minutes to finish streams already open when it is stopped.
+A request that starts during the swap itself still fails and must be retried
+by its client. Installations created before 0.6.0 keep a 30-second stop
+timeout until `install.sh --service` is run again. An unchanged commit does not reinstall or
 restart anything. Anyone with the router API key can request this action, so
 keep that key private and use a trusted LAN/VPN or HTTPS connection.
 
 The progress indicator shows actual stages: checking, downloading, validating,
-and restarting. It is indeterminate rather than an estimated download percentage.
+draining (waiting for in-flight requests), and restarting. It is indeterminate rather than an estimated download percentage.
 The update runs in the separate `llm-router-update.service`, so it continues
 while the gateway restarts or the browser closes. The page reconnects and reads
 the saved result; a returning server alone is not treated as update success.
@@ -617,7 +634,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.5.0-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.6.0-py3-none-any.whl
 llm-router --json discover
 ```
 
@@ -762,10 +779,41 @@ The settings API is `GET` and `POST /status/settings`. Both need the router
 Bearer key even on otherwise keyless gateways; `POST` additionally requires
 `X-LLM-Router-Settings: 1`, a same-origin browser request, and a JSON object with
 any of `advertise_machine_aliases`, `prefer_fastest_replica`, `prefer_first_token`,
-`race_replicas`, `race_every`, `first_token_timeout_seconds`, `idle_timeout_seconds`,
-and `max_request_seconds`. Invalid values are rejected with HTTP 400 and nothing
+`race_replicas`, `session_affinity`, `race_every`, `first_token_timeout_seconds`,
+`idle_timeout_seconds`, and `max_request_seconds`. Invalid values are rejected with HTTP 400 and nothing
 changes; a storage failure returns 503 and nothing changes. Detailed `/status/data`
 carries the same object under `routing`.
+
+### Session affinity: a conversation stays where its cache is warm
+
+Every turn of an agent conversation resends the whole context. A backend that
+already holds that context in its prompt cache answers the next turn after a
+short evaluation; a different replica must evaluate the whole context again,
+which for a long coding session costs far more than any speed difference
+between replicas. **Keep a conversation on the replica that started it**, on by
+default, therefore sends follow-up turns back to the replica that answered
+last, for 30 minutes after its last turn.
+
+The router recognizes a conversation by a client-supplied
+`X-LLM-Router-Session` header when present, and otherwise by a digest of the
+requested model name, the system prompt, and the first user message, which
+stay the same across the turns of one conversation. No prompt text is kept.
+Affinity never overrides a hard constraint: a replica that is unavailable, has
+an open circuit, or no longer satisfies the request is not sticky, a
+preferred-machine name (`…-machine`) still wins, and a sticky conversation is
+never raced. The memory is process-local, holds at most 2000 conversations,
+and is lost on restart.
+
+### Per-backend concurrency
+
+An endpoint may declare how many answers its server generates at once with
+`max_concurrent_requests` (for example `1` for an LM Studio instance that
+queues requests per model, or the value of `OLLAMA_NUM_PARALLEL`). When that
+many answers are already in flight there, its replicas move behind idle
+replicas of the same model, so a request is answered now rather than queued.
+Nothing is excluded: if every replica is busy, the best one still takes the
+request and the backend queues it. Without the setting the router only prefers
+less loaded replicas through the ranking's load factor.
 
 ### Streaming, silences, and long-running requests
 
@@ -1094,12 +1142,12 @@ Wheels include the plugin and example config under the Python installation's `sh
 
 ## Configuration model
 
-An endpoint is a network source and adapter. A model entry is a deployable model at one endpoint. Discovery automatically creates separate deployment IDs for the same model at different IPs, keeping health, latency, and circuit state independent. Explicit entries with the same IDs override discovered metadata.
+An endpoint is a network source and adapter; it may declare `max_concurrent_requests` (see [Per-backend concurrency](#per-backend-concurrency)). A model entry is a deployable model at one endpoint. Discovery automatically creates separate deployment IDs for the same model at different IPs, keeping health, latency, and circuit state independent. Explicit entries with the same IDs override discovered metadata.
 
 Hard constraints filter deployments before scoring:
 
 - explicit capabilities and the configured capability threshold;
-- context window and output limit;
+- context window and output limit (reported by Ollama and LM Studio where available);
 - input/output price ceilings;
 - enabled state, exclusions, and open circuits.
 

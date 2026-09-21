@@ -114,6 +114,9 @@ def config_from_mapping(payload: Mapping[str, Any], *, source_path: str | None =
             machine_id=_optional_nonempty_string(raw, "machine_id", f"endpoints.{name}"),
             discover=_boolean(raw.get("discover", False), f"endpoints.{name}.discover"),
             health_path=_optional_nonempty_string(raw, "health_path", f"endpoints.{name}"),
+            max_concurrent_requests=_optional_positive_int(
+                raw.get("max_concurrent_requests"), f"endpoints.{name}.max_concurrent_requests"
+            ),
         )
 
     models: list[ModelConfig] = []
@@ -306,6 +309,14 @@ def _float(value: Any, location: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigError(f"{location} must be a number")
     return float(value)
+
+
+def _optional_positive_int(value: object, location: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigError(f"{location} must be a positive whole number")
+    return value
 
 
 def _positive_float(value: Any, location: str) -> float:

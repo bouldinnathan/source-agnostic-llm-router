@@ -646,3 +646,44 @@ def test_unnamed_source_identifiers_do_not_expose_url_credentials_or_private_pat
         assert identifier is not None
         assert "host-example" in identifier
         assert all(secret not in identifier for secret in ("user-secret", "password-secret", "path-secret"))
+
+
+def test_backend_metadata_gives_real_context_windows_and_model_types() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "ollama.test" and request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"model": "qwen3:1.7b"}]})
+        if request.url.host == "ollama.test" and request.url.path == "/api/show":
+            return httpx.Response(200, json={
+                "capabilities": ["completion", "tools", "thinking"],
+                "model_info": {"general.architecture": "qwen3", "qwen3.context_length": 40960, "qwen3.embedding_length": 2048},
+                "parameters": "top_k 20",
+            })
+        if request.url.host == "lm.test" and request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "nemotron-3.5-lightning-30b"}, {"id": "nomic-thing"}, {"id": "gemma-3-12b"}, {"id": "embeddinggemma-latest"}, {"id": "plain-server-model"}]})
+        if request.url.host == "lm.test" and request.url.path == "/api/v0/models":
+            return httpx.Response(200, json={"data": [
+                {"id": "nemotron-3.5-lightning-30b", "type": "llm", "state": "loaded", "max_context_length": 1048576, "loaded_context_length": 8192, "capabilities": ["tool_use"]},
+                {"id": "nomic-thing", "type": "embeddings", "state": "not-loaded", "max_context_length": 2048},
+                {"id": "gemma-3-12b", "type": "vlm", "state": "not-loaded", "max_context_length": 131072},
+                {"id": "embeddinggemma-latest", "type": "llm", "state": "not-loaded", "max_context_length": 2048},
+            ]})
+        if request.url.host == "plain.test" and request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "some-model"}]})
+        if request.url.host == "plain.test":
+            return httpx.Response(404, json={"error": "no such API"})
+        raise httpx.ConnectError("offline", request=request)
+
+    settings = DiscoverySettings(
+        include_loopback=False, include_cloud=False,
+        extra_urls=("ollama=http://ollama.test:11434", "openai=http://lm.test:1234/v1", "openai=http://plain.test:8000/v1"),
+    )
+    report = asyncio.run(ModelDiscovery(settings, transport=httpx.MockTransport(handler)).discover())
+    models = {model.upstream_model: model for model in report.config.models}
+    assert models["qwen3:1.7b"].context_window == 40960, "Ollama's architecture-prefixed context length is read"
+    assert models["nemotron-3.5-lightning-30b"].context_window == 8192, "LM Studio serves the context a model was loaded with"
+    assert models["nemotron-3.5-lightning-30b"].capabilities["tool_use"] >= 0.9, "LM Studio's declared tool_use capability is trusted"
+    assert "nomic-thing" not in models, "LM Studio says it is an embedding model, whatever its name"
+    assert "embeddinggemma-latest" not in models, "An embedding model LM Studio mislabels as an llm is still caught by its name"
+    assert models["gemma-3-12b"].context_window == 131072 and models["gemma-3-12b"].capabilities.get("vision", 0) >= 0.9
+    from llm_router.discovery import infer_model_profile
+    assert models["some-model"].context_window == infer_model_profile("some-model", provider="openai-compatible", local=False)["context_window"], "A server without LM Studio's API keeps the inferred default"

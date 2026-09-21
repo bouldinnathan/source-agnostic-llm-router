@@ -370,3 +370,11 @@ def test_smoke_never_reads_or_probes_operator_saved_state(monkeypatch, tmp_path)
     assert not metrics_file.exists()
     assert {name: os.environ.get(name) for name in before} == before
     assert bootstrap.DEFAULT_CONFIG_LOCATIONS == (router_config,)
+
+
+def test_draining_is_a_recorded_stage(tmp_path):
+    progress = UpdateProgress(tmp_path)
+    progress.advance("checking")
+    progress.advance("draining")
+    status = read_update_status(tmp_path)
+    assert status["stage"] == "draining" and "in-flight" in status["message"]

@@ -45,6 +45,7 @@ class RoutingSettings:
     prefer_fastest_replica: bool = False
     prefer_first_token: bool = False
     race_replicas: bool = False
+    session_affinity: bool = True
     race_every: int = 20
     first_token_timeout_seconds: int = 300
     idle_timeout_seconds: int = 90
@@ -56,6 +57,7 @@ class RoutingSettings:
             "prefer_fastest_replica": self.prefer_fastest_replica,
             "prefer_first_token": self.prefer_first_token,
             "race_replicas": self.race_replicas,
+            "session_affinity": self.session_affinity,
             "race_every": self.race_every,
             "first_token_timeout_seconds": self.first_token_timeout_seconds,
             "idle_timeout_seconds": self.idle_timeout_seconds,
@@ -74,7 +76,7 @@ def validate_settings(data: object, *, base: RoutingSettings | None = None) -> R
     if unknown:
         raise ValueError("Unknown routing setting: " + ", ".join(sorted(str(name) for name in unknown)))
     changes: dict[str, Any] = {}
-    for name in ("advertise_machine_aliases", "prefer_fastest_replica", "prefer_first_token", "race_replicas"):
+    for name in ("advertise_machine_aliases", "prefer_fastest_replica", "prefer_first_token", "race_replicas", "session_affinity"):
         if name in data:
             if type(data[name]) is not bool:
                 raise ValueError(f"{name} must be true or false.")

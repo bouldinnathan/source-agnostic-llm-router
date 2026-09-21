@@ -80,6 +80,10 @@ class EndpointConfig:
     machine_id: str | None = None
     discover: bool = False
     health_path: str | None = None
+    # How many answers this server generates at once before further requests
+    # queue behind them. None means the router does not know and never demotes
+    # it for load; the ranking still prefers idle replicas.
+    max_concurrent_requests: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,10 +182,17 @@ class QueryRequest:
     preferred_tags: tuple[str, ...] = ()
     allowed_deployments: tuple[str, ...] | None = None
     preferred_endpoints: tuple[str, ...] = ()
+    # Conversations keep the replica that started them (see session affinity):
+    # a client-supplied session name or a fingerprint of the conversation.
+    session_key: str | None = None
 
     def __post_init__(self) -> None:
         if not self.messages:
             raise RequestError("messages must not be empty")
+        if self.session_key is not None and not (
+            isinstance(self.session_key, str) and 0 < len(self.session_key) <= 160 and self.session_key.isprintable()
+        ):
+            raise RequestError("session_key must be a short printable string")
         if not all(isinstance(message, Mapping) for message in self.messages):
             raise RequestError("every message must be an object")
         # JSON clients send whole numbers in several spellings: Home Assistant's

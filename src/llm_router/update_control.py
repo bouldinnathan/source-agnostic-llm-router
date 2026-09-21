@@ -95,7 +95,7 @@ class UpdateController:
     def _snapshot(**fields: Any) -> dict[str, Any]:
         return {
             "available": True, "busy": False, "state": "idle", "stage": "idle",
-            "message": "Check the official main branch and install a newer update, if available. The router may restart briefly.",
+            "message": "Check the official main branch and install a newer update, if available. The router restarts once the answers it is producing have finished.",
             "run_id": None, "updated_at": None, "current_version": __version__,
             "current_commit": None, "target_commit": None, **fields,
         }

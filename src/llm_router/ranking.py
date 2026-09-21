@@ -98,6 +98,7 @@ class Ranker:
             candidates = _diversify_endpoints(candidates)
         if self.prefer_fastest:
             candidates = _prefer_fastest_replicas(candidates, first_token=self.prefer_first_token)
+        candidates = self._demote_saturated(candidates)
         if request.preferred_endpoints:
             # A named machine is the first choice after hard constraints, even
             # when another replica has a better score. Preserve scoring within
@@ -111,6 +112,23 @@ class Ranker:
             candidates=tuple(candidates),
             excluded=excluded,
         )
+
+    def _demote_saturated(self, candidates: list[RouteCandidate]) -> list[RouteCandidate]:
+        """Move replicas on a server already generating its limit of answers behind the rest.
+
+        A saturated server would queue the request behind others, so an idle
+        replica elsewhere answers sooner. Nothing is excluded: when every
+        candidate is saturated the best one still takes the request.
+        """
+        models = self.config.models
+        saturated = set()
+        for name, endpoint in self.config.endpoints.items():
+            limit = endpoint.max_concurrent_requests
+            if limit is not None and self.runtime.endpoint_load(name, models) >= limit:
+                saturated.add(name)
+        if not saturated:
+            return candidates
+        return sorted(candidates, key=lambda item: item.model.endpoint in saturated)
 
     def _exclusion_reasons(
         self,

@@ -210,3 +210,28 @@ def test_prefer_fastest_can_rank_by_first_token_instead_of_total_time() -> None:
     router.settings = RoutingSettings(prefer_fastest_replica=True, prefer_first_token=True)
     assert [item.model.id for item in router.route(ha).candidates] == ["qwen-a", "qwen-b"]
     assert router.route(ha).candidates[0].observed_first_token_ms == 50
+
+
+def test_saturated_servers_are_demoted_but_never_excluded() -> None:
+    from dataclasses import replace
+
+    config = make_config(
+        models=[
+            {"id": "qwen-a", "endpoint": "source-a", "upstream_model": "qwen", "quality": 0.95, "capabilities": {"general": 1.0}},
+            {"id": "qwen-b", "endpoint": "source-b", "upstream_model": "qwen", "quality": 0.90, "capabilities": {"general": 1.0}},
+        ],
+    )
+    config = replace(config, endpoints={
+        name: replace(endpoint, max_concurrent_requests=1 if name == "source-a" else None)
+        for name, endpoint in config.endpoints.items()
+    })
+    router = LLMRouter(config)
+    request = QueryRequest.from_prompt("hi")
+    assert [item.model.id for item in router.route(request).candidates] == ["qwen-a", "qwen-b"]
+    router.runtime.begin("qwen-a")
+    assert [item.model.id for item in router.route(request).candidates] == ["qwen-b", "qwen-a"], "A server at its limit queues, so the idle replica goes first"
+    router.runtime.begin("qwen-b")
+    router.runtime.begin("qwen-b")
+    assert [item.model.id for item in router.route(request).candidates] == ["qwen-b", "qwen-a"], "A server without a known limit is never demoted"
+    router.runtime.end_without_result("qwen-a")
+    assert [item.model.id for item in router.route(request).candidates] == ["qwen-a", "qwen-b"]

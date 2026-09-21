@@ -33,6 +33,10 @@ class EndpointState:
     last_error: str | None = None
 
 
+SESSION_TTL_SECONDS = 30 * 60
+SESSION_LIMIT = 2000
+
+
 class RuntimeRegistry:
     """Tracks ephemeral deployment health for one router process."""
 
@@ -45,6 +49,30 @@ class RuntimeRegistry:
         self.race_counters: dict[str, int] = {}
         self.last_races: deque[dict[str, Any]] = deque(maxlen=5)
         self.race_tasks: set[asyncio.Task[Any]] = set()
+        # Conversation -> replica that served it last, so a follow-up turn lands
+        # where the backend's prompt cache is warm. Bounded and time-limited.
+        self.sessions: dict[str, tuple[str, float]] = {}
+
+    def remember_session(self, key: str, deployment: str) -> None:
+        self.sessions.pop(key, None)
+        self.sessions[key] = (deployment, time.monotonic())
+        while len(self.sessions) > SESSION_LIMIT:
+            self.sessions.pop(next(iter(self.sessions)))
+
+    def session_deployment(self, key: str) -> str | None:
+        """The replica this conversation last used, unless it has gone quiet for too long."""
+        entry = self.sessions.get(key)
+        if entry is None:
+            return None
+        deployment, last_used = entry
+        if time.monotonic() - last_used > SESSION_TTL_SECONDS:
+            self.sessions.pop(key, None)
+            return None
+        return deployment
+
+    def endpoint_load(self, endpoint: str, models: tuple[ModelConfig, ...]) -> int:
+        """Answers this server is generating right now, across all its models."""
+        return sum(self._states[model.id].active_requests for model in models if model.endpoint == endpoint and model.id in self._states)
 
     def state(self, deployment: str) -> DeploymentState:
         return self._states.setdefault(deployment, DeploymentState())

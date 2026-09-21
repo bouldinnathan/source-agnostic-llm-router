@@ -24,6 +24,7 @@ _MESSAGES = {
     ("running", "checking"): "Checking the installed revision and official main branch.",
     ("running", "downloading"): "Downloading and preparing the new router runtime.",
     ("running", "validating"): "Validating the new runtime with isolated, model-free checks.",
+    ("running", "draining"): "Waiting for in-flight requests to finish before restarting the router.",
     ("running", "restarting"): "Activating the validated update and checking the router service.",
     ("succeeded", "complete"): "Update installed successfully; the router service state was preserved.",
     ("current", "complete"): "The router already has the current official main revision.",

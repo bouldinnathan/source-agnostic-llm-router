@@ -149,6 +149,8 @@ _STATUS_HTML = """<!doctype html>
             <label class="setting setting-number"><span><strong>Race every</strong></span><input id="setting-race-every" type="number" min="2" max="1000" step="1" inputmode="numeric" disabled><span class="muted">requests per model (2 to 1000)</span></label>
             <label class="setting"><input id="setting-prefer-first-token" type="checkbox" disabled>
               <span><strong>Rank the fastest replica by first token</strong><span class="muted">Use time to first token instead of total answer time when preferring the fastest replica. Better for voice, where the wait before speech starts is what you feel.</span></span></label>
+            <label class="setting"><input id="setting-session-affinity" type="checkbox" disabled>
+              <span><strong>Keep a conversation on the replica that started it</strong><span class="muted">Follow-up turns of the same conversation go back to the server that answered last, where its prompt cache is still warm, for 30 minutes. A named machine, an unavailable replica, or a client's X-LLM-Router-Session header take precedence.</span></span></label>
             <p class="muted setting-note">Backend answers are read as token streams, so these limits apply to silences, not to the whole answer. Loading a model and evaluating a long prompt happen before the first token.</p>
             <label class="setting setting-number"><span><strong>First-token timeout</strong></span><input id="setting-first-token-timeout" type="number" min="5" max="3600" step="1" inputmode="numeric" disabled><span class="muted">seconds a backend may stay silent before its first token (5 to 3600)</span></label>
             <label class="setting setting-number"><span><strong>Idle timeout</strong></span><input id="setting-idle-timeout" type="number" min="5" max="3600" step="1" inputmode="numeric" disabled><span class="muted">seconds between tokens before an attempt is abandoned (5 to 3600)</span></label>
@@ -386,7 +388,7 @@ STATUS_JS = r"""
   let settingsGeneration = 0;
   let activeSettings = null;
   let routingSettings = null;
-  const settingFields = {advertise_machine_aliases: "setting-advertise-machine", prefer_fastest_replica: "setting-prefer-fastest", prefer_first_token: "setting-prefer-first-token", race_replicas: "setting-race"};
+  const settingFields = {advertise_machine_aliases: "setting-advertise-machine", prefer_fastest_replica: "setting-prefer-fastest", prefer_first_token: "setting-prefer-first-token", race_replicas: "setting-race", session_affinity: "setting-session-affinity"};
   const settingNumbers = {
     race_every: ["setting-race-every", 2, 1000, "Race every"],
     first_token_timeout_seconds: ["setting-first-token-timeout", 5, 3600, "First-token timeout"],
@@ -1115,6 +1117,7 @@ STATUS_JS = r"""
       routing.settings.advertise_machine_aliases ? "machine names shown" : "machine names hidden",
       routing.settings.prefer_fastest_replica ? (routing.settings.prefer_first_token ? "fastest first token first" : "fastest first") : "",
       routing.settings.race_replicas ? `race every ${routing.settings.race_every}` : "",
+      routing.settings.session_affinity ? "sticky conversations" : "",
       `first token ${routing.settings.first_token_timeout_seconds}s / idle ${routing.settings.idle_timeout_seconds}s${routing.settings.max_request_seconds ? ` / cap ${routing.settings.max_request_seconds}s` : ""}`,
     ].filter(Boolean).join(" · "));
     if (!authRequired) {
@@ -1762,7 +1765,7 @@ STATUS_JS = r"""
   function validUpdate(data) {
     return data && typeof data.available === "boolean" && typeof data.busy === "boolean" &&
       ["idle", "queued", "running", "current", "succeeded", "failed", "unavailable", "interrupted"].includes(data.state) &&
-      ["checking", "downloading", "validating", "restarting", "complete", "failed", "queued", "idle"].includes(data.stage) &&
+      ["checking", "downloading", "validating", "draining", "restarting", "complete", "failed", "queued", "idle"].includes(data.stage) &&
       (data.run_id === null || typeof data.run_id === "string" && data.run_id.length > 0 && data.run_id.length <= 128) &&
       (data.updated_at === null || typeof data.updated_at === "string") && typeof data.current_version === "string" && data.current_version.length <= 64;
   }
@@ -1794,7 +1797,7 @@ STATUS_JS = r"""
       return;
     }
     updateLastRunId = data.run_id;
-    const stages = {checking: "Checking official main", downloading: "Downloading update", validating: "Validating installation", restarting: "Restarting router", complete: "Complete", failed: "Failed", queued: "Queued", idle: "Idle"};
+    const stages = {checking: "Checking official main", downloading: "Downloading update", validating: "Validating installation", draining: "Waiting for in-flight requests", restarting: "Restarting router", complete: "Complete", failed: "Failed", queued: "Queued", idle: "Idle"};
     updateLastStage = stages[data.stage];
     text("update-stage", updateLastStage);
     meta("update-meta", updateLastStage);

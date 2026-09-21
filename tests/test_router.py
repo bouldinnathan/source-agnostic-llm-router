@@ -525,3 +525,58 @@ def test_closing_the_stream_early_stops_the_backend_and_records_nothing() -> Non
         assert _traffic(router)["requests_ok"] == 0 and _traffic(router)["requests_failed"] == 0
 
     asyncio.run(scenario())
+
+
+def test_conversations_stick_to_the_replica_that_answered_last() -> None:
+    from llm_router.routing_settings import RoutingSettings
+
+    adapter = StreamingFake({})
+    router = _replica_router(adapter, RoutingSettings(prefer_fastest_replica=True, race_replicas=True, race_every=3))
+    router.runtime.record_success("qwen-b", 10.0)
+    router.runtime.record_success("qwen-a", 900.0)
+    turn = QueryRequest.from_prompt("hi", session_key="conversation:abc")
+
+    async def scenario():
+        first = await router.complete(turn)
+        assert first.deployment == "qwen-b", "The fastest replica takes a fresh conversation"
+        for _ in range(3):
+            router.runtime.record_success("qwen-b", 5000.0)
+        assert router.runtime.observed_latency(router.config.models[1]) > router.runtime.observed_latency(router.config.models[0])
+        assert (await router.complete(QueryRequest.from_prompt("hi"))).deployment == "qwen-a", "Other conversations follow the new fastest"
+        assert router.runtime.race_counters["qwen"] == 2, "The next request would be the raced one"
+        follow_up = await router.complete(turn)
+        assert follow_up.deployment == "qwen-b", "A follow-up turn goes back to the replica whose prompt cache is warm"
+        assert all("race" not in attempt for attempt in follow_up.attempts), "A warm conversation is not raced"
+        assert router.runtime.race_counters["qwen"] == 2, "Nor does it advance the race schedule"
+        pinned = await router.complete(QueryRequest.from_prompt("hi", session_key="conversation:abc", preferred_endpoints=("source-a",)))
+        assert pinned.deployment == "qwen-a", "A named machine beats affinity"
+        for _ in range(5):
+            router.runtime.record_failure("qwen-b", "down")
+        rerouted = await router.complete(turn)
+        assert rerouted.deployment == "qwen-a", "An open circuit ends the affinity"
+        assert router.runtime.session_deployment("conversation:abc") == "qwen-a", "The conversation now belongs to the replica that answered"
+        router.settings = RoutingSettings(prefer_fastest_replica=True, session_affinity=False)
+        router.runtime.record_success("qwen-b", 1.0)
+        for _ in range(3):
+            router.runtime.record_success("qwen-b", 1.0)
+        assert (await router.complete(turn)).deployment == router.route(turn).candidates[0].model.id, "Affinity off: plain ranking"
+
+    asyncio.run(scenario())
+
+
+def test_session_memory_is_bounded_and_expires(monkeypatch) -> None:
+    from llm_router import runtime as runtime_module
+    from llm_router.runtime import RuntimeRegistry
+    from llm_router.schema import PolicyConfig
+
+    registry = RuntimeRegistry(PolicyConfig())
+    monkeypatch.setattr(runtime_module, "SESSION_LIMIT", 3)
+    for index in range(5):
+        registry.remember_session(f"s{index}", "qwen-a")
+    assert list(registry.sessions) == ["s2", "s3", "s4"], "Oldest conversations are forgotten first"
+    clock = [1000.0]
+    monkeypatch.setattr(runtime_module.time, "monotonic", lambda: clock[0])
+    registry.remember_session("late", "qwen-b")
+    clock[0] += runtime_module.SESSION_TTL_SECONDS + 1
+    assert registry.session_deployment("late") is None, "A conversation quiet for too long is not sticky any more"
+    assert "late" not in registry.sessions
