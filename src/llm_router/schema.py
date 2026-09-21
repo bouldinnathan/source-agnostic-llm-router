@@ -166,6 +166,9 @@ class QueryRequest:
     # False when the client set no output limit; adapters then send none upstream
     # (Ollama's own default is unlimited) while ranking still budgets max_tokens.
     max_tokens_specified: bool = True
+    # Ollama-only pass-through values a client may send; None means "not sent".
+    keep_alive: str | int | None = None
+    think: bool | None = None
     temperature: float | None = None
     tools: tuple[Mapping[str, Any], ...] = ()
     response_format: Mapping[str, Any] | None = None
@@ -192,6 +195,13 @@ class QueryRequest:
             raise RequestError("max_tokens must be a whole number")
         if not isinstance(self.max_tokens_specified, bool):
             raise RequestError("max_tokens_specified must be true or false")
+        if self.think is not None and not isinstance(self.think, bool):
+            raise RequestError("think must be true or false")
+        if self.keep_alive is not None and not (
+            (isinstance(self.keep_alive, int) and not isinstance(self.keep_alive, bool))
+            or (isinstance(self.keep_alive, str) and 0 < len(self.keep_alive) <= 32)
+        ):
+            raise RequestError("keep_alive must be a duration string or a number of seconds")
         if self.max_tokens <= 0:
             raise RequestError("max_tokens must be greater than zero")
         if self.min_context_window is not None and self.min_context_window <= 0:
@@ -287,6 +297,7 @@ class RouteCandidate:
     estimated_request_cost: float | None
     observed_latency_ms: float
     health_score: float
+    observed_first_token_ms: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -334,6 +345,7 @@ class UpstreamResult:
     finish_reason: str | None = None
     raw: Mapping[str, Any] | None = None
     tool_calls: tuple[Mapping[str, Any], ...] = ()
+    first_token_ms: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

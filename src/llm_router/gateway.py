@@ -45,7 +45,7 @@ from .self_test import run_backend_checks
 from .status_page import STATUS_CSS, STATUS_JS, render_status_html
 from .update_control import UpdateController, UpdateRequestError
 
-VERSION = "0.3.12"
+VERSION = "0.4.0"
 SAVED_HOST_REFRESH_SECONDS = 30.0
 SAVED_HOST_CHECK_COOLDOWN_SECONDS = 3.0
 VIRTUAL_MODELS: dict[str, str] = {
@@ -1469,6 +1469,23 @@ def _usable_whole_number(value: Any, *, default: int | None) -> int | None:
     return number if number is not None and number > 0 else default
 
 
+_KEEP_ALIVE = re.compile(r"^-?\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h)?$")
+
+
+def _usable_keep_alive(value: Any) -> str | int | None:
+    """Ollama's keep_alive as a client sent it: a duration string or seconds."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        value = int(value)
+    if isinstance(value, int):
+        return value if -1 <= value <= 30 * 86400 else None
+    if isinstance(value, str):
+        text = value.strip()
+        return text if 0 < len(text) <= 32 and _KEEP_ALIVE.match(text) else None
+    return None
+
+
 def _usable_temperature(value: Any) -> float | None:
     """A temperature from 0 to 2 in any spelling, or ``None`` when unusable."""
     if value is None or isinstance(value, bool):
@@ -1530,7 +1547,9 @@ def _query_request(
         required.append("tool_use")
     if response_format is not None:
         required.append("structured_output")
-    if ollama and body.get("think"):
+    think = body.get("think") if ollama and isinstance(body.get("think"), bool) else None
+    keep_alive = _usable_keep_alive(body.get("keep_alive")) if ollama else None
+    if think is True:
         required.append("reasoning")
     if _messages_have_images(messages):
         required.append("vision")
@@ -1542,6 +1561,8 @@ def _query_request(
         min_context_window=min_context_window,
         max_tokens=max_tokens,
         max_tokens_specified=max_tokens_specified,
+        keep_alive=keep_alive,
+        think=think,
         temperature=temperature,
         tools=tuple(dict(tool) for tool in tools),
         response_format=response_format,

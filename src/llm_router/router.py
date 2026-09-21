@@ -11,6 +11,7 @@ import time
 from typing import Any, Sequence
 
 from .adapters import AdapterRegistry
+from .adapters.base import STREAM_TIMEOUTS, StreamTimeouts
 from .errors import AllModelsFailed, NoEligibleModel, UpstreamError, UpstreamFailure
 from .metrics import MetricsStore
 from .ranking import Ranker, replica_group
@@ -61,6 +62,15 @@ class LLMRouter:
     def settings(self, value: RoutingSettings) -> None:
         self._settings = value
         self.ranker.prefer_fastest = value.prefer_fastest_replica
+        self.ranker.prefer_first_token = value.prefer_first_token
+
+    def _stream_timeouts(self) -> StreamTimeouts:
+        settings = self._settings
+        return StreamTimeouts(
+            first_token=float(settings.first_token_timeout_seconds),
+            idle=float(settings.idle_timeout_seconds),
+            total=float(settings.max_request_seconds) if settings.max_request_seconds > 0 else None,
+        )
 
     def route(self, request: QueryRequest) -> RoutingDecision:
         """Rank deployments without contacting an upstream model."""
@@ -138,6 +148,7 @@ class LLMRouter:
         endpoint = self.config.endpoints[model.endpoint]
         self.runtime.begin(model.id)
         started = time.perf_counter()
+        timeouts_token = STREAM_TIMEOUTS.set(self._stream_timeouts())
         try:
             adapter = self.adapters.get(endpoint.adapter)
             result = await adapter.complete(endpoint, model, request)
@@ -158,18 +169,23 @@ class LLMRouter:
             )
         else:
             latency_ms = (time.perf_counter() - started) * 1_000
-            self.runtime.record_success(model.id, latency_ms)
+            self.runtime.record_success(model.id, latency_ms, first_token_ms=result.first_token_ms)
             observation = await self._record_metrics(endpoint, model, latency_ms, success=True, result=result)
             attempt = {
                 "deployment": model.id, "endpoint": model.endpoint,
                 "latency_ms": round(latency_ms, 2), "success": True,
             }
+            if result.first_token_ms is not None:
+                attempt["first_token_ms"] = round(result.first_token_ms, 2)
             if race is not None:
                 attempt["race"] = True
                 race["participants"][model.id] = {
                     "endpoint": model.endpoint, "success": True, "latency_ms": round(latency_ms, 2), "kind": None,
+                    "first_token_ms": None if result.first_token_ms is None else round(result.first_token_ms, 2),
                 }
             return _AttemptOutcome(candidate, result, observation, None, attempt)
+        finally:
+            STREAM_TIMEOUTS.reset(timeouts_token)
         self.runtime.record_failure(model.id, failure.reason)
         await self._record_metrics(endpoint, model, latency_ms, success=False)
         attempt = {**failure.to_dict(), "latency_ms": round(latency_ms, 2), "success": False}
@@ -262,6 +278,7 @@ class LLMRouter:
             except Exception:
                 # Optional provider statistics cannot erase the attempt itself.
                 pass
+            observation["first_token_ms"] = result.first_token_ms
         try:
             await asyncio.to_thread(
                 self.metrics.record, endpoint, model, observation, success=success,

@@ -186,7 +186,7 @@ async function reply(request, status, data) {
 
 function snapshot() {
   return {
-    ready: true, status: "ready", version: "0.3.12", uptime_seconds: 65,
+    ready: true, status: "ready", version: "0.4.0", uptime_seconds: 65,
     checked_at: "2026-09-16T12:00:00Z", last_discovery: null,
     counts: {endpoints: 1, online: 1, models: 1, available_models: 1, aliases: 1},
     endpoints: [{name: "backend", machine: "laptop", address: "http://private-backend:1234", state: "online", model_count: 1, available_models: 1}],
@@ -199,14 +199,14 @@ function snapshot() {
 
 function routingSnapshot(overrides = {}) {
   return {
-    settings: {advertise_machine_aliases: true, prefer_fastest_replica: false, race_replicas: false, race_every: 20, ...(overrides.settings || {})},
+    settings: {advertise_machine_aliases: true, prefer_fastest_replica: false, prefer_first_token: false, race_replicas: false, race_every: 20, first_token_timeout_seconds: 300, idle_timeout_seconds: 90, max_request_seconds: 0, ...(overrides.settings || {})},
     storage: overrides.storage || {available: true, error: null},
     races: overrides.races || [],
   };
 }
 
 function updateSnapshot(overrides = {}) {
-  return {available: true, busy: false, state: "idle", stage: "idle", message: "Ready", run_id: null, updated_at: null, current_version: "0.3.12", ...overrides};
+  return {available: true, busy: false, state: "idle", stage: "idle", message: "Ready", run_id: null, updated_at: null, current_version: "0.4.0", ...overrides};
 }
 
 function inferenceSnapshot(overrides = {}) {
@@ -471,11 +471,11 @@ async function publicReadiness() {
     assert.equal(app.requests[0].url, "/healthz");
     assert.equal(app.requests[0].options.headers.Authorization, undefined);
     // The real public endpoint deliberately contains no ready field.
-    await reply(app.requests[0], httpStatus, {status, version: "0.3.12"});
+    await reply(app.requests[0], httpStatus, {status, version: "0.4.0"});
     assert.equal(app.element("health-panel").className, `health-panel tone-${tone}`);
     assert.equal(app.element("gateway-state").textContent, "Responding");
     assert.equal(app.element("model-readiness").textContent, readiness);
-    assert.equal(app.element("version").textContent, "Version 0.3.12", "Version should remain visible while details are locked");
+    assert.equal(app.element("version").textContent, "Version 0.4.0", "Version should remain visible while details are locked");
     assert.equal(app.element("details").hidden, true);
     assert.equal(app.element("refresh-button").disabled, false);
   }
@@ -489,10 +489,10 @@ async function topbarVersionTracksCurrentSnapshot() {
   assert.ok(header && /\bid="version"/.test(header[1]), "Version belongs at the top of the page, before locked details");
   assert.equal(Array.from(markup.matchAll(/\bid="version"/g)).length, 1);
   const app = harness();
-  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.12"});
+  await reply(app.requests[0], 503, {status: "unavailable", version: "0.4.0"});
   assert.equal(app.element("details").hidden, true);
   assert.equal(app.element("version").hidden, false);
-  assert.equal(app.element("version").textContent, "Version 0.3.12", "Even an unavailable public gateway identifies its version");
+  assert.equal(app.element("version").textContent, "Version 0.4.0", "Even an unavailable public gateway identifies its version");
   app.enterKey("secret-key");
   await reply(app.requests.at(-1), 200, {...snapshot(), version: "0.4.0"});
   assert.equal(app.element("version").textContent, "Version 0.4.0");
@@ -516,7 +516,7 @@ async function nonoverlapAndNetworkFailure() {
   app.tick();
   app.element("refresh-button").events.click();
   assert.equal(app.requests.length, 1, "In-flight requests must not overlap");
-  await reply(app.requests[0], 200, {status: "ready", version: "0.3.12"});
+  await reply(app.requests[0], 200, {status: "ready", version: "0.4.0"});
   app.tick();
   assert.equal(app.requests.length, 2);
   app.requests[1].reject(new Error("network offline"));
@@ -531,7 +531,7 @@ async function nonoverlapAndNetworkFailure() {
 
 async function authenticationAndSafeRendering() {
   const app = harness();
-  await reply(app.requests[0], 503, {status: "unavailable", version: "0.3.12"});
+  await reply(app.requests[0], 503, {status: "unavailable", version: "0.4.0"});
   app.enterKey("secret-key");
   assert.equal(app.requests[1].url, "/status/data");
   assert.equal(app.requests[1].options.headers.Authorization, "Bearer secret-key");
@@ -562,9 +562,9 @@ async function lockLateResponsesAndRejectedKeys() {
   assert.equal(app.requests[3].url, "/healthz");
   await reply(app.requests[2], 200, snapshot());
   assert.equal(app.element("details").hidden, true, "A late authenticated result must not unlock details");
-  await reply(app.requests[0], 200, {status: "ready", version: "0.3.12"});
+  await reply(app.requests[0], 200, {status: "ready", version: "0.4.0"});
   assert.equal(app.element("health-panel").className, "health-panel tone-pending", "A cancelled old public request must not overwrite pending state");
-  await reply(app.requests[3], 503, {status: "unavailable", version: "0.3.12"});
+  await reply(app.requests[3], 503, {status: "unavailable", version: "0.4.0"});
   app.enterKey("rejected-key");
   await reply(app.requests[4], 401, {});
   assert.equal(app.element("details").hidden, true);
@@ -1413,6 +1413,17 @@ async function routingSettingsCheckboxesAndRaces() {
   await reply(numberPost, 400, {error: "race_every must be a whole number from 2 to 1000."});
   assert.match(app.element("settings-message").textContent, /rejected; nothing changed/);
   assert.equal(app.element("setting-race-every").value, "5");
+  assert.equal(app.element("setting-first-token-timeout").value, "300");
+  app.element("setting-first-token-timeout").value = "4";
+  app.element("setting-first-token-timeout").events.change();
+  assert.match(app.element("settings-message").textContent, /First-token timeout must be a whole number from 5 to 3600/);
+  assert.equal(app.element("setting-first-token-timeout").value, "300");
+  app.element("setting-max-request").value = "0";
+  app.element("setting-max-request").events.change();
+  assert.deepEqual(JSON.parse(app.settingsRequests.at(-1).options.body), {max_request_seconds: 0}, "Zero is a valid cap meaning none");
+  await reply(app.settingsRequests.at(-1), 200, routingSnapshot({settings: {advertise_machine_aliases: false, race_replicas: true, race_every: 5, first_token_timeout_seconds: 600, max_request_seconds: 0}}));
+  assert.equal(app.element("setting-first-token-timeout").value, "600");
+  assert.match(app.element("settings-meta").textContent, /first token 600s \/ idle 90s/);
   app.element("setting-prefer-fastest").checked = true;
   app.element("setting-prefer-fastest").events.change();
   await reply(app.settingsRequests.at(-1), 503, {error: "private /path/to/settings"});
@@ -1741,6 +1752,7 @@ function performanceSnapshot() {
         output_tokens_per_second: performanceObservation(30, 25, 7),
         load_duration_ms: performanceObservation(2000, 800, 4),
         request_duration_ms: performanceObservation(1500, 1200, 9),
+        first_token_ms: performanceObservation(400, 350, 9),
       }, slow_load_count: 2, slow_load_threshold_ms: 1000,
     }],
   };
@@ -1787,9 +1799,10 @@ async function performanceIsPassiveAndPerDeployment() {
   assert.equal(rows[0].children[3].children[0].children[0].textContent, "800 ms");
   assert.match(rows[0].children[3].textContent, /Slow reported loads \(≥1 s\): 2/);
   assert.equal(rows[0].children[4].children[0].children[0].textContent, "1,200 ms");
-  assert.match(rows[0].children[5].textContent, /7 succeeded \/ 2 failed/);
-  assert.match(rows[0].children[5].textContent, /Reported input tokens: 1000Reported output tokens: 500/);
-  assert.notEqual(rows[0].children[6].textContent, "Not recorded");
+  assert.equal(rows[0].children[5].children[0].children[0].textContent, "350 ms", "Time to first token has its own column");
+  assert.match(rows[0].children[6].textContent, /7 succeeded \/ 2 failed/);
+  assert.match(rows[0].children[6].textContent, /Reported input tokens: 1000Reported output tokens: 500/);
+  assert.notEqual(rows[0].children[7].textContent, "Not recorded");
   assert.match(app.element("performance-message").textContent, /does not generate traffic to models/);
   assert.ok(app.allRequests.every(request => request.options.method === "GET"));
   assert.equal(app.allRequests.some(request => request.url === "/router/metrics"), false, "Metrics arrive in the existing status snapshot, not another fetch");
@@ -1809,6 +1822,7 @@ async function performanceUnknownZeroAndMissingTimings() {
   row.metrics.input_tokens_per_second = performanceObservation(0, 0, 1);
   row.metrics.output_tokens_per_second = null;
   row.metrics.load_duration_ms = null;
+  row.metrics.first_token_ms = null;
   row.slow_load_count = 0;
   row.successes = 0;
   row.failures = 0;
@@ -1821,8 +1835,9 @@ async function performanceUnknownZeroAndMissingTimings() {
   assert.match(cells[3].textContent, /^Not reported/);
   assert.match(cells[3].textContent, /Slow reported loads \(≥1 s\): Not reported/);
   assert.match(cells[4].textContent, /^1,200 ms/);
-  assert.match(cells[5].textContent, /0 succeeded \/ 0 failed/);
-  assert.equal(cells[6].textContent, "Not recorded");
+  assert.equal(cells[5].textContent, "Not reported", "Rows recorded before streaming have no first-token timing");
+  assert.match(cells[6].textContent, /0 succeeded \/ 0 failed/);
+  assert.equal(cells[7].textContent, "Not recorded");
   row.metrics.load_duration_ms = performanceObservation(0, 0, 1);
   row.metrics.output_tokens_per_second = performanceObservation(0.001, 0.002, 1);
   app.tick();
@@ -2108,10 +2123,10 @@ async function updatesRequireExplicitAuthenticatedClick() {
     assert.doesNotMatch(app.element("update-message").textContent, /\d+%/);
   }
   app.expire(2000);
-  await reply(app.updateRequests.at(-1), 200, updateSnapshot({state: "succeeded", stage: "complete", run_id: "run-one", current_version: "0.3.12", updated_at: "2026-09-19T12:00:00Z"}));
+  await reply(app.updateRequests.at(-1), 200, updateSnapshot({state: "succeeded", stage: "complete", run_id: "run-one", current_version: "0.4.0", updated_at: "2026-09-19T12:00:00Z"}));
   assert.equal(app.element("update-progress").hidden, true);
   assert.match(app.element("update-message").textContent, /Update completed successfully/);
-  assert.match(app.element("update-observed").textContent, /0\.3\.12/);
+  assert.match(app.element("update-observed").textContent, /0\.4\.0/);
   assert.equal(app.requests.at(-1).url, "/status/data", "Confirmed completion refreshes installed version and router state");
   const count = app.updateRequests.length;
   app.expire(2000);

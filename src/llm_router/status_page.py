@@ -147,6 +147,12 @@ _STATUS_HTML = """<!doctype html>
             <label class="setting"><input id="setting-race" type="checkbox" disabled>
               <span><strong>Occasionally race all replicas</strong><span class="muted">Every Nth request for a model with several available replicas is sent to all of them at once. The first answer is returned and the others finish in the background, so every replica’s latency is re-measured. Those requests run once per replica.</span></span></label>
             <label class="setting setting-number"><span><strong>Race every</strong></span><input id="setting-race-every" type="number" min="2" max="1000" step="1" inputmode="numeric" disabled><span class="muted">requests per model (2 to 1000)</span></label>
+            <label class="setting"><input id="setting-prefer-first-token" type="checkbox" disabled>
+              <span><strong>Rank the fastest replica by first token</strong><span class="muted">Use time to first token instead of total answer time when preferring the fastest replica. Better for voice, where the wait before speech starts is what you feel.</span></span></label>
+            <p class="muted setting-note">Backend answers are read as token streams, so these limits apply to silences, not to the whole answer. Loading a model and evaluating a long prompt happen before the first token.</p>
+            <label class="setting setting-number"><span><strong>First-token timeout</strong></span><input id="setting-first-token-timeout" type="number" min="5" max="3600" step="1" inputmode="numeric" disabled><span class="muted">seconds a backend may stay silent before its first token (5 to 3600)</span></label>
+            <label class="setting setting-number"><span><strong>Idle timeout</strong></span><input id="setting-idle-timeout" type="number" min="5" max="3600" step="1" inputmode="numeric" disabled><span class="muted">seconds between tokens before an attempt is abandoned (5 to 3600)</span></label>
+            <label class="setting setting-number"><span><strong>Request cap</strong></span><input id="setting-max-request" type="number" min="0" max="86400" step="1" inputmode="numeric" disabled><span class="muted">seconds for a whole answer; 0 means no cap (0 to 86400)</span></label>
           </form>
           <div id="settings-races" class="settings-races" hidden><h3>Recent races</h3><ul id="settings-races-list"></ul></div>
         </div>
@@ -200,7 +206,7 @@ _STATUS_HTML = """<!doctype html>
         <div class="card-intro"><p class="muted">Measured passively from real requests through this router and saved across restarts and updates. Refresh never runs a benchmark or model. Smoothed averages use EWMA; token rates and load/setup time need backend-reported timings. Request time covers the whole upstream call.</p></div>
         <p id="performance-message" class="performance-message muted" role="status">Waiting for saved performance observations.</p>
         <div class="table-scroll"><table><caption class="sr-only">Saved request performance by model and server</caption>
-          <thead><tr><th scope="col">Model / server</th><th scope="col">Input tok/s</th><th scope="col">Output tok/s</th><th scope="col">Reported load / setup</th><th scope="col">Request time (wall clock)</th><th scope="col">Requests</th><th scope="col">Last observed</th></tr></thead>
+          <thead><tr><th scope="col">Model / server</th><th scope="col">Input tok/s</th><th scope="col">Output tok/s</th><th scope="col">Reported load / setup</th><th scope="col">Request time (wall clock)</th><th scope="col">First token</th><th scope="col">Requests</th><th scope="col">Last observed</th></tr></thead>
           <tbody id="performance-body"></tbody>
         </table></div>
         <p class="performance-note muted">Load/setup times are backend-reported. Slow reported loads may be cold starts, but do not prove disk I/O. Missing timings are not estimated from request latency. Historical rows keep observations for deployments no longer in the routing configuration.</p>
@@ -325,7 +331,7 @@ main{max-width:1400px;margin:auto;padding:38px 24px 24px}.heading,.section-headi
 .traffic-chart svg{display:block;width:100%;height:auto}.traffic-chart .bar-ok{fill:var(--chart-ok)}.traffic-chart .bar-failed{fill:var(--chart-failed)}.traffic-chart .axis{stroke:#cbd5e1;stroke-width:1}.traffic-chart .grid{stroke:var(--track);stroke-width:1}.traffic-chart text{font-size:11px;fill:var(--muted);font-family:inherit}.traffic-chart .hit{fill:transparent}.traffic-chart g:hover .hit{fill:rgba(20,37,61,.06)}.traffic-chart .chart-empty{font-size:12px}
 .traffic-failures{margin:0 22px 18px;padding-top:12px;border-top:1px solid var(--line)}.failures-note{margin:6px 0 8px}.traffic-failures .table-scroll{margin:0 -22px}.traffic-failures td{vertical-align:top}.traffic-table{margin-top:10px}.traffic-table .table-scroll{margin-top:8px}.traffic-table th,.traffic-table td{padding:8px 12px}.traffic-table td{font-variant-numeric:tabular-nums}
 .alias-conflicts{padding:0 22px 16px;font-size:13px;color:var(--amber);overflow-wrap:anywhere}
-.settings-form{display:grid;gap:12px;margin-top:12px}.setting{display:grid;grid-template-columns:auto 1fr;gap:10px 12px;align-items:start;font-size:14px;cursor:pointer}.setting input[type="checkbox"]{width:18px;height:18px;margin:2px 0 0}.setting strong{display:block;font-weight:600}.setting .muted{display:block;margin-top:2px}.setting-number{grid-template-columns:auto auto 1fr;align-items:center}.setting-number input{width:96px;padding:6px 10px}.settings-races{margin-top:16px;padding-top:12px;border-top:1px solid var(--line)}.settings-races h3{font-size:13px;margin-bottom:6px}.settings-races ul{margin:0;padding-left:18px;font-size:13px;display:grid;gap:6px}#settings-message.result-fail{color:var(--red)}#settings-message.result-pass{color:var(--green)}#settings-message.result-warning{color:var(--amber)}
+.settings-form{display:grid;gap:12px;margin-top:12px}.setting-note{margin-top:4px}.setting{display:grid;grid-template-columns:auto 1fr;gap:10px 12px;align-items:start;font-size:14px;cursor:pointer}.setting input[type="checkbox"]{width:18px;height:18px;margin:2px 0 0}.setting strong{display:block;font-weight:600}.setting .muted{display:block;margin-top:2px}.setting-number{grid-template-columns:auto auto 1fr;align-items:center}.setting-number input{width:96px;padding:6px 10px}.settings-races{margin-top:16px;padding-top:12px;border-top:1px solid var(--line)}.settings-races h3{font-size:13px;margin-bottom:6px}.settings-races ul{margin:0;padding-left:18px;font-size:13px;display:grid;gap:6px}#settings-message.result-fail{color:var(--red)}#settings-message.result-pass{color:var(--green)}#settings-message.result-warning{color:var(--amber)}
 @media(max-width:500px){.setting-number{grid-template-columns:1fr}}
 .about-body dl{margin:0;display:grid;grid-template-columns:minmax(140px,190px) 1fr;gap:10px 18px;font-size:13px}.about-body dt{font-weight:600}.about-body dd{margin:0;color:var(--muted)}
 @media(max-width:900px){.traffic-tiles{grid-template-columns:repeat(2,1fr)}}
@@ -380,7 +386,13 @@ STATUS_JS = r"""
   let settingsGeneration = 0;
   let activeSettings = null;
   let routingSettings = null;
-  const settingFields = {advertise_machine_aliases: "setting-advertise-machine", prefer_fastest_replica: "setting-prefer-fastest", race_replicas: "setting-race"};
+  const settingFields = {advertise_machine_aliases: "setting-advertise-machine", prefer_fastest_replica: "setting-prefer-fastest", prefer_first_token: "setting-prefer-first-token", race_replicas: "setting-race"};
+  const settingNumbers = {
+    race_every: ["setting-race-every", 2, 1000, "Race every"],
+    first_token_timeout_seconds: ["setting-first-token-timeout", 5, 3600, "First-token timeout"],
+    idle_timeout_seconds: ["setting-idle-timeout", 5, 3600, "Idle timeout"],
+    max_request_seconds: ["setting-max-request", 0, 86400, "Request cap"],
+  };
   let trafficWindow = "24h";
   let trafficData = null;
   let trafficCheckedAt = 0;
@@ -966,7 +978,7 @@ STATUS_JS = r"""
     clearPerformance();
     if (!performance || typeof performance !== "object") {
       text("performance-message", "This snapshot does not include performance metrics. Older router versions may not report them.");
-      rows("performance-body", [], 7, "No performance data received.", () => {});
+      rows("performance-body", [], 8, "No performance data received.", () => {});
       return;
     }
     const validRows = Array.isArray(performance.deployments) && performance.deployments.every(item => item && typeof item === "object" &&
@@ -974,7 +986,7 @@ STATUS_JS = r"""
     if (performance.available !== true || !validRows) {
       el("performance-message").className = "performance-message muted result-warning";
       text("performance-message", "Saved performance history is unavailable. Check the service account’s metrics-storage access and the router’s service logs. No current metrics are being shown.");
-      rows("performance-body", [], 7, "Performance history is unavailable.", () => {});
+      rows("performance-body", [], 8, "Performance history is unavailable.", () => {});
       meta("performance-meta", "Unavailable");
       return;
     }
@@ -985,7 +997,7 @@ STATUS_JS = r"""
       el("performance-message").className = "performance-message muted result-warning";
       text("performance-message", `Performance storage reported a problem; saved observations may be incomplete. Last saved update: ${updated}. Check service permissions and logs.`);
     }
-    rows("performance-body", performance.deployments, 7, "No routed requests yet. Performance will appear after real requests pass through this router.", (row, item) => {
+    rows("performance-body", performance.deployments, 8, "No routed requests yet. Performance will appear after real requests pass through this router.", (row, item) => {
       const identity = document.createElement("div");
       identity.className = "performance-identity";
       const model = document.createElement("strong");
@@ -1012,6 +1024,7 @@ STATUS_JS = r"""
       load.append(slow);
       cell(row, load);
       cell(row, observation(metrics.request_duration_ms, "ms"));
+      cell(row, observation(metrics.first_token_ms, "ms"));
       const requests = document.createElement("div");
       for (const label of [
         `${count(item.successes)} succeeded / ${count(item.failures)} failed`,
@@ -1030,7 +1043,7 @@ STATUS_JS = r"""
   function validSettings(settings) {
     return Boolean(settings) && typeof settings === "object" &&
       Object.keys(settingFields).every(name => typeof settings[name] === "boolean") &&
-      Number.isSafeInteger(settings.race_every) && settings.race_every >= 2 && settings.race_every <= 1000;
+      Object.entries(settingNumbers).every(([name, [, low, high]]) => Number.isSafeInteger(settings[name]) && settings[name] >= low && settings[name] <= high);
   }
   function validRoutingState(routing) {
     return Boolean(routing) && typeof routing === "object" && validSettings(routing.settings) &&
@@ -1040,7 +1053,7 @@ STATUS_JS = r"""
   }
   function settingsControls() {
     const enabled = authRequired && Boolean(apiKey) && !el("details").hidden && routingSettings !== null && !activeSettings;
-    for (const id of [...Object.values(settingFields), "setting-race-every"]) el(id).disabled = !enabled;
+    for (const id of [...Object.values(settingFields), ...Object.values(settingNumbers).map(([id]) => id)]) el(id).disabled = !enabled;
   }
   function settingsMessage(message, tone = "") {
     el("settings-message").className = tone ? `muted result-${tone}` : "muted";
@@ -1049,7 +1062,7 @@ STATUS_JS = r"""
   function restoreSettingInputs() {
     if (!routingSettings) return;
     for (const [name, id] of Object.entries(settingFields)) el(id).checked = routingSettings[name];
-    el("setting-race-every").value = String(routingSettings.race_every);
+    for (const [name, [id]] of Object.entries(settingNumbers)) el(id).value = String(routingSettings[name]);
   }
   function clearSettings() {
     settingsGeneration += 1;
@@ -1057,7 +1070,7 @@ STATUS_JS = r"""
     activeSettings = null;
     routingSettings = null;
     for (const id of Object.values(settingFields)) el(id).checked = false;
-    el("setting-race-every").value = "";
+    for (const [id] of Object.values(settingNumbers)) el(id).value = "";
     el("settings-races").hidden = true;
     el("settings-races-list").replaceChildren();
     meta("settings-meta", "");
@@ -1098,8 +1111,9 @@ STATUS_JS = r"""
     restoreSettingInputs();
     meta("settings-meta", [
       routing.settings.advertise_machine_aliases ? "machine names shown" : "machine names hidden",
-      routing.settings.prefer_fastest_replica ? "fastest first" : "",
+      routing.settings.prefer_fastest_replica ? (routing.settings.prefer_first_token ? "fastest first token first" : "fastest first") : "",
       routing.settings.race_replicas ? `race every ${routing.settings.race_every}` : "",
+      `first token ${routing.settings.first_token_timeout_seconds}s / idle ${routing.settings.idle_timeout_seconds}s${routing.settings.max_request_seconds ? ` / cap ${routing.settings.max_request_seconds}s` : ""}`,
     ].filter(Boolean).join(" · "));
     if (!authRequired) {
       settingsMessage("Routing settings can be viewed here, but changing them requires LLM_ROUTER_GATEWAY_API_KEY in router.env and a router restart.");
@@ -2036,14 +2050,16 @@ STATUS_JS = r"""
   el("hosts-check-button").addEventListener("click", () => hostOperation("check"));
   el("settings-form").addEventListener("submit", (event) => { event.preventDefault(); });
   for (const [name, id] of Object.entries(settingFields)) el(id).addEventListener("change", () => saveSettings({[name]: el(id).checked}));
-  el("setting-race-every").addEventListener("change", () => {
-    const value = Number(el("setting-race-every").value);
-    if (Number.isSafeInteger(value) && value >= 2 && value <= 1000) saveSettings({race_every: value});
-    else {
-      restoreSettingInputs();
-      settingsMessage("Race every must be a whole number from 2 to 1000.", "fail");
-    }
-  });
+  for (const [name, [id, low, high, label]] of Object.entries(settingNumbers)) {
+    el(id).addEventListener("change", () => {
+      const value = Number(el(id).value);
+      if (Number.isSafeInteger(value) && value >= low && value <= high) saveSettings({[name]: value});
+      else {
+        restoreSettingInputs();
+        settingsMessage(`${label} must be a whole number from ${low} to ${high}.`, "fail");
+      }
+    });
+  }
   const setPanels = open => { for (const id of panels) el(id).open = open; };
   el("collapse-all-button").addEventListener("click", () => setPanels(false));
   el("expand-all-button").addEventListener("click", () => setPanels(true));

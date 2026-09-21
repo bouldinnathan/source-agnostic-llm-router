@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 from ..errors import UpstreamError
 from ..schema import EndpointConfig, ModelConfig, QueryRequest, UpstreamResult
-from .base import BaseHTTPAdapter, merge_payload, message_text, neutral_tool_calls
+from .base import FIRST_TOKEN_KEY, BaseHTTPAdapter, merge_payload, message_text, neutral_tool_calls
 
 
 class OllamaChatAdapter(BaseHTTPAdapter):
@@ -53,12 +53,17 @@ class OllamaChatAdapter(BaseHTTPAdapter):
                 message.pop("tool_call_id", None)
             messages.append(message)
 
+        streaming = endpoint.options.get("stream", True) is not False
         body: dict[str, Any] = {
             "model": model.upstream_model,
             "messages": messages,
-            "stream": False,
+            "stream": streaming,
             "options": options,
         }
+        if request.keep_alive is not None:
+            body["keep_alive"] = request.keep_alive
+        if request.think is not None:
+            body["think"] = request.think
         if request.tools:
             body["tools"] = [dict(tool) for tool in request.tools]
         if request.response_format is not None:
@@ -72,11 +77,13 @@ class OllamaChatAdapter(BaseHTTPAdapter):
                 body["format"] = dict(schema) if isinstance(schema, Mapping) else "json"
             else:
                 body["format"] = dict(response_format)
-        data = await self.post_json(
+        data = dict(await self.post_json(
             endpoint,
             str(endpoint.options.get("path", "/api/chat")),
             merge_payload(request.extra_body, body),
-        )
+            stream_format="ollama-ndjson" if streaming else None,
+        ))
+        first_token_ms = data.pop(FIRST_TOKEN_KEY, None)
         message = data.get("message")
         if not isinstance(message, Mapping):
             raise UpstreamError("Ollama response has no message", retryable=False)
@@ -101,4 +108,5 @@ class OllamaChatAdapter(BaseHTTPAdapter):
             finish_reason=str(data["done_reason"]) if data.get("done_reason") else None,
             raw=data,
             tool_calls=tool_calls,
+            first_token_ms=first_token_ms if isinstance(first_token_ms, (int, float)) else None,
         )

@@ -68,7 +68,7 @@ def test_metrics_survive_restart_with_expected_schema_and_private_files(tmp_path
     record(store, {
         "input_tokens": 100, "output_tokens": 20,
         "input_tokens_per_second": 500, "output_tokens_per_second": 25,
-        "load_duration_ms": 1500, "request_duration_ms": 2000,
+        "load_duration_ms": 1500, "request_duration_ms": 2000, "first_token_ms": 800,
     })
     row = only(MetricsStore(path))
     assert row["machine"] == "worker"
@@ -83,7 +83,7 @@ def test_metrics_survive_restart_with_expected_schema_and_private_files(tmp_path
     assert row["output_tokens_total"] == 20
     assert row["slow_load_count"] == 1
     assert row["slow_load_threshold_ms"] == 1000
-    assert set(row["metrics"]) == {"input_tokens_per_second", "output_tokens_per_second", "load_duration_ms", "request_duration_ms"}
+    assert set(row["metrics"]) == {"input_tokens_per_second", "output_tokens_per_second", "load_duration_ms", "request_duration_ms", "first_token_ms"}
     for metric in row["metrics"].values():
         assert metric["samples"] == 1
         assert metric["ewma"] == metric["latest"]
@@ -487,3 +487,21 @@ def test_recent_write_failure_is_visible_until_a_successful_record(monkeypatch, 
     assert recovered["available"] is True
     assert recovered["error"] is None
     assert recovered["deployments"][0]["metrics"]["output_tokens_per_second"]["samples"] == 2
+
+
+def test_rows_written_before_first_token_metric_still_decode(tmp_path):
+    store = MetricsStore(tmp_path / "metrics.sqlite3")
+    record(store, {"request_duration_ms": 1000})
+    legacy = json.dumps({
+        "input_tokens_per_second": None, "output_tokens_per_second": None, "load_duration_ms": None,
+        "request_duration_ms": {"latest": 1000, "ewma": 1000, "samples": 1, "updated_at": "2026-09-16T12:00:00+00:00"},
+    })
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("UPDATE deployments SET metrics_json=?", (legacy,))
+    row = only(store)
+    assert row["metrics"]["first_token_ms"] is None, "An older row simply has no first-token history"
+    assert row["metrics"]["request_duration_ms"]["samples"] == 1
+    record(store, {"request_duration_ms": 500, "first_token_ms": 120})
+    row = only(store)
+    assert row["metrics"]["first_token_ms"]["samples"] == 1 and row["metrics"]["first_token_ms"]["latest"] == 120
+    assert row["metrics"]["request_duration_ms"]["samples"] == 2

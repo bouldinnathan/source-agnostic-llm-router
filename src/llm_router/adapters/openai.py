@@ -7,6 +7,7 @@ from typing import Any, Mapping
 from ..errors import UpstreamError
 from ..schema import EndpointConfig, ModelConfig, QueryRequest, UpstreamResult
 from .base import (
+    FIRST_TOKEN_KEY,
     BaseHTTPAdapter,
     merge_payload,
     message_text,
@@ -36,13 +37,20 @@ class OpenAIChatAdapter(BaseHTTPAdapter):
             body["tools"] = openai_tools(request.tools)
         if request.response_format is not None:
             body["response_format"] = dict(request.response_format)
+        streaming = endpoint.options.get("stream", True) is not False
+        if streaming:
+            body["stream"] = True
+            if endpoint.options.get("stream_usage", True) is not False:
+                body["stream_options"] = {"include_usage": True}
         payload = merge_payload(request.extra_body, body)
-        data = await self.post_json(
+        data = dict(await self.post_json(
             endpoint,
             str(endpoint.options.get("path", "/chat/completions")),
             payload,
             default_headers={"Content-Type": "application/json"},
-        )
+            stream_format="openai-sse" if streaming else None,
+        ))
+        first_token_ms = data.pop(FIRST_TOKEN_KEY, None)
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):
             raise UpstreamError("OpenAI-compatible response has no choices", retryable=False)
@@ -68,6 +76,7 @@ class OpenAIChatAdapter(BaseHTTPAdapter):
             finish_reason=str(choice["finish_reason"]) if choice.get("finish_reason") else None,
             raw=data,
             tool_calls=tool_calls,
+            first_token_ms=first_token_ms if isinstance(first_token_ms, (int, float)) else None,
         )
 
 

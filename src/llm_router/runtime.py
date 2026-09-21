@@ -19,6 +19,7 @@ class DeploymentState:
     consecutive_failures: int = 0
     active_requests: int = 0
     latency_ewma_ms: float | None = None
+    first_token_ewma_ms: float | None = None
     circuit_open_until: float = 0.0
     last_error: str | None = None
 
@@ -67,18 +68,23 @@ class RuntimeRegistry:
     def begin(self, deployment: str) -> None:
         self.state(deployment).active_requests += 1
 
-    def record_success(self, deployment: str, latency_ms: float) -> None:
+    def record_success(self, deployment: str, latency_ms: float, *, first_token_ms: float | None = None) -> None:
         state = self.state(deployment)
         state.active_requests = max(0, state.active_requests - 1)
         state.successes += 1
         state.consecutive_failures = 0
         state.circuit_open_until = 0.0
         state.last_error = None
+        alpha = self.policy.latency_ewma_alpha
         if state.latency_ewma_ms is None:
             state.latency_ewma_ms = latency_ms
         else:
-            alpha = self.policy.latency_ewma_alpha
             state.latency_ewma_ms = alpha * latency_ms + (1 - alpha) * state.latency_ewma_ms
+        if first_token_ms is not None:
+            if state.first_token_ewma_ms is None:
+                state.first_token_ewma_ms = first_token_ms
+            else:
+                state.first_token_ewma_ms = alpha * first_token_ms + (1 - alpha) * state.first_token_ewma_ms
 
     def record_failure(self, deployment: str, reason: str) -> None:
         state = self.state(deployment)
@@ -97,6 +103,10 @@ class RuntimeRegistry:
 
     def observed_latency(self, model: ModelConfig) -> float:
         return self.state(model.id).latency_ewma_ms or model.estimated_latency_ms
+
+    def observed_first_token(self, model: ModelConfig) -> float | None:
+        """Smoothed time to first token, or None when never measured."""
+        return self.state(model.id).first_token_ewma_ms
 
     def health_score(self, model: ModelConfig) -> float:
         state = self.state(model.id)

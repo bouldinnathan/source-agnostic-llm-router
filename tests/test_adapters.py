@@ -386,3 +386,159 @@ def test_reasoning_only_ollama_response_is_diagnosed() -> None:
     with pytest.raises(UpstreamError) as captured:
         asyncio.run(ThinkingOllama().complete(EndpointConfig(name="source", adapter="ollama-chat", base_url="http://s.invalid"), MODEL, QueryRequest.from_prompt("hi")))
     assert "output budget on reasoning" in str(captured.value) and "private thoughts" not in str(captured.value)
+
+
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+
+
+def _streamed_backend(monkeypatch, *, body: bytes | None = None, content=None, status: int = 200, captured: list | None = None, content_type: str | None = None):
+    """Serve a canned body (or async byte stream) through the adapter's own HTTP client."""
+    from llm_router.adapters import base
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if captured is not None:
+            captured.append(json.loads(request.content))
+        headers = {"content-type": content_type} if content_type else {}
+        return httpx.Response(status, content=content if content is not None else body, headers=headers)
+
+    def client(**kwargs):  # type: ignore[no-untyped-def]
+        kwargs.pop("verify", None)
+        return _REAL_ASYNC_CLIENT(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(base.httpx, "AsyncClient", client)
+
+
+OLLAMA_ENDPOINT = EndpointConfig(name="source", adapter="ollama-chat", base_url="http://source.invalid")
+OPENAI_ENDPOINT = EndpointConfig(name="source", adapter="openai-chat", base_url="http://source.invalid/v1", auth=AuthConfig(scheme="none"))
+
+
+def test_ollama_adapter_streams_and_folds_chunks(monkeypatch) -> None:
+    chunks = [
+        {"model": "m", "message": {"role": "assistant", "content": "Hel"}, "done": False},
+        {"model": "m", "message": {"role": "assistant", "content": "lo"}, "done": False},
+        {"model": "m", "message": {"role": "assistant", "content": "", "thinking": "hmm"}, "done": False},
+        {"model": "m", "message": {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "turn_on", "arguments": {"room": "kitchen"}}}]}, "done": False},
+        {"model": "m", "message": {"role": "assistant", "content": ""}, "done": True, "done_reason": "stop",
+         "prompt_eval_count": 7, "eval_count": 3, "total_duration": 1000, "load_duration": 10, "eval_duration": 500, "prompt_eval_duration": 200},
+    ]
+    captured: list = []
+    _streamed_backend(monkeypatch, body="\n".join(json.dumps(chunk) for chunk in chunks).encode(), captured=captured)
+    result = asyncio.run(OllamaChatAdapter().complete(OLLAMA_ENDPOINT, MODEL, QueryRequest.from_prompt("hi", keep_alive=-1, think=False)))
+    assert captured[0]["stream"] is True and captured[0]["keep_alive"] == -1 and captured[0]["think"] is False
+    assert result.text == "Hello"
+    assert result.tool_calls[0]["function"]["name"] == "turn_on"
+    assert result.usage == {"prompt_eval_count": 7, "eval_count": 3, "total_duration": 1000}
+    assert result.finish_reason == "stop"
+    assert result.raw["eval_duration"] == 500 and result.raw["message"]["thinking"] == "hmm"
+    assert result.first_token_ms is not None and result.first_token_ms >= 0
+
+
+def test_openai_adapter_streams_sse_and_reassembles_tool_calls(monkeypatch) -> None:
+    events = [
+        {"id": "c1", "object": "chat.completion.chunk", "model": "m", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]},
+        {"choices": [{"index": 0, "delta": {"content": "Hi"}}]},
+        {"choices": [{"index": 0, "delta": {"content": " there"}}]},
+        {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_a", "type": "function", "function": {"name": "turn_on", "arguments": "{\"ro"}}]}}]},
+        {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "om\": \"kitchen\"}"}}]}}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+        {"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 4}},
+    ]
+    body = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + ": keepalive\n\ndata: [DONE]\n\n"
+    captured: list = []
+    _streamed_backend(monkeypatch, body=body.encode(), captured=captured)
+    result = asyncio.run(OpenAIChatAdapter().complete(OPENAI_ENDPOINT, MODEL, QueryRequest.from_prompt("hi")))
+    assert captured[0]["stream"] is True and captured[0]["stream_options"] == {"include_usage": True}
+    assert result.text == "Hi there"
+    assert result.tool_calls[0]["id"] == "call_a" and result.tool_calls[0]["function"]["name"] == "turn_on"
+    assert result.tool_calls[0]["function"]["arguments"] == {"room": "kitchen"}, "Argument fragments are joined before parsing"
+    assert result.usage == {"prompt_tokens": 9, "completion_tokens": 4}
+    assert result.finish_reason == "tool_calls"
+    assert result.raw["id"] == "c1" and result.first_token_ms is not None
+
+
+def test_unstreamed_json_reply_is_accepted_when_backend_ignores_stream(monkeypatch) -> None:
+    """A backend or proxy that ignores ``stream`` still yields a usable answer."""
+    captured: list = []
+    body = {"choices": [{"message": {"role": "assistant", "content": "whole"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 3, "completion_tokens": 1}}
+    _streamed_backend(monkeypatch, body=json.dumps(body).encode(), captured=captured, content_type="application/json")
+    result = asyncio.run(OpenAIChatAdapter().complete(OPENAI_ENDPOINT, MODEL, QueryRequest.from_prompt("hi")))
+    assert captured[0]["stream"] is True, "The adapter still asks for a stream; only the reply shape differs"
+    assert result.text == "whole" and result.usage == {"prompt_tokens": 3, "completion_tokens": 1}
+    assert result.first_token_ms is not None
+
+    body = {"message": {"role": "assistant", "content": "done"}, "done": True, "done_reason": "stop", "eval_count": 4}
+    _streamed_backend(monkeypatch, body=json.dumps(body, indent=2).encode(), content_type="application/json")
+    result = asyncio.run(OllamaChatAdapter().complete(OLLAMA_ENDPOINT, MODEL, QueryRequest.from_prompt("hi")))
+    assert result.text == "done" and result.usage == {"eval_count": 4}, "Pretty-printed JSON is not mistaken for NDJSON"
+
+
+def test_streaming_can_be_disabled_per_endpoint(monkeypatch) -> None:
+    captured: list = []
+    _streamed_backend(monkeypatch, body=json.dumps({"message": {"role": "assistant", "content": "OK"}, "done": True}).encode(), captured=captured)
+    endpoint = EndpointConfig(name="source", adapter="ollama-chat", base_url="http://source.invalid", options={"stream": False})
+    result = asyncio.run(OllamaChatAdapter().complete(endpoint, MODEL, QueryRequest.from_prompt("hi")))
+    assert captured[0]["stream"] is False and result.text == "OK" and result.first_token_ms is None
+
+
+@pytest.mark.parametrize("body,fragment", [
+    (b'{"error": "model requires more system memory (12 GiB)"}\n', "model requires more system memory"),
+    (b'not json\n', "invalid JSON"),
+])
+def test_ollama_stream_errors_are_reported_safely(monkeypatch, body, fragment) -> None:
+    _streamed_backend(monkeypatch, body=body)
+    with pytest.raises(UpstreamError) as captured:
+        asyncio.run(OllamaChatAdapter().complete(OLLAMA_ENDPOINT, MODEL, QueryRequest.from_prompt("hi")))
+    assert fragment in str(captured.value)
+
+
+def test_openai_stream_error_event_and_http_status(monkeypatch) -> None:
+    _streamed_backend(monkeypatch, body=b'data: {"error": {"message": "context length exceeded", "type": "invalid"}}\n\n')
+    with pytest.raises(UpstreamError) as captured:
+        asyncio.run(OpenAIChatAdapter().complete(OPENAI_ENDPOINT, MODEL, QueryRequest.from_prompt("hi")))
+    assert "context length exceeded" in str(captured.value)
+    _streamed_backend(monkeypatch, body=b'{"error": "busy"}', status=503)
+    with pytest.raises(UpstreamError) as captured:
+        asyncio.run(OpenAIChatAdapter().complete(OPENAI_ENDPOINT, MODEL, QueryRequest.from_prompt("hi")))
+    assert captured.value.status_code == 503 and captured.value.kind == "http_5xx" and captured.value.retryable
+
+
+def test_stream_timeouts_distinguish_first_token_idle_and_cap(monkeypatch) -> None:
+    from llm_router.adapters.base import STREAM_TIMEOUTS, StreamTimeouts
+
+    async def silent():
+        await asyncio.sleep(0.4)
+        yield b'{"message":{"role":"assistant","content":"late"},"done":true}\n'
+
+    async def stalls():
+        yield b'{"message":{"role":"assistant","content":"Hi"},"done":false}\n'
+        await asyncio.sleep(0.4)
+        yield b'{"message":{"role":"assistant","content":"!"},"done":true}\n'
+
+    async def slow_total():
+        for _ in range(40):
+            yield b'{"message":{"role":"assistant","content":"x"},"done":false}\n'
+            await asyncio.sleep(0.02)
+        yield b'{"message":{"role":"assistant","content":""},"done":true}\n'
+
+    cases = [
+        (silent, StreamTimeouts(first_token=0.05, idle=1.0, total=None), "no first token within 0.05 s"),
+        (stalls, StreamTimeouts(first_token=1.0, idle=0.05, total=None), "no token for 0.05 s"),
+        (slow_total, StreamTimeouts(first_token=1.0, idle=1.0, total=0.15), "request cap of 0.15 s"),
+    ]
+    for content, timeouts, fragment in cases:
+        _streamed_backend(monkeypatch, content=content())
+        token = STREAM_TIMEOUTS.set(timeouts)
+        try:
+            with pytest.raises(UpstreamError) as captured:
+                asyncio.run(OllamaChatAdapter().complete(OLLAMA_ENDPOINT, MODEL, QueryRequest.from_prompt("hi")))
+        finally:
+            STREAM_TIMEOUTS.reset(token)
+        assert captured.value.kind == "timeout", fragment
+        assert fragment in str(captured.value), str(captured.value)
+    _streamed_backend(monkeypatch, content=stalls())
+    token = STREAM_TIMEOUTS.set(StreamTimeouts(first_token=1.0, idle=1.0, total=None))
+    try:
+        result = asyncio.run(OllamaChatAdapter().complete(OLLAMA_ENDPOINT, MODEL, QueryRequest.from_prompt("hi")))
+    finally:
+        STREAM_TIMEOUTS.reset(token)
+    assert result.text == "Hi!", "A pause shorter than the idle limit is fine"

@@ -150,12 +150,14 @@ caveats instead of repeating them under every card. Each panel heading carries a
 live count, such as `2 of 3 online` or `82 requests · last 24 hours`, so a
 folded panel still tells you its state.
 
-The Fleet zone also has a **Routing settings** panel with three switches that
+The Fleet zone also has a **Routing settings** panel whose switches and numbers
 save on the router the moment you change them and apply to new requests without
-a restart: **Advertise per-machine model names**, **Prefer the fastest replica**,
-and **Occasionally race all replicas** with its **Race every** interval. Recent
-races are listed under the switches. See
-[Fastest replica and replica races](#fastest-replica-and-replica-races).
+a restart: **Advertise per-machine model names**, **Prefer the fastest replica**
+(optionally ranked by first token), **Occasionally race all replicas** with its
+**Race every** interval, and the three streaming timeouts. Recent races are
+listed under the switches. See
+[Fastest replica and replica races](#fastest-replica-and-replica-races) and
+[Streaming, silences, and long-running requests](#streaming-silences-and-long-running-requests).
 
 Enter the **router's** `LLM_ROUTER_GATEWAY_API_KEY` from `router.env` to unlock fleet
 details. This is not an LM Studio/provider token. A key entered in the password
@@ -326,8 +328,9 @@ per second, reported model load/setup time, successful/failed request counts,
 and when each model/server was last observed. **No benchmarks or extra inference
 requests are sent.** Only real requests routed through this process contribute;
 requests sent directly to Ollama/LM Studio bypass the router and are not visible.
-The existing buffered streaming path records one observation after the upstream
-answer completes, not a live token counter while the answer is being generated.
+The router reads each backend answer as a token stream and records one
+observation after it completes, including the **time to first token**, not a
+live token counter while the answer is being generated.
 
 Each measurement keeps its latest value, sample count, last-observed timestamp,
 and an exponentially weighted moving average (`ewma`, alpha `0.2`) that adjusts
@@ -614,7 +617,7 @@ To install the local wheel instead:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install ./dist/source_agnostic_llm_router-0.3.12-py3-none-any.whl
+python -m pip install ./dist/source_agnostic_llm_router-0.4.0-py3-none-any.whl
 llm-router --json discover
 ```
 
@@ -736,7 +739,9 @@ under the service account, and apply to new requests immediately.
 orders the chosen model's replicas by observed latency, lowest first. An explicit
 machine preference such as `qwen-golemframe` still wins. Observed latency comes
 from real requests in this process, so a replica that is never used keeps a
-stale figure; that is what the second switch is for.
+stale figure; that is what the second switch is for. **Rank the fastest replica
+by first token** swaps total answer time for the observed time to first token,
+which is what a voice assistant feels as the pause before it starts speaking.
 
 **Occasionally race all replicas** sends every Nth request for a model that has
 two or more available replicas to all of them at the same time. The first
@@ -754,10 +759,44 @@ router process restarts.
 The settings API is `GET` and `POST /status/settings`. Both need the router
 Bearer key even on otherwise keyless gateways; `POST` additionally requires
 `X-LLM-Router-Settings: 1`, a same-origin browser request, and a JSON object with
-any of `advertise_machine_aliases`, `prefer_fastest_replica`, `race_replicas`, and
-`race_every`. Invalid values are rejected with HTTP 400 and nothing changes;
-a storage failure returns 503 and nothing changes. Detailed `/status/data`
+any of `advertise_machine_aliases`, `prefer_fastest_replica`, `prefer_first_token`,
+`race_replicas`, `race_every`, `first_token_timeout_seconds`, `idle_timeout_seconds`,
+and `max_request_seconds`. Invalid values are rejected with HTTP 400 and nothing
+changes; a storage failure returns 503 and nothing changes. Detailed `/status/data`
 carries the same object under `routing`.
+
+### Streaming, silences, and long-running requests
+
+The router always asks Ollama and OpenAI-compatible backends for a **token
+stream** (`stream: true`) and folds the chunks back into one answer, including
+tool calls whose arguments arrive in fragments. The client still receives a
+single reply, as before. Streaming changes what a timeout means: a backend that
+is still producing tokens is never cut off for taking long overall, only for
+going silent. A backend or proxy that ignores `stream` and answers in one piece
+is accepted as well; set `options.stream = false` on an endpoint to ask for
+that explicitly.
+
+Three limits on the **Routing settings** panel govern silences, and none of
+them caps a working answer by default:
+
+- **First-token timeout** (default 300 s): how long a backend may stay silent
+  before its first token. Loading a model from disk and evaluating a long
+  prompt, such as Home Assistant's exposed-entity list, both happen here.
+- **Idle timeout** (default 90 s): the longest gap allowed between tokens once
+  generation has started.
+- **Request cap** (default 0, meaning none): a hard limit on a whole answer for
+  routers that must bound every request; leave it at 0 for agent workloads.
+
+Each attempt records its time to first token; the performance panel shows it
+next to the wall-clock request time, and `prefer_first_token` can rank replicas
+by it. A timed-out attempt is reported with the phase it timed out in ("no
+first token within 300 s", "no token for 90 s during generation", or "exceeded
+the request cap") and fails over like any other failure. Ollama's `keep_alive`
+and `think` request fields are forwarded to Ollama backends when a client sends
+usable values, so Home Assistant's `keep_alive: -1` keeps its model loaded.
+Multi-day agent jobs are fine as long as their own client waits; the router
+holds no state for a stream across a restart, so a request in flight during a
+router update fails and the client must retry it.
 
 ### Unified gateway and Home Assistant
 
@@ -941,7 +980,8 @@ Health timestamps and errors appear under `/router/status`; `/readyz` returns 50
 when no enabled deployment is currently usable. Backend HA still requires a surviving
 eligible replica within the configured retry budget and the client's timeout. The
 gateway itself needs separate redundancy if its host must also tolerate failure.
-Streaming responses are currently buffered until an entire upstream answer completes.
+Backend answers are streamed into the router and delivered to the client in one
+piece once complete.
 
 ### CLI routing
 

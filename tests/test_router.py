@@ -356,3 +356,31 @@ def test_cancelling_a_raced_request_cancels_every_participant() -> None:
         assert not router.runtime.race_tasks
 
     asyncio.run(scenario())
+
+
+def test_attempts_carry_the_configured_stream_timeouts_and_record_first_token(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from llm_router.adapters.base import STREAM_TIMEOUTS
+    from llm_router.metrics import MetricsStore
+    from llm_router.routing_settings import RoutingSettings
+
+    seen = []
+
+    class TimedFirstToken(TimedAdapter):
+        async def complete(self, endpoint, model, request):  # type: ignore[no-untyped-def]
+            seen.append(STREAM_TIMEOUTS.get())
+            result = await super().complete(endpoint, model, request)
+            return UpstreamResult(text=result.text, usage=result.usage, raw=result.raw, finish_reason=result.finish_reason, first_token_ms=42.5)
+
+    adapter = TimedFirstToken({})
+    settings = RoutingSettings(first_token_timeout_seconds=600, idle_timeout_seconds=30, max_request_seconds=0)
+    router = _replica_router(adapter, settings)
+    result = asyncio.run(router.complete(QueryRequest.from_prompt("hello")))
+    assert seen[-1].first_token == 600 and seen[-1].idle == 30 and seen[-1].total is None
+    assert result.attempts[-1]["first_token_ms"] == 42.5
+    assert router.runtime.state(result.deployment).first_token_ewma_ms == 42.5
+    router.settings = RoutingSettings(max_request_seconds=120)
+    asyncio.run(router.complete(QueryRequest.from_prompt("hello")))
+    assert seen[-1].total == 120
+    assert STREAM_TIMEOUTS.get().first_token == 300, "The context variable is reset after each attempt"
+    row = router.metrics.snapshot()["deployments"][0]
+    assert row["metrics"]["first_token_ms"]["latest"] == 42.5

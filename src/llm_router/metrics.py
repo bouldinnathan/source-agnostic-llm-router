@@ -52,7 +52,10 @@ _TRAFFIC_COUNTERS = ("requests_ok", "requests_failed", "reroutes_ok", "reroutes_
 _TRAFFIC_TOKENS = ("input_tokens", "output_tokens")
 _METRICS = (
     "input_tokens_per_second", "output_tokens_per_second", "load_duration_ms", "request_duration_ms",
+    "first_token_ms",
 )
+# Rows written before time-to-first-token existed lack that key; every other key is required.
+_OPTIONAL_METRICS = {"first_token_ms"}
 _COLUMNS = (
     "id", "machine", "endpoint", "model", "address", "adapter", "successes", "failures",
     "input_tokens_total", "output_tokens_total", "last_seen_at", "metrics_json", "slow_load_count",
@@ -201,8 +204,10 @@ def _decode(row: sqlite3.Row) -> dict:
     if not isinstance(raw, str) or len(raw) > 8192:
         raise ValueError("Invalid metrics aggregates")
     metrics = json.loads(raw, object_pairs_hook=_unique_json)
-    if not isinstance(metrics, dict) or set(metrics) != set(_METRICS):
+    if not isinstance(metrics, dict) or not (set(_METRICS) - _OPTIONAL_METRICS <= set(metrics) <= set(_METRICS)):
         raise ValueError("Invalid metrics aggregates")
+    for name in _OPTIONAL_METRICS:
+        metrics.setdefault(name, None)
     for sample in metrics.values():
         if sample is None:
             continue

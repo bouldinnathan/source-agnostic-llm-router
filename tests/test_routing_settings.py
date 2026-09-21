@@ -17,8 +17,9 @@ def test_defaults_keep_current_behaviour_and_missing_file_reads_as_defaults(tmp_
     store = RoutingSettingsStore(tmp_path / "missing" / "routing-settings.json")
     assert store.load() == RoutingSettings()
     assert RoutingSettings().to_dict() == {
-        "advertise_machine_aliases": True, "prefer_fastest_replica": False,
+        "advertise_machine_aliases": True, "prefer_fastest_replica": False, "prefer_first_token": False,
         "race_replicas": False, "race_every": 20,
+        "first_token_timeout_seconds": 300, "idle_timeout_seconds": 90, "max_request_seconds": 0,
     }
     assert not (tmp_path / "missing").exists(), "Reading never creates files"
 
@@ -110,3 +111,24 @@ def test_oversized_file_is_refused(tmp_path):
     path.chmod(0o600)
     with pytest.raises(RuntimeError):
         RoutingSettingsStore(path).load()
+
+
+@pytest.mark.parametrize("data,expected", [
+    ({"first_token_timeout_seconds": 600}, 600), ({"first_token_timeout_seconds": 5.0}, 5),
+])
+def test_timeout_fields_accept_whole_seconds(data, expected):
+    assert validate_settings(data).first_token_timeout_seconds == expected
+    assert validate_settings({"idle_timeout_seconds": 3600}).idle_timeout_seconds == 3600
+    assert validate_settings({"max_request_seconds": 0}).max_request_seconds == 0
+    assert validate_settings({"max_request_seconds": 86400}).max_request_seconds == 86400
+    assert validate_settings({"prefer_first_token": True}).prefer_first_token is True
+
+
+@pytest.mark.parametrize("data", [
+    {"first_token_timeout_seconds": 4}, {"first_token_timeout_seconds": 3601}, {"idle_timeout_seconds": 0},
+    {"max_request_seconds": -1}, {"max_request_seconds": 86401}, {"max_request_seconds": "none"},
+    {"prefer_first_token": "yes"}, {"first_token_timeout_seconds": True},
+])
+def test_timeout_fields_reject_out_of_range_values(data):
+    with pytest.raises(ValueError):
+        validate_settings(data)

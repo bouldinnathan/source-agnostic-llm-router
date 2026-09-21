@@ -193,3 +193,20 @@ def test_prefer_fastest_replica_reorders_only_within_a_replica_group() -> None:
     assert router.route(pinned).candidates[0].model.id == "qwen-a", "An explicit machine preference still comes first"
     router.settings = RoutingSettings()
     assert [item.model.id for item in router.route(ha).candidates] == default_order
+
+
+def test_prefer_fastest_can_rank_by_first_token_instead_of_total_time() -> None:
+    from llm_router.routing_settings import RoutingSettings
+
+    router = LLMRouter(_replica_config())
+    for _ in range(3):
+        router.runtime.begin("qwen-a")
+        router.runtime.record_success("qwen-a", 900, first_token_ms=50)   # slow overall, quick to start
+        router.runtime.begin("qwen-b")
+        router.runtime.record_success("qwen-b", 120, first_token_ms=400)  # fast overall, slow to start
+    ha = QueryRequest.from_prompt("hello", allowed_deployments=("qwen-a", "qwen-b"), strategy="quality")
+    router.settings = RoutingSettings(prefer_fastest_replica=True)
+    assert [item.model.id for item in router.route(ha).candidates] == ["qwen-b", "qwen-a"]
+    router.settings = RoutingSettings(prefer_fastest_replica=True, prefer_first_token=True)
+    assert [item.model.id for item in router.route(ha).candidates] == ["qwen-a", "qwen-b"]
+    assert router.route(ha).candidates[0].observed_first_token_ms == 50

@@ -25,6 +25,14 @@ except ImportError:  # Normal gateway imports must still work off POSIX.
 
 MIN_RACE_EVERY = 2
 MAX_RACE_EVERY = 1000
+# Whole seconds. A first-token limit covers model loading and prompt evaluation;
+# idle is the longest silence during generation; the cap bounds the whole answer.
+INTEGER_FIELDS = {
+    "race_every": (MIN_RACE_EVERY, MAX_RACE_EVERY),
+    "first_token_timeout_seconds": (5, 3600),
+    "idle_timeout_seconds": (5, 3600),
+    "max_request_seconds": (0, 86400),
+}
 _MAX_STATE_BYTES = 8 * 1024
 _ERROR = "Routing settings storage is unavailable or unsafe; saved settings were not changed."
 
@@ -35,15 +43,23 @@ class RoutingSettings:
 
     advertise_machine_aliases: bool = True
     prefer_fastest_replica: bool = False
+    prefer_first_token: bool = False
     race_replicas: bool = False
     race_every: int = 20
+    first_token_timeout_seconds: int = 300
+    idle_timeout_seconds: int = 90
+    max_request_seconds: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "advertise_machine_aliases": self.advertise_machine_aliases,
             "prefer_fastest_replica": self.prefer_fastest_replica,
+            "prefer_first_token": self.prefer_first_token,
             "race_replicas": self.race_replicas,
             "race_every": self.race_every,
+            "first_token_timeout_seconds": self.first_token_timeout_seconds,
+            "idle_timeout_seconds": self.idle_timeout_seconds,
+            "max_request_seconds": self.max_request_seconds,
         }
 
 
@@ -58,18 +74,20 @@ def validate_settings(data: object, *, base: RoutingSettings | None = None) -> R
     if unknown:
         raise ValueError("Unknown routing setting: " + ", ".join(sorted(str(name) for name in unknown)))
     changes: dict[str, Any] = {}
-    for name in ("advertise_machine_aliases", "prefer_fastest_replica", "race_replicas"):
+    for name in ("advertise_machine_aliases", "prefer_fastest_replica", "prefer_first_token", "race_replicas"):
         if name in data:
             if type(data[name]) is not bool:
                 raise ValueError(f"{name} must be true or false.")
             changes[name] = data[name]
-    if "race_every" in data:
-        value = data["race_every"]
+    for name, (low, high) in INTEGER_FIELDS.items():
+        if name not in data:
+            continue
+        value = data[name]
         if isinstance(value, float) and value.is_integer():
             value = int(value)
-        if type(value) is not int or not MIN_RACE_EVERY <= value <= MAX_RACE_EVERY:
-            raise ValueError(f"race_every must be a whole number from {MIN_RACE_EVERY} to {MAX_RACE_EVERY}.")
-        changes["race_every"] = value
+        if type(value) is not int or not low <= value <= high:
+            raise ValueError(f"{name} must be a whole number from {low} to {high}.")
+        changes[name] = value
     return replace(base or RoutingSettings(), **changes)
 
 

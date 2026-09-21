@@ -22,8 +22,10 @@ class Ranker:
     def __init__(self, config: RouterConfig, runtime: RuntimeRegistry) -> None:
         self.config = config
         self.runtime = runtime
-        # Dashboard switch: order replicas of the chosen model by observed latency.
+        # Dashboard switches: order replicas of the chosen model by observed
+        # latency, measured as total answer time or as time to first token.
         self.prefer_fastest = False
+        self.prefer_first_token = False
 
     def rank(self, request: QueryRequest) -> RoutingDecision:
         strategy = request.strategy or self.config.policy.default_strategy
@@ -87,6 +89,7 @@ class Ranker:
                     estimated_request_cost=costs[model.id],
                     observed_latency_ms=latencies[model.id],
                     health_score=health,
+                    observed_first_token_ms=self.runtime.observed_first_token(model),
                 )
             )
 
@@ -94,7 +97,7 @@ class Ranker:
         if self.config.policy.diversify_fallbacks:
             candidates = _diversify_endpoints(candidates)
         if self.prefer_fastest:
-            candidates = _prefer_fastest_replicas(candidates)
+            candidates = _prefer_fastest_replicas(candidates, first_token=self.prefer_first_token)
         if request.preferred_endpoints:
             # A named machine is the first choice after hard constraints, even
             # when another replica has a better score. Preserve scoring within
@@ -204,7 +207,7 @@ def replica_group(model: ModelConfig) -> str:
     return replica_group_key(model)
 
 
-def _prefer_fastest_replicas(candidates: list[RouteCandidate]) -> list[RouteCandidate]:
+def _prefer_fastest_replicas(candidates: list[RouteCandidate], *, first_token: bool = False) -> list[RouteCandidate]:
     """Keep the model choice, but try that model's replicas fastest-first.
 
     Groups stay in the order their best-scored member earned; only the order
@@ -219,9 +222,14 @@ def _prefer_fastest_replicas(candidates: list[RouteCandidate]) -> list[RouteCand
             order.append(key)
             groups[key] = []
         groups[key].append(item)
+    def speed(item: RouteCandidate) -> float:
+        if first_token and item.observed_first_token_ms is not None:
+            return item.observed_first_token_ms
+        return item.observed_latency_ms
+
     ordered: list[RouteCandidate] = []
     for key in order:
-        ordered.extend(sorted(groups[key], key=lambda item: (item.observed_latency_ms, -item.score, item.model.id)))
+        ordered.extend(sorted(groups[key], key=lambda item: (speed(item), -item.score, item.model.id)))
     return ordered
 
 

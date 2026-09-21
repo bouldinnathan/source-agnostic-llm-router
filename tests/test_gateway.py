@@ -66,7 +66,7 @@ class StaticGateway:
     def status(self):  # type: ignore[no-untyped-def]
         return {
             "status": "ready" if self._router else "unavailable",
-            "version": "0.3.12",
+            "version": "0.4.0",
         }
 
 
@@ -445,3 +445,21 @@ def test_client_output_limit_is_only_forwarded_when_set() -> None:
     assert adapter.requests[-1].max_tokens_specified is False
     assert asyncio.run(request(app, "POST", "/v1/chat/completions", json={**openai, "max_completion_tokens": 32})).status_code == 200
     assert adapter.requests[-1].max_tokens == 32 and adapter.requests[-1].max_tokens_specified is True
+
+
+def test_keep_alive_and_think_pass_through_only_when_usable() -> None:
+    router, adapter = make_gateway_router()
+    app = create_app(gateway=StaticGateway(router))
+    base = {"model": "auto", "stream": False, "messages": [{"role": "user", "content": "hi"}]}
+    for keep_alive, expected in ((-1, -1), ("300s", "300s"), (600.0, 600), ("5m", "5m"), ("bogus", None), (True, None), (-2, None), ("", None)):
+        response = asyncio.run(request(app, "POST", "/api/chat", json={**base, "keep_alive": keep_alive}))
+        assert response.status_code == 200, (keep_alive, response.text)
+        assert adapter.requests[-1].keep_alive == expected, keep_alive
+    assert asyncio.run(request(app, "POST", "/api/chat", json=base)).status_code == 200
+    assert adapter.requests[-1].keep_alive is None and adapter.requests[-1].think is None
+    assert asyncio.run(request(app, "POST", "/api/chat", json={**base, "think": False})).status_code == 200
+    assert adapter.requests[-1].think is False and "reasoning" not in adapter.requests[-1].required_capabilities
+    assert asyncio.run(request(app, "POST", "/api/chat", json={**base, "think": "yes"})).status_code == 200
+    assert adapter.requests[-1].think is None
+    openai = asyncio.run(request(app, "POST", "/v1/chat/completions", json={"model": "auto", "messages": base["messages"], "keep_alive": -1}))
+    assert openai.status_code == 200 and adapter.requests[-1].keep_alive is None, "keep_alive is an Ollama concept"
