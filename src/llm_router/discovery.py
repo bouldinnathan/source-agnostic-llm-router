@@ -5,17 +5,21 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import json
 import math
 import os
 import re
+import struct
+import time
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 from urllib.parse import urlparse
 
 import httpx
 
 from .adapters import BUILTIN_ADAPTERS
 from .errors import ConfigError
+from .peers import FLEET_PATH, PeerSpec, enroll_peer, instance_id, lan_peer_specs, parse_peers, peer_key_env
 from .schema import AuthConfig, EndpointConfig, ModelConfig, PolicyConfig, RouterConfig
 
 
@@ -24,12 +28,23 @@ class DiscoverySettings:
     """Controls safe automatic enrollment.
 
     Loopback probes and credential-backed cloud providers are enabled by default.
-    LAN probing only occurs for explicitly supplied CIDRs.
+    LAN probing only occurs for explicitly supplied CIDRs. ``sweep_local_ports``
+    additionally asks every TCP port this machine listens on whether it serves
+    Ollama's or an OpenAI-compatible API, so Ollama and LM Studio are found on
+    whatever port they were started on; nothing beyond this machine is touched.
     """
 
     enabled: bool = True
     include_loopback: bool = True
     include_cloud: bool = True
+    sweep_local_ports: bool = True
+    max_local_ports: int = 512
+    # Other llm-router gateways whose deployments this router enrolls as its
+    # own (``LLM_ROUTER_PEERS``), and whether the opted-in LAN ranges are also
+    # checked for gateways on the fleet port.
+    peers: tuple[str, ...] = ()
+    scan_peers: bool = True
+    peer_port: int = 8088
     timeout_seconds: float = 1.25
     cloud_timeout_seconds: float = 6.0
     refresh_seconds: float = 300.0
@@ -45,6 +60,11 @@ class DiscoverySettings:
             enabled=_env_bool("LLM_ROUTER_DISCOVERY", True),
             include_loopback=_env_bool("LLM_ROUTER_DISCOVER_LOCAL", True),
             include_cloud=_env_bool("LLM_ROUTER_DISCOVER_CLOUD", True),
+            sweep_local_ports=_env_bool("LLM_ROUTER_DISCOVER_LOCAL_PORTS", True),
+            max_local_ports=_env_int("LLM_ROUTER_MAX_LOCAL_PORTS", 512, minimum=1, maximum=4096),
+            peers=_env_list("LLM_ROUTER_PEERS"),
+            scan_peers=_env_bool("LLM_ROUTER_SCAN_PEERS", True),
+            peer_port=_env_int("LLM_ROUTER_PEER_PORT", 8088, minimum=1, maximum=65535),
             timeout_seconds=_env_float("LLM_ROUTER_DISCOVERY_TIMEOUT", 1.25, minimum=0.1),
             cloud_timeout_seconds=_env_float(
                 "LLM_ROUTER_CLOUD_DISCOVERY_TIMEOUT", 6.0, minimum=0.1
@@ -151,25 +171,38 @@ class ModelDiscovery:
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         configured: RouterConfig | None = None,
+        listening_addresses: Callable[[], Awaitable[Iterable[tuple[str, int]]]] | None = None,
+        previous: RouterConfig | None = None,
     ) -> None:
         self.settings = settings or DiscoverySettings.from_env()
         self.transport = transport
         self.configured = configured
+        # The router in service before this refresh. A peer that cannot be
+        # reached now keeps the machines it published last time, offline, so
+        # their names survive and their health probes bring them back.
+        self.previous = previous
+        # How the local port sweep learns what this machine listens on; tests
+        # inject a fixed list. ``None`` resolves to local_listening_addresses
+        # at sweep time so a patched module attribute is honoured.
+        self.listening_addresses = listening_addresses
 
     async def discover(self) -> DiscoveryReport:
         if not self.settings.enabled:
             return DiscoveryReport(_empty_config(), ())
 
-        probes = self._probes()
+        probes = self._static_probes()
         limits = httpx.Limits(max_connections=64, max_keepalive_connections=16)
         async with httpx.AsyncClient(
             transport=self.transport,
             follow_redirects=False,
             limits=limits,
         ) as client:
-            enrolled = await asyncio.gather(
-                *(self._probe_safely(client, probe) for probe in probes)
-            )
+            if self.settings.include_loopback and self.settings.sweep_local_ports:
+                probes.extend(await self._sweep_local_ports(client, probes))
+            enrolled = list(await asyncio.gather(
+                *(self._probe_safely(client, probe) for probe in self._unique(probes))
+            ))
+            enrolled.extend(await self._peer_sources(client))
 
         endpoints: dict[str, EndpointConfig] = {}
         models: dict[str, ModelConfig] = {}
@@ -360,6 +393,10 @@ class ModelDiscovery:
         return merged
 
     def _probes(self) -> tuple[ProbeSpec, ...]:
+        """Every probe except the local port sweep, which needs a live client."""
+        return self._unique(self._static_probes())
+
+    def _static_probes(self) -> list[ProbeSpec]:
         probes = _configured_probes(self.configured, self.settings.timeout_seconds)
         probes.extend(_extra_probes(self.settings.extra_urls, self.settings.timeout_seconds))
         if self.settings.include_loopback:
@@ -373,6 +410,10 @@ class ModelDiscovery:
         )
         if self.settings.include_cloud:
             probes.extend(_cloud_probes(self.settings.cloud_timeout_seconds))
+        return probes
+
+    def _unique(self, probes: list[ProbeSpec]) -> tuple[ProbeSpec, ...]:
+        """One probe per API address; configured endpoints own theirs, earlier names win."""
         configured_addresses = {
             _service_address(endpoint.base_url)
             for endpoint in (self.configured.endpoints.values() if self.configured else ())
@@ -397,6 +438,380 @@ class ModelDiscovery:
             identities[name] = key
             unique.setdefault(key, probe)
         return tuple(unique.values())
+
+    async def _sweep_local_ports(
+        self, client: httpx.AsyncClient, static: list[ProbeSpec],
+    ) -> list[ProbeSpec]:
+        """Find model servers on every port this machine listens on, whatever the port.
+
+        Ports that the fixed loopback probes or explicit configuration already
+        cover are left to them. A port that answered as something other than a
+        model server is remembered and not asked again for a while, so the
+        gateway's periodic refresh does not keep sending HTTP requests to a
+        database or a SOCKS proxy. Never raises: a sweep that cannot run only
+        means the fixed ports are used.
+        """
+        enumerate_addresses = self.listening_addresses or local_listening_addresses
+        try:
+            addresses = tuple(await enumerate_addresses())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return []
+        claimed = {key for key in (_url_key(probe.base_url) for probe in static) if key is not None}
+        if self.configured is not None:
+            claimed.update(
+                key for key in (_url_key(endpoint.base_url) for endpoint in self.configured.endpoints.values())
+                if key is not None
+            )
+        candidates = _sweep_candidates(addresses, claimed, self.settings.max_local_ports)
+        semaphore = asyncio.Semaphore(_SWEEP_IDENTIFY_CONCURRENCY)
+        timeout = self.settings.timeout_seconds
+
+        async def identify(port: int, hosts: list[str]) -> ProbeSpec | None:
+            now = time.monotonic()
+            for host in hosts:
+                if now - _sweep_rejections.get((host, port), -math.inf) < _SWEEP_NEGATIVE_TTL_SECONDS:
+                    continue
+                async with semaphore:
+                    try:
+                        probe = await _identify_local_service(client, host, port, timeout)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        probe = None
+                if probe is not None:
+                    _sweep_rejections.pop((host, port), None)
+                    return probe
+                if len(_sweep_rejections) >= _SWEEP_NEGATIVE_LIMIT:
+                    _sweep_rejections.clear()
+                _sweep_rejections[(host, port)] = time.monotonic()
+            return None
+
+        found = await asyncio.gather(*(identify(port, hosts) for port, hosts in candidates))
+        return [probe for probe in found if probe is not None]
+
+    async def _peer_sources(self, client: httpx.AsyncClient) -> list[_EnrolledSource]:
+        """Enroll the deployments other gateways publish, one endpoint per machine behind them."""
+        settings = self.settings
+        key_env = peer_key_env()
+        specs = parse_peers(settings.peers, key_env)
+        if settings.scan_peers and settings.scan_cidrs:
+            specs.extend(lan_peer_specs(
+                settings.scan_cidrs, settings.max_hosts_per_cidr, settings.peer_port, key_env,
+                exclude={spec.base_url for spec in specs},
+            ))
+        if not specs:
+            return []
+        own = instance_id()
+        groups = await asyncio.gather(*(self._peer_source(client, spec, own) for spec in specs))
+        return [source for group in groups for source in group]
+
+    async def _peer_source(self, client: httpx.AsyncClient, spec: PeerSpec, own: str) -> list[_EnrolledSource]:
+        timeout = min(self.settings.timeout_seconds, 0.5) if spec.scanned else self.settings.timeout_seconds
+        headers = {"Accept": "application/json"}
+        secret = os.environ.get(spec.key_env, "") if spec.key_env else ""
+        if secret:
+            headers["Authorization"] = "Bearer " + secret
+        label = f"{'lan-peer' if spec.scanned else 'peer'}-{spec.name}"
+        error: str
+        try:
+            response = await client.get(spec.base_url + FLEET_PATH, headers=headers, timeout=timeout)
+            if response.status_code in (401, 403):
+                error = "authentication rejected"
+            elif response.status_code != 200:
+                error = f"HTTP {response.status_code}"
+            else:
+                enrolled = enroll_peer(response.json(), spec, own_instance=own)
+                sources = [
+                    _EnrolledSource(endpoint=endpoint, models=models, result=ProbeResult(
+                        source=label, provider="llm-router", base_url=spec.base_url, reachable=True,
+                        enrolled_models=len(models), endpoint=endpoint.name,
+                    ))
+                    for endpoint, models in enrolled
+                ]
+                if sources:
+                    return sources
+                placeholder = EndpointConfig(name=label, adapter="ollama-chat", base_url=spec.base_url)
+                return [_EnrolledSource(endpoint=placeholder, models=(), result=ProbeResult(
+                    source=label, provider="llm-router", base_url=spec.base_url, reachable=True,
+                    error="reachable but publishes no deployments this router can use",
+                ))]
+        except asyncio.CancelledError:
+            raise
+        except (httpx.TimeoutException, TimeoutError):
+            error = "timed out"
+        except (httpx.NetworkError, ConnectionError):
+            error = "unreachable"
+        except httpx.HTTPError as exc:
+            error = f"HTTP client error ({type(exc).__name__})"
+        except (ValueError, TypeError, KeyError):
+            error = "not an llm-router fleet listing"
+        except Exception as exc:
+            error = f"probe failed ({type(exc).__name__})"
+        # Known machines behind an unreachable peer stay enrolled offline; the
+        # gateway retains their deployments and their health probes revive them.
+        retained = [
+            endpoint for endpoint in (self.previous.endpoints.values() if self.previous is not None else ())
+            if endpoint.options.get("peer") == spec.name and endpoint.base_url == spec.base_url
+        ]
+        if retained:
+            return [
+                _EnrolledSource(endpoint=endpoint, models=(), result=ProbeResult(
+                    source=label, provider="llm-router", base_url=spec.base_url, reachable=False,
+                    error=error, endpoint=endpoint.name,
+                ))
+                for endpoint in retained
+            ]
+        placeholder = EndpointConfig(name=label, adapter="ollama-chat", base_url=spec.base_url)
+        return [_EnrolledSource(endpoint=placeholder, models=(), result=ProbeResult(
+            source=label, provider="llm-router", base_url=spec.base_url, reachable=False, error=error,
+        ))]
+
+
+# Local port sweep. Every TCP port this machine listens on is asked whether it
+# speaks Ollama's or an OpenAI-compatible API, so Ollama and LM Studio are
+# found on whatever port they were started on. Only this machine is probed.
+_SWEEP_IDENTIFY_CONCURRENCY = 32
+_SWEEP_MAX_BODY = 1024 * 1024
+_SWEEP_NEGATIVE_TTL_SECONDS = 600.0
+_SWEEP_NEGATIVE_LIMIT = 4096
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+# (host, port) -> when it last answered as something other than a model server.
+_sweep_rejections: dict[tuple[str, int], float] = {}
+
+
+async def local_listening_addresses() -> tuple[tuple[str, int], ...]:
+    """TCP addresses this machine listens on: from /proc on Linux, else a loopback connect sweep."""
+    listed = _proc_listening_addresses()
+    if listed is not None:
+        return listed
+    return await _loopback_connect_sweep()
+
+
+def _proc_listening_addresses(
+    paths: tuple[str, ...] = ("/proc/net/tcp", "/proc/net/tcp6"),
+) -> tuple[tuple[str, int], ...] | None:
+    """Listening sockets from the kernel's tables, or None where they cannot be read."""
+    found: dict[tuple[str, int], None] = {}
+    readable = False
+    for path in paths:
+        try:
+            with open(path, encoding="ascii", errors="replace") as handle:
+                table = handle.read()
+        except OSError:
+            continue
+        readable = True
+        found.update(dict.fromkeys(_parse_proc_net_tcp(table)))
+    return tuple(found) if readable else None
+
+
+def _parse_proc_net_tcp(table: str) -> list[tuple[str, int]]:
+    """Listening sockets in a /proc/net/tcp or tcp6 table, as connectable addresses.
+
+    A wildcard bind is reached through loopback (both families for ``::``,
+    since a v6-only socket refuses IPv4). An address bound to one interface is
+    still this machine and is used as is. Link-local IPv6 needs a scope and is
+    skipped.
+    """
+    addresses: list[tuple[str, int]] = []
+    for line in table.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 4 or fields[3] != "0A":  # 0A is TCP_LISTEN
+            continue
+        local, _, port_hex = fields[1].partition(":")
+        try:
+            port = int(port_hex, 16)
+            address: ipaddress.IPv4Address | ipaddress.IPv6Address
+            if len(local) == 8:
+                address = ipaddress.IPv4Address(struct.pack("<I", int(local, 16)))
+            elif len(local) == 32:
+                address = ipaddress.IPv6Address(
+                    b"".join(struct.pack("<I", int(local[index:index + 8], 16)) for index in range(0, 32, 8))
+                )
+            else:
+                continue
+        except (ValueError, struct.error):
+            continue
+        if not 1 <= port <= 65535:
+            continue
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        if address.is_unspecified:
+            addresses.append(("127.0.0.1", port))
+            if address.version == 6:
+                addresses.append(("[::1]", port))
+        elif address.is_link_local:
+            continue
+        elif address.version == 6:
+            addresses.append((f"[{address.compressed}]", port))
+        else:
+            addresses.append((str(address), port))
+    return addresses
+
+
+async def _loopback_connect_sweep(
+    ports: Iterable[int] | None = None, *, host: str = "127.0.0.1", concurrency: int = 256,
+    connect_timeout: float = 0.25, budget_seconds: float = 10.0,
+) -> tuple[tuple[str, int], ...]:
+    """Without /proc, find open loopback ports by connecting to each; a closed port refuses at once."""
+    pending = iter(list(ports) if ports is not None else [80, *range(1024, 65536)])
+    open_ports: list[int] = []
+
+    async def check(port: int) -> None:
+        try:
+            _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), connect_timeout)
+        except (OSError, asyncio.TimeoutError):
+            return
+        try:
+            # Connecting to an unused port can land on the connection's own
+            # ephemeral port (a TCP self-connect); that is not a service.
+            local = writer.get_extra_info("sockname")
+            if not (isinstance(local, tuple) and len(local) >= 2 and local[1] == port):
+                open_ports.append(port)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def worker() -> None:
+        for port in pending:  # the shared iterator hands each port to one worker
+            await check(port)
+
+    try:
+        await asyncio.wait_for(asyncio.gather(*(worker() for _ in range(concurrency))), budget_seconds)
+    except asyncio.TimeoutError:
+        pass  # keep what was found within the budget
+    return tuple((host, port) for port in sorted(open_ports))
+
+
+def _loopback_key(host: str | None, port: int | None) -> tuple[str, int | None]:
+    """Identity of a service address with every loopback spelling folded together."""
+    name = (host or "").strip("[]").lower()
+    if name in _LOOPBACK_HOSTS:
+        return "local", port
+    try:
+        if ipaddress.ip_address(name).is_loopback:
+            return "local", port
+    except ValueError:
+        pass
+    return name, port
+
+
+def _url_key(base_url: str) -> tuple[str, int | None] | None:
+    try:
+        url = httpx.URL(base_url)
+    except Exception:
+        return None
+    if url.scheme not in {"http", "https"} or not url.host:
+        return None
+    port = url.port if url.port is not None else (443 if url.scheme == "https" else 80)
+    return _loopback_key(url.host, port)
+
+
+def _sweep_candidates(
+    addresses: Iterable[tuple[str, int]], claimed: set[tuple[str, int | None]], limit: int,
+) -> list[tuple[int, list[str]]]:
+    """Ports worth asking, each with its addresses to try in order, loopback first.
+
+    Privileged ports other than 80 host system services, not model servers,
+    and are left alone. Ports already covered by a fixed probe or explicit
+    configuration are skipped.
+    """
+    by_port: dict[int, list[str]] = {}
+    for host, port in addresses:
+        if not isinstance(host, str) or not host or isinstance(port, bool) or not isinstance(port, int):
+            continue
+        if not (port == 80 or 1024 <= port <= 65535):
+            continue
+        hosts = by_port.setdefault(port, [])
+        if host not in hosts:
+            hosts.append(host)
+
+    def preference(host: str) -> tuple[int, str]:
+        bare = host.strip("[]")
+        return (0 if bare == "127.0.0.1" else 1 if bare == "::1" else 2, host)
+
+    candidates: list[tuple[int, list[str]]] = []
+    for port in sorted(by_port):
+        hosts = [host for host in sorted(by_port[port], key=preference) if _loopback_key(host, port) not in claimed]
+        if hosts:
+            candidates.append((port, hosts))
+    return candidates[:limit]
+
+
+async def _json_get(client: httpx.AsyncClient, url: str, timeout: float) -> Any:
+    """GET a small JSON document, or None when the port does not serve one."""
+    try:
+        async with client.stream("GET", url, headers={"Accept": "application/json"}, timeout=timeout) as response:
+            if response.status_code != 200:
+                return None
+            chunks: list[bytes] = []
+            received = 0
+            async for chunk in response.aiter_bytes():
+                received += len(chunk)
+                if received > _SWEEP_MAX_BODY:
+                    return None
+                chunks.append(chunk)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return None
+    try:
+        return json.loads(b"".join(chunks))
+    except ValueError:
+        return None
+
+
+def _is_router_listing(entries: list[Any]) -> bool:
+    """A model list published by an llm-router gateway; never enrolled, so a router cannot chain to itself."""
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        details = entry.get("details")
+        if entry.get("owned_by") == "llm-router":
+            return True
+        if isinstance(details, Mapping) and details.get("family") == "llm-router":
+            return True
+    return False
+
+
+async def _identify_local_service(
+    client: httpx.AsyncClient, host: str, port: int, timeout: float,
+) -> ProbeSpec | None:
+    """Ask one listening port whether it is Ollama, LM Studio or another OpenAI-compatible server."""
+    base = f"http://{host}:{port}"
+    tags = await _json_get(client, base + "/api/tags", timeout)
+    if isinstance(tags, Mapping) and isinstance(tags.get("models"), list):
+        if _is_router_listing(tags["models"]):
+            return None
+        return _sweep_probe("ollama", "ollama", base, host, port, timeout)
+    listing = await _json_get(client, base + "/v1/models", timeout)
+    if isinstance(listing, Mapping) and isinstance(listing.get("data"), list):
+        if _is_router_listing(listing["data"]):
+            return None
+        native = await _json_get(client, base + "/api/v0/models", timeout)
+        studio = isinstance(native, Mapping) and isinstance(native.get("data"), list)
+        return _sweep_probe("lm-studio" if studio else "openai-compatible", "openai", base, host, port, timeout)
+    return None
+
+
+def _sweep_probe(provider: str, kind: str, base: str, host: str, port: int, timeout: float) -> ProbeSpec:
+    label = f"local-{port}" if host.strip("[]").lower() in _LOOPBACK_HOSTS else f"local-{_slug(host)}-{port}"
+    api_base = base if kind == "ollama" else base + "/v1"
+    return ProbeSpec(
+        name=f"{provider}-{label}",
+        provider=provider,
+        kind=kind,
+        base_url=api_base,
+        list_url=api_base + ("/api/tags" if kind == "ollama" else "/models"),
+        adapter="ollama-chat" if kind == "ollama" else "openai-chat",
+        local=True,
+        timeout_seconds=timeout,
+        machine_id="local",
+    )
 
 
 def merge_router_configs(
@@ -1151,5 +1566,6 @@ __all__ = [
     "DiscoverySettings",
     "ModelDiscovery",
     "infer_model_profile",
+    "local_listening_addresses",
     "merge_router_configs",
 ]

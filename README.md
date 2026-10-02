@@ -657,6 +657,8 @@ pytest
 
 | Feature | Behavior |
 |---|---|
+| Find Ollama and LM Studio on this machine | Automatic, on any port. Every TCP port the machine listens on is asked whether it serves Ollama's or an OpenAI-compatible API; see the local port sweep below. |
+| Use other routers as backends | List them in `LLM_ROUTER_PEERS`, or let a `LLM_ROUTER_SCAN_CIDRS` scan find gateways on port 8088. Their deployments are enrolled under the same names with real metadata; see [Routers as peers](#routers-as-peers-a-fleet-that-routes-as-one). |
 | Find and enroll servers on your LAN/VPN | Opt in with `LLM_ROUTER_SCAN_CIDRS`, or list known servers in `LLM_ROUTER_DISCOVERY_URLS`. A LAN/VPN range is never guessed from an entered IP. |
 | Keep the routing model list current | Discovery repeats every 30 seconds in a new service installation, or every 300 seconds by default when launched manually. Existing settings are preserved; change `LLM_ROUTER_DISCOVERY_REFRESH` to choose another interval. |
 | Status-page saved IP addresses | Saved addresses automatically enroll supported chat models, are restored at startup, and are rechecked every 30 seconds. No separate discovery URL is needed. |
@@ -685,6 +687,20 @@ The default scan is bounded to well-known loopback services:
 - vLLM on `8000`;
 - llama.cpp or LocalAI on `8080`;
 - text-generation-webui on `5000`, KoboldCpp on `5001`, and Jan on `1337`.
+
+Beyond those fixed ports, the gateway **sweeps every TCP port this machine is
+listening on** and asks each one whether it serves Ollama's API or an
+OpenAI-compatible one, so an Ollama started as `OLLAMA_HOST=127.0.0.1:11500`,
+an LM Studio server moved off `1234`, or a second instance of either is enrolled
+without configuration. LM Studio is recognized by its native `/api/v0/models`
+listing and keeps its context sizes. Only this machine is swept: listening
+sockets are read from `/proc/net/tcp` (a bounded loopback connect sweep stands
+in on systems without it), privileged ports other than `80` are left alone,
+ports already covered by the fixed probes or by `router.toml` are left to them,
+and a port that answered as something else is not asked again for ten minutes.
+Another llm-router gateway found this way is never enrolled, so a router cannot
+route to itself. Set `LLM_ROUTER_DISCOVER_LOCAL_PORTS=0` to keep only the fixed
+ports above; `LLM_ROUTER_MAX_LOCAL_PORTS` (default 512) bounds one sweep.
 
 Cloud providers self-enroll only when their credential is present:
 
@@ -1096,6 +1112,53 @@ eligible replica within the configured retry budget and the client's timeout. Th
 gateway itself needs separate redundancy if its host must also tolerate failure.
 Streaming clients receive fragments as they are generated; a failure after the
 first fragment is reported in the stream rather than failed over.
+
+### Routers as peers: a fleet that routes as one
+
+A router can use other llm-router gateways as backends without the client
+noticing. Each gateway publishes the deployments it can reach, its own
+backends and, recursively, its peers', with their real quality, context window
+and capabilities at `GET /router/fleet`. A router that lists it as a peer
+enrolls those deployments as its own, one endpoint per machine behind the peer,
+under the same names: `qwen3-14b-ha` and `qwen3-14b-golemframe` mean the same
+thing on a laptop as on the router in the server room, and `auto` ranks the
+whole fleet by real metadata and observed latency. A request for a deployment
+behind a peer is forwarded pinned to exactly that deployment, so failover
+across replicas, latency figures and session affinity stay with the router
+talking to the client and describe real machines. The answer's `router` block
+names the local deployment and, under `via`, what the peer actually used.
+
+```bash
+# On the laptop. One key everywhere is the simplest fleet.
+export LLM_ROUTER_GATEWAY_API_KEY=...the same key as the other routers...
+export LLM_ROUTER_PEERS="serverroom@192.168.37.37,garage@garage.home.arpa:8088"
+```
+
+`LLM_ROUTER_PEERS` takes `name@host`, `host`, `host:port` or a full URL; a bare
+host means port 8088. Peers are called with `LLM_ROUTER_PEER_KEY`, or with this
+gateway's own key when that is unset. With `LLM_ROUTER_SCAN_CIDRS`, the opted-in
+ranges are also checked for gateways on port 8088 (`LLM_ROUTER_PEER_PORT`); set
+`LLM_ROUTER_SCAN_PEERS=0` to keep that scan to model servers only. Peer
+deployments refresh with discovery. A peer that cannot be reached keeps the
+machines it published last time enrolled offline, each machine behind a peer is
+health-checked every 15 seconds through `/router/machines/<machine>/healthz`,
+and they return to routing as soon as they answer.
+
+Loops are prevented twice. Every published deployment names the router that
+owns it and the routers a request would pass through, identified by a stable
+instance id (`~/.config/llm-router/instance-id`, or `LLM_ROUTER_INSTANCE_ID`),
+and a router never enrolls a deployment that would come back to itself, so two
+routers may list each other. At request time every backend request carries
+`X-LLM-Router-Hops`, and a gateway refuses to forward a request that has
+already passed through `LLM_ROUTER_MAX_HOPS` routers (default 3) with HTTP 400,
+which the previous router treats as a failed attempt. Timeouts still add up
+along a chain: a peer's first-token and idle limits apply to its leg, and the
+heartbeats it sends keep the caller's first-token limit from firing, so set a
+request cap on routers that other routers call when bounded latency matters.
+
+Do not also list a peer's address in `LLM_ROUTER_DISCOVERY_URLS` or as a saved
+address: that enrolls the gateway a second time as a plain Ollama server, with
+stacked names such as `qwen3-14b-ha-ha` and no real metadata.
 
 ### CLI routing
 

@@ -247,7 +247,7 @@ def anthropic_completion(model: str, completion: RoutedCompletion, *, message_id
         "id": message_id or "msg_" + uuid.uuid4().hex, "type": "message", "role": "assistant", "model": model,
         "content": content, "stop_reason": _anthropic_stop_reason(completion), "stop_sequence": None,
         "usage": _anthropic_usage(completion),
-        "router": {"deployment": completion.deployment, "endpoint": completion.endpoint, "upstream_model": completion.upstream_model},
+        "router": completion.routing_block(),
     }
 
 
@@ -443,7 +443,7 @@ def responses_completion(model: str, completion: RoutedCompletion, *, response_i
         "error": None, "incomplete_details": {"reason": "max_output_tokens"} if completion.finish_reason == "length" else None,
         "model": model, "output": _responses_output(completion, "msg_" + uuid.uuid4().hex),
         "usage": _responses_usage(completion), "parallel_tool_calls": True, "store": False,
-        "router": {"deployment": completion.deployment, "endpoint": completion.endpoint, "upstream_model": completion.upstream_model},
+        "router": completion.routing_block(),
     }
 
 

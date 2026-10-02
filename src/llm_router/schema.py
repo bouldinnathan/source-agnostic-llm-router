@@ -185,10 +185,15 @@ class QueryRequest:
     # Conversations keep the replica that started them (see session affinity):
     # a client-supplied session name or a fingerprint of the conversation.
     session_key: str | None = None
+    # Routers this request has passed through, this one included, for the
+    # X-LLM-Router-Hops header on backend requests; 0 means "not a gateway".
+    hops: int = 0
 
     def __post_init__(self) -> None:
         if not self.messages:
             raise RequestError("messages must not be empty")
+        if isinstance(self.hops, bool) or not isinstance(self.hops, int) or not 0 <= self.hops <= 64:
+            raise RequestError("hops must be a whole number between 0 and 64")
         if self.session_key is not None and not (
             isinstance(self.session_key, str) and 0 < len(self.session_key) <= 160 and self.session_key.isprintable()
         ):
@@ -371,6 +376,18 @@ class RoutedCompletion:
     attempts: tuple[Mapping[str, Any], ...]
     inferred_capabilities: tuple[str, ...]
     tool_calls: tuple[Mapping[str, Any], ...] = ()
+    # The routing block a peer gateway returned, when the answer came through
+    # one: which deployment behind it actually answered.
+    upstream_router: Mapping[str, Any] | None = None
+
+    def routing_block(self) -> dict[str, Any]:
+        """The ``router`` object clients see: what answered, and through which peer if any."""
+        block: dict[str, Any] = {
+            "deployment": self.deployment, "endpoint": self.endpoint, "upstream_model": self.upstream_model,
+        }
+        if self.upstream_router is not None:
+            block["via"] = dict(self.upstream_router)
+        return block
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -384,4 +401,5 @@ class RoutedCompletion:
             "tool_calls": [dict(item) for item in self.tool_calls],
             "attempts": [dict(item) for item in self.attempts],
             "inferred_capabilities": list(self.inferred_capabilities),
+            "via": dict(self.upstream_router) if self.upstream_router is not None else None,
         }

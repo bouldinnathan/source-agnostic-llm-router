@@ -15,6 +15,10 @@ from typing import Literal
 
 from .schema import ModelConfig, QueryRequest, RouterConfig
 
+# ``deployment:<id>`` names exactly one deployment with no failover. Peer
+# gateways forward with it so failover stays with the router facing the client.
+DEPLOYMENT_PREFIX = "deployment:"
+
 
 @dataclass(frozen=True, slots=True)
 class ModelAlias:
@@ -105,6 +109,21 @@ def _catalog(config: RouterConfig) -> tuple[dict[str, ModelAlias], tuple[str, ..
             add(f"{name}-nofailover", machine_models, preferred_endpoints, kind="pinned")
 
     return dict(sorted(aliases.items())), tuple(sorted(conflicts))
+
+
+def deployment_alias(config: RouterConfig, deployment_id: str) -> ModelAlias | None:
+    """The alias that pins a request to one enabled deployment by id, or None."""
+    for model in config.models:
+        if model.id == deployment_id and model.enabled:
+            return ModelAlias(
+                name=DEPLOYMENT_PREFIX + deployment_id,
+                strategy="latency",
+                deployment_ids=(model.id,),
+                preferred_endpoints=(model.endpoint,),
+                models=(model,),
+                kind="pinned",
+            )
+    return None
 
 
 def replica_group_key(model: ModelConfig) -> str:

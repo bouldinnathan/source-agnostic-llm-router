@@ -9,10 +9,10 @@ from datetime import datetime, timezone
 import os
 import re
 import time
-from typing import Any, AsyncIterator, Sequence
+from typing import Any, AsyncIterator, Mapping, Sequence
 
 from .adapters import AdapterRegistry
-from .adapters.base import STREAM_TIMEOUTS, StreamDelta, StreamTimeouts, adapter_stream
+from .adapters.base import REQUEST_HOPS, STREAM_TIMEOUTS, StreamDelta, StreamTimeouts, adapter_stream
 from .errors import AllModelsFailed, NoEligibleModel, StreamInterrupted, UpstreamError, UpstreamFailure
 from .metrics import MetricsStore
 from .ranking import Ranker, replica_group
@@ -198,6 +198,8 @@ class LLMRouter:
             input_tokens=outcome.observation.get("input_tokens"), output_tokens=outcome.observation.get("output_tokens"),
         )
         candidate = outcome.candidate
+        raw = outcome.result.raw
+        via = raw.get("router") if isinstance(raw, Mapping) else None
         return RoutedCompletion(
             text=outcome.result.text,
             deployment=candidate.model.id,
@@ -209,6 +211,7 @@ class LLMRouter:
             attempts=tuple(attempts),
             inferred_capabilities=decision.inferred_capabilities,
             tool_calls=outcome.result.tool_calls,
+            upstream_router=dict(via) if isinstance(via, Mapping) else None,
         )
 
     async def _attempt_stream(
@@ -225,6 +228,8 @@ class LLMRouter:
         self.runtime.begin(model.id)
         started = time.perf_counter()
         timeouts_token = STREAM_TIMEOUTS.set(self._stream_timeouts())
+        # A router is one hop even when no gateway counted it (CLI, MCP).
+        hops_token = REQUEST_HOPS.set(request.hops or 1)
         recorded = False
         result: UpstreamResult | None = None
         failure: UpstreamFailure | None = None
@@ -290,12 +295,13 @@ class LLMRouter:
         finally:
             if not recorded:
                 self.runtime.end_without_result(model.id)
-            try:
-                STREAM_TIMEOUTS.reset(timeouts_token)
-            except ValueError:
-                # The first fragment was pulled by another task (a race head), so
-                # the variable was set in that task's context, which is gone.
-                pass
+            for variable, token in ((STREAM_TIMEOUTS, timeouts_token), (REQUEST_HOPS, hops_token)):
+                try:
+                    variable.reset(token)
+                except ValueError:
+                    # The first fragment was pulled by another task (a race head), so
+                    # the variable was set in that task's context, which is gone.
+                    pass
 
     def _race_participants(self, request: QueryRequest, decision: RoutingDecision) -> tuple[RouteCandidate, ...]:
         """Decide whether this request is one of the periodic all-replica races."""

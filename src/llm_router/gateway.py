@@ -26,15 +26,16 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .adapters.base import StreamDelta
+from .adapters.base import HOP_HEADER, StreamDelta
 from .bootstrap import BootstrapResult, bootstrap_router, load_optional_config
-from .aliases import ModelAlias, alias_conflicts, build_aliases
+from .aliases import DEPLOYMENT_PREFIX, ModelAlias, alias_conflicts, build_aliases, deployment_alias
 from .discovery import DiscoveryReport, DiscoverySettings, ProbeResult, merge_router_configs
 from .errors import AllModelsFailed, NoEligibleModel, RequestError, RouterError, StreamInterrupted
 from .health import probe_endpoints
 from .inference_jobs import InferenceJobError, InferenceJobs, Runner
 from .inference_test import run_inference_checks
 from .metrics import MetricsStore
+from .peers import fleet_listing, hops_from_header, machine_available
 from .routing_settings import FIELDS as ROUTING_SETTING_FIELDS, RoutingSettings, RoutingSettingsStore, validate_settings
 from .provisioning import OllamaProvisioner, ProvisioningReport, ProvisioningSettings
 from .public_status import public_summary
@@ -50,7 +51,7 @@ from .wire import (
     anthropic_session_hint, anthropic_token_estimate, responses_completion, responses_error, responses_query_fields,
 )
 
-VERSION = "0.7.0"
+VERSION = "0.9.0"
 # A streaming client hears from the router at least this often while a backend
 # is silent (loading a model, evaluating a long prompt), so idle-connection
 # timeouts in proxies and client libraries do not cut a slow start short.
@@ -1184,6 +1185,35 @@ def create_app(
         except Exception as exc:
             return _ollama_error(_safe_exception(exc), 500)
 
+    async def router_fleet(request: Request) -> Response:
+        """What peer gateways enroll: every deployment reachable from here, with real metadata."""
+        denied = _authorize(request)
+        if denied:
+            return denied
+        try:
+            router = await service.router()
+        except GatewayUnavailable as exc:
+            return _ollama_error(str(exc), 503)
+        return JSONResponse(fleet_listing(router, version=VERSION))
+
+    async def machine_health(request: Request) -> Response:
+        """Health of one machine behind this gateway, for a peer's per-machine probes."""
+        denied = _authorize(request)
+        if denied:
+            return denied
+        machine = str(request.path_params.get("machine", ""))[:128]
+        try:
+            router = await service.router()
+        except GatewayUnavailable as exc:
+            return JSONResponse({"status": "unavailable", "machine": machine, "error": str(exc)}, status_code=503)
+        available = machine_available(router, machine)
+        if available is None:
+            return JSONResponse({"status": "unknown", "machine": machine}, status_code=404)
+        return JSONResponse(
+            {"status": "ready" if available else "unavailable", "machine": machine},
+            status_code=200 if available else 503,
+        )
+
     async def ollama_version(request: Request) -> Response:
         denied = _authorize(request)
         return denied or JSONResponse({"version": f"llm-router-{VERSION}"})
@@ -1262,6 +1292,7 @@ def create_app(
         try:
             body = await _json_body(request)
             model = str(body.get("model", "auto"))
+            hops = _hops(request)
             router = await service.router()
             strategy, alias = _resolve_model(router, model)
             preferred_tags = VIRTUAL_PREFERRED_TAGS.get(model, ())
@@ -1272,7 +1303,7 @@ def create_app(
                 return JSONResponse(_ollama_empty(model, "load"))
             query = _query_request(
                 body, messages, strategy, ollama=True, preferred_tags=preferred_tags,
-                session_key=_session_key(request, model, messages),
+                session_key=_session_key(request, model, messages), hops=hops,
             )
             if alias is not None:
                 query = alias.apply(query)
@@ -1335,6 +1366,7 @@ def create_app(
         try:
             body = await _json_body(request)
             model = str(body.get("model", "auto"))
+            hops = _hops(request)
             router = await service.router()
             strategy, alias = _resolve_model(router, model)
             preferred_tags = VIRTUAL_PREFERRED_TAGS.get(model, ())
@@ -1343,7 +1375,7 @@ def create_app(
                 raise ValueError("messages must be a non-empty array")
             query = _query_request(
                 body, messages, strategy, ollama=False, preferred_tags=preferred_tags,
-                session_key=_session_key(request, model, messages),
+                session_key=_session_key(request, model, messages), hops=hops,
             )
             if alias is not None:
                 query = alias.apply(query)
@@ -1383,12 +1415,14 @@ def create_app(
         try:
             body = await _json_body(request)
             model = str(body.get("model", "auto"))
+            hops = _hops(request)
             router = await service.router()
             strategy, alias = _resolve_model(router, model)
             fields = anthropic_query_fields(body)
             query = QueryRequest(
                 **fields, strategy=strategy, preferred_tags=VIRTUAL_PREFERRED_TAGS.get(model, ()),
                 session_key=anthropic_session_hint(body) or _session_key(request, model, list(fields["messages"])),
+                hops=hops,
             )
             if alias is not None:
                 query = alias.apply(query)
@@ -1438,12 +1472,13 @@ def create_app(
         try:
             body = await _json_body(request)
             model = str(body.get("model", "auto"))
+            hops = _hops(request)
             router = await service.router()
             strategy, alias = _resolve_model(router, model)
             fields = responses_query_fields(body)
             query = QueryRequest(
                 **fields, strategy=strategy, preferred_tags=VIRTUAL_PREFERRED_TAGS.get(model, ()),
-                session_key=_session_key(request, model, list(fields["messages"])),
+                session_key=_session_key(request, model, list(fields["messages"])), hops=hops,
             )
             if alias is not None:
                 query = alias.apply(query)
@@ -1487,6 +1522,8 @@ def create_app(
         Route("/healthz", health, methods=["GET"]),
         Route("/readyz", health, methods=["GET"]),
         Route("/router/status", router_status, methods=["GET"]),
+        Route("/router/fleet", router_fleet, methods=["GET"]),
+        Route("/router/machines/{machine}/healthz", machine_health, methods=["GET"]),
         Route("/router/metrics", performance_metrics, methods=["GET"]),
         Route("/router/discover", refresh, methods=["POST"]),
         Route("/router/provision", provision, methods=["POST"]),
@@ -1685,6 +1722,15 @@ def _session_key(request: Request, model: str, messages: list[Any]) -> str | Non
     return "conversation:" + digest[:32]
 
 
+def _hops(request: Request) -> int:
+    """Routers this request has passed through once this one forwards it.
+
+    Raises ValueError, answered as a client error, when the request has
+    already been through as many routers as allowed: a loop between peers.
+    """
+    return hops_from_header(request.headers.get(HOP_HEADER)) + 1
+
+
 def _query_request(
     body: Mapping[str, Any],
     messages: list[Any],
@@ -1693,6 +1739,7 @@ def _query_request(
     ollama: bool,
     preferred_tags: tuple[str, ...] = (),
     session_key: str | None = None,
+    hops: int = 0,
 ) -> QueryRequest:
     if not all(isinstance(message, Mapping) for message in messages):
         raise ValueError("every message must be an object")
@@ -1757,6 +1804,7 @@ def _query_request(
         response_format=response_format,
         preferred_tags=preferred_tags,
         session_key=session_key,
+        hops=hops,
     )
 
 
@@ -1814,6 +1862,12 @@ def _ollama_models(router: LLMRouter) -> list[dict[str, Any]]:
 def _resolve_model(router: LLMRouter, name: str) -> tuple[str, ModelAlias | None]:
     if name in VIRTUAL_MODELS:
         return VIRTUAL_MODELS[name], None
+    if name.startswith(DEPLOYMENT_PREFIX):
+        # A peer gateway forwarding to exactly one of our deployments.
+        pinned = deployment_alias(router.config, name[len(DEPLOYMENT_PREFIX):])
+        if pinned is None:
+            raise ValueError(f"unknown virtual model '{name[:160]}'; no enabled deployment has that id on this router")
+        return pinned.strategy, pinned
     alias = build_aliases(router.config).get(name)
     if alias is None:
         raise ValueError(f"unknown virtual model '{name}'; query the model list for available aliases")
@@ -1875,11 +1929,7 @@ def _ollama_completion(
         "total_duration": int(latency_ms * 1_000_000),
         "prompt_eval_count": usage["prompt_tokens"],
         "eval_count": usage["completion_tokens"],
-        "router": {
-            "deployment": completion.deployment,
-            "endpoint": completion.endpoint,
-            "upstream_model": completion.upstream_model,
-        },
+        "router": completion.routing_block(),
     }
     return first, final
 
@@ -1924,11 +1974,7 @@ def _openai_completion(model: str, completion: RoutedCompletion) -> dict[str, An
             }
         ],
         "usage": _usage(completion.usage),
-        "router": {
-            "deployment": completion.deployment,
-            "endpoint": completion.endpoint,
-            "upstream_model": completion.upstream_model,
-        },
+        "router": completion.routing_block(),
     }
 
 

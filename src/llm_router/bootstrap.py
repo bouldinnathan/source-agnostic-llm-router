@@ -38,6 +38,9 @@ async def bootstrap_router(
     if not discovery:
         effective_settings = replace(effective_settings, enabled=False)
     discoverer = model_discovery or ModelDiscovery(effective_settings, configured=configured)
+    if previous is not None and getattr(discoverer, "previous", None) is None:
+        # A peer that cannot be reached now keeps the machines it published before.
+        discoverer.previous = previous.config
     base_report = await discoverer.discover()
     report = (
         merge_saved_discovery(base_report, saved_discovery, configured)

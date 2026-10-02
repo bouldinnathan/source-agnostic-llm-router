@@ -32,6 +32,34 @@ def restricted_environment_thread_wakeups(request, monkeypatch):  # type: ignore
 
 
 @pytest.fixture(autouse=True)
+def no_real_local_port_sweep(monkeypatch):  # type: ignore[no-untyped-def]
+    """Tests never enumerate or probe the developer machine's own listening ports."""
+    from llm_router import discovery
+
+    async def nothing() -> tuple[tuple[str, int], ...]:
+        return ()
+
+    monkeypatch.setattr(discovery, "local_listening_addresses", nothing)
+    discovery._sweep_rejections.clear()
+
+
+@pytest.fixture(autouse=True)
+def isolated_peer_identity(monkeypatch, tmp_path):  # type: ignore[no-untyped-def]
+    """Each test gets its own gateway identity and no peers from the developer's environment."""
+    from llm_router import peers
+
+    monkeypatch.setenv("LLM_ROUTER_INSTANCE_ID_FILE", str(tmp_path / "identity" / "instance-id"))
+    for name in (
+        "LLM_ROUTER_INSTANCE_ID", "LLM_ROUTER_PEERS", "LLM_ROUTER_PEER_KEY", "LLM_ROUTER_MAX_HOPS",
+        "LLM_ROUTER_SCAN_PEERS", "LLM_ROUTER_PEER_PORT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    peers._instance = None
+    yield
+    peers._instance = None
+
+
+@pytest.fixture(autouse=True)
 def isolated_passive_metrics(monkeypatch, tmp_path):  # type: ignore[no-untyped-def]
     """Tests must never read or append to an operator's real metrics database."""
     monkeypatch.setenv("LLM_ROUTER_METRICS_FILE", str(tmp_path / "performance" / "metrics.sqlite3"))

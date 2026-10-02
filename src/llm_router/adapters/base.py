@@ -38,6 +38,12 @@ class StreamTimeouts:
 # keeps the Adapter protocol unchanged for custom adapters.
 STREAM_TIMEOUTS: ContextVar[StreamTimeouts] = ContextVar("llm_router_stream_timeouts", default=StreamTimeouts())
 
+# How many routers the request being forwarded has passed through, this one
+# included. Sent as X-LLM-Router-Hops on every backend request so a peer
+# gateway can refuse a loop; Ollama and the others ignore it.
+HOP_HEADER = "X-LLM-Router-Hops"
+REQUEST_HOPS: ContextVar[int] = ContextVar("llm_router_request_hops", default=0)
+
 
 @dataclass(slots=True)
 class StreamDelta:
@@ -490,6 +496,9 @@ class BaseHTTPAdapter:
     ) -> tuple[dict[str, str], dict[str, str]]:
         headers = {key: _expand_env(value) for key, value in default_headers.items()}
         headers.update({key: _expand_env(value) for key, value in endpoint.headers.items()})
+        hops = REQUEST_HOPS.get()
+        if hops > 0:
+            headers[HOP_HEADER] = str(hops)
         params: dict[str, str] = {}
         auth = endpoint.auth
         scheme = (auth.scheme or self.default_auth_scheme).lower()
